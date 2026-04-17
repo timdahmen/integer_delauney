@@ -1,0 +1,266 @@
+"""Performance profiling -- 1024x1024 grid, 100 000 seed points.
+
+Run with:
+    python profiling.py
+
+Sections
+--------
+1. Seed generation
+2. RegularDelaunay   -- NumPy reference  (BFS only)
+3. RegularDelaunay   -- CUDA
+4. GridTriangulation -- NumPy reference  (detection + dedup; assignment skipped
+                        because ~237 k triangles x 1 M pixels = ~248 G containment
+                        tests, which would take hours in a Python loop)
+5. GridTriangulation -- CUDA             (full pipeline)
+6. Summary table
+"""
+
+from __future__ import annotations
+
+import time
+from contextlib import contextmanager
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_results: dict[str, float] = {}
+
+
+@contextmanager
+def timer(label: str, store: bool = True):
+    t0 = time.perf_counter()
+    yield
+    elapsed = time.perf_counter() - t0
+    if store:
+        _results[label] = elapsed
+    print(f"    {label:<52} {elapsed * 1000:>10.1f} ms")
+
+
+def section(title: str) -> None:
+    print(f"\n  {'-'*62}")
+    print(f"  {title}")
+    print(f"  {'-'*62}")
+
+
+def hr() -> None:
+    print(f"\n  {'='*68}")
+
+
+# ---------------------------------------------------------------------------
+# CUDA availability
+# ---------------------------------------------------------------------------
+
+def cuda_available() -> bool:
+    try:
+        from delauney import _delauney_cuda  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Reference triangle detection (steps 2-3 only, without the O(H*W*T) loop)
+# ---------------------------------------------------------------------------
+
+def _ref_detect_triangles(voronoi_grid: np.ndarray,
+                           seeds: list[tuple[int, int]]) -> dict:
+    """Run GridTriangulation steps 2-3 (detection + dedup) without assignment."""
+    seeds_arr = np.array(seeds, dtype=np.int32)
+    n_grid = voronoi_grid[:, :, 0]
+
+    seen: dict[frozenset, int] = {}
+    tri_map: dict[int, tuple] = {}
+    next_id = 0
+
+    def register(gx: int, gy: int, a: int, b: int, c: int) -> None:
+        nonlocal next_id
+        triplet = frozenset({a, b, c})
+        if len(triplet) < 3:
+            return
+        if triplet not in seen:
+            seen[triplet] = next_id
+            tri_map[next_id] = (gx, gy, a, b, c)
+            next_id += 1
+
+    for s_cell, s_nb, s_dn, ox, oy in [
+        (n_grid[:-1, 1:],  n_grid[:-1, :-1], n_grid[1:, 1:],  1, 0),
+        (n_grid[:-1, :-1], n_grid[:-1, 1:],  n_grid[1:, :-1], 0, 0),
+        (n_grid[1:,  :-1], n_grid[1:,  1:],  n_grid[:-1,:-1], 0, 1),
+        (n_grid[1:,  1:],  n_grid[1:,  :-1], n_grid[:-1, 1:], 1, 1),
+    ]:
+        mask = (s_cell != s_nb) & (s_cell != s_dn) & (s_nb != s_dn)
+        for ry, rx in zip(*np.where(mask)):
+            register(rx + ox, ry + oy,
+                     int(s_nb[ry, rx]), int(s_cell[ry, rx]), int(s_dn[ry, rx]))
+
+    return tri_map
+
+
+# ---------------------------------------------------------------------------
+# BFS with iteration counter
+# ---------------------------------------------------------------------------
+
+def _ref_voronoi_timed(W: int, H: int, seeds: list) -> tuple[np.ndarray, int]:
+    """Return (voronoi_grid, n_bfs_iterations)."""
+    from delauney.reference.voronoi import _UNDEFINED
+
+    seeds_arr = np.array(seeds, dtype=np.int32)
+    order = np.lexsort((seeds_arr[:, 1], seeds_arr[:, 0]))
+    sorted_seeds = seeds_arr[order]
+
+    grid = np.full((H, W, 2), _UNDEFINED, dtype=np.int32)
+    for seed_id, (sx, sy) in enumerate(sorted_seeds):
+        grid[sy, sx, 0] = seed_id
+        grid[sy, sx, 1] = 0
+
+    sid = grid[:, :, 0]
+    dst = grid[:, :, 1]
+    iters = 0
+
+    SHIFTS = [
+        # (n_id array, n_d_raw array)
+        lambda: (np.pad(sid[:, :-1], ((0,0),(1,0)), constant_values=_UNDEFINED),
+                 np.pad(dst[:, :-1], ((0,0),(1,0)))),
+        lambda: (np.pad(sid[:, 1:],  ((0,0),(0,1)), constant_values=_UNDEFINED),
+                 np.pad(dst[:, 1:],  ((0,0),(0,1)))),
+        lambda: (np.pad(sid[:-1, :], ((1,0),(0,0)), constant_values=_UNDEFINED),
+                 np.pad(dst[:-1, :], ((1,0),(0,0)))),
+        lambda: (np.pad(sid[1:,  :], ((0,1),(0,0)), constant_values=_UNDEFINED),
+                 np.pad(dst[1:,  :], ((0,1),(0,0)))),
+    ]
+
+    while True:
+        iters += 1
+        changed = False
+        for shift_fn in SHIFTS:
+            n_id, n_d_raw = shift_fn()
+            n_d   = n_d_raw + 1
+            valid = n_id >= 0
+            undef = sid == _UNDEFINED
+            lower = valid & ~undef & (n_d < dst)
+            tie   = valid & ~undef & (n_d == dst) & (n_id > sid)
+            new   = valid & undef
+            mask  = new | lower | tie
+            if np.any(mask):
+                changed = True
+                sid[mask] = n_id[mask]
+                dst[mask] = n_d[mask]
+
+        if not changed:
+            break
+
+    return grid, iters
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+W, H, N = 1024, 1024, 100_000
+
+hr()
+print(f"\n  Delauney profiling  |  grid {W}x{H}  |  {N:,} seed points")
+hr()
+
+# -- 1. Seed generation ------------------------------------------------------
+section("1. Seed generation")
+with timer("Generate unique positions"):
+    rng = np.random.default_rng(42)
+    coords: set[tuple[int, int]] = set()
+    while len(coords) < N:
+        xs = rng.integers(0, W, N).tolist()
+        ys = rng.integers(0, H, N).tolist()
+        coords.update(zip(xs, ys))
+    seeds = list(coords)[:N]
+
+# -- 2. RegularDelaunay -- reference -----------------------------------------
+section("2. RegularDelaunay -- NumPy reference")
+with timer("compute()  (full BFS)"):
+    ref_vgrid, n_iter = _ref_voronoi_timed(W, H, seeds)
+print(f"    {'BFS convergence iterations':<52} {n_iter:>10}")
+print(f"    {'Max distance in grid (pixels)':<52} {int(ref_vgrid[:,:,1].max()):>10}")
+
+# -- 3. RegularDelaunay -- CUDA ----------------------------------------------
+section("3. RegularDelaunay -- CUDA")
+if cuda_available():
+    from delauney._delauney_cuda import RegularDelaunay as CudaVD
+    cuda_vd = CudaVD()
+    _ = cuda_vd.compute(32, 32, [(0, 0), (31, 31)])   # warm-up
+    with timer("compute()  (warm-up excluded)"):
+        cuda_vgrid = cuda_vd.compute(W, H, seeds)
+    match = np.array_equal(cuda_vgrid, ref_vgrid)
+    print(f"    {'Result matches NumPy reference':<52} {'YES' if match else 'NO':>10}")
+else:
+    print("    [CUDA extension not available -- skipped]")
+    cuda_vgrid = ref_vgrid
+
+# -- 4. GridTriangulation -- reference (detection only) ----------------------
+section("4. GridTriangulation -- NumPy reference (detection + dedup only)")
+with timer("Triangle detection + deduplication"):
+    ref_tri_map = _ref_detect_triangles(ref_vgrid, seeds)
+
+T = len(ref_tri_map)
+ops = W * H * T
+hours_est = ops / 1e7 / 3600
+print(f"    {'Unique triangles found':<52} {T:>10,}")
+print(f"    {'Assignment ops  W x H x T  (skipped)':<52} {ops/1e9:>9.1f} G")
+print(f"    ('-> ~{hours_est:.1f} h in Python; GPU required for this scale)")
+
+# -- 5. GridTriangulation -- CUDA --------------------------------------------
+section("5. GridTriangulation -- CUDA (full pipeline incl. assignment)")
+if cuda_available():
+    from delauney._delauney_cuda import GridTriangulation as CudaTri
+    cuda_tri = CudaTri()
+    with timer("compute_timed()  (detection + dedup + assignment)"):
+        cuda_tri_map, cuda_tgrid, gpu_timings = cuda_tri.compute_timed(cuda_vgrid, seeds)
+    tri_match = "YES (%d)" % len(cuda_tri_map) if len(cuda_tri_map) == T \
+                else "NO (%d vs %d)" % (len(cuda_tri_map), T)
+    print(f"    {'Triangle count matches reference':<52} {tri_match:>10}")
+    print()
+    print(f"    GPU sub-phase breakdown:")
+    print(f"    {'  detect (find_triangle_seeds kernel)':<52} {gpu_timings['detect_ms']:>9.1f} ms")
+    print(f"    {'  dedup  (thrust sort + unique)':<52} {gpu_timings['dedup_ms']:>9.1f} ms")
+    print(f"    {'  assign (assign_triangles kernel)':<52} {gpu_timings['assign_ms']:>9.1f} ms")
+else:
+    print("    [CUDA extension not available -- skipped]")
+    gpu_timings = None
+
+# -- 6. Summary --------------------------------------------------------------
+section("6. Summary")
+COL = 46
+labels = [
+    ("Generate seeds",               "Generate unique positions"),
+    ("RegularDelaunay  (NumPy ref)", "compute()  (full BFS)"),
+    ("RegularDelaunay  (CUDA)",      "compute()  (warm-up excluded)"),
+    ("GridTriang. detect (NumPy)",   "Triangle detection + deduplication"),
+    ("GridTriang. full   (CUDA)",    "compute_timed()  (detection + dedup + assignment)"),
+]
+
+print(f"\n    {'Phase':<{COL}}  {'Time':>11}  {'vs ref BFS':>10}")
+print(f"    {'-'*COL}  {'-'*11}  {'-'*10}")
+
+ref_bfs_s = _results.get("compute()  (full BFS)")
+for display, key in labels:
+    ms = _results.get(key)
+    if ms is None:
+        print(f"    {display:<{COL}}  {'n/a':>11}  {'':>10}")
+        continue
+    speedup = ""
+    if ref_bfs_s and key == "compute()  (warm-up excluded)":
+        speedup = f"{ref_bfs_s / ms:.1f}x"
+    print(f"    {display:<{COL}}  {ms*1000:>10.1f}ms  {speedup:>10}")
+
+print(f"\n    Complexity note:")
+print(f"      Voronoi BFS:      O(W x H x iters)  -- iters = {n_iter} here")
+print(f"      Tri. detection:   O(W x H x 4)      -- vectorised NumPy")
+print(f"      Tri. assignment:  O(W x H x T)      -- T = {T:,} triangles")
+print(f"        Reference Python: ~{hours_est:.1f} h")
+if cuda_available() and gpu_timings is not None:
+    print(f"        CUDA kernel breakdown:")
+    print(f"          detect: {gpu_timings['detect_ms']:.1f} ms")
+    print(f"          dedup:  {gpu_timings['dedup_ms']:.1f} ms  (Thrust sort+unique on device)")
+    print(f"          assign: {gpu_timings['assign_ms']:.1f} ms")
+hr()

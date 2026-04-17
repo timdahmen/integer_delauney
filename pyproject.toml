@@ -1,0 +1,19 @@
+[build-system]
+requires = ["scikit-build-core>=0.9", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "delauney"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov"]
+
+[tool.scikit-build]
+cmake.build-type = "Release"
+wheel.packages = ["src/delauney"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
