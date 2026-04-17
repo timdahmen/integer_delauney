@@ -17,6 +17,7 @@ if(WITH_CUDA)
         src/cuda/bindings.cpp
         src/cuda/voronoi.cu
         src/cuda/triangulation.cu
+        src/cuda/incremental.cu
     )
 
     target_include_directories(_delauney_cuda PRIVATE src/cuda)

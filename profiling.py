@@ -12,7 +12,8 @@ Sections
                         because ~237 k triangles x 1 M pixels = ~248 G containment
                         tests, which would take hours in a Python loop)
 5. GridTriangulation -- CUDA             (full pipeline)
-6. Summary table
+6. IncrementalDelaunay -- CUDA           (cold insert + warm single-seed insert)
+7. Summary table
 """
 
 from __future__ import annotations
@@ -228,8 +229,62 @@ else:
     print("    [CUDA extension not available -- skipped]")
     gpu_timings = None
 
-# -- 6. Summary --------------------------------------------------------------
-section("6. Summary")
+# -- 6. IncrementalDelaunay -- CUDA ------------------------------------------
+section("6. IncrementalDelaunay -- CUDA")
+if cuda_available():
+    from delauney._delauney_cuda import IncrementalDelaunay as CudaInc
+
+    # Cold insert: all N seeds in one shot (exercises full_triangulate_)
+    inc = CudaInc(W, H, N + 20)
+    with timer("insert_timed()  cold  (all seeds, full triangulate)"):
+        inc_tri_map, inc_tgrid, inc_t0 = inc.insert_timed(seeds)
+    print(f"    {'  Seeds inserted':<52} {inc.seed_count:>10,}")
+    print(f"    {'  Triangles found':<52} {len(inc_tri_map):>10,}")
+    print()
+    print(f"    GPU sub-phase breakdown (cold):")
+    print(f"    {'  bfs    (BFS until convergence)':<52} {inc_t0['bfs_ms']:>9.1f} ms")
+    print(f"    {'  detect (find_triangle_seeds kernel)':<52} {inc_t0['detect_ms']:>9.1f} ms")
+    print(f"    {'  dedup  (thrust sort + unique)':<52} {inc_t0['dedup_ms']:>9.1f} ms")
+    print(f"    {'  assign (assign_triangles kernel)':<52} {inc_t0['assign_ms']:>9.1f} ms")
+
+    # Warm insert: one additional seed (exercises partial_triangulate_)
+    rng2 = np.random.default_rng(99)
+    extra_seeds = []
+    seed_set = set(map(tuple, seeds))
+    while len(extra_seeds) < 10:
+        x, y = int(rng2.integers(0, W)), int(rng2.integers(0, H))
+        if (x, y) not in seed_set:
+            extra_seeds.append((x, y))
+            seed_set.add((x, y))
+
+    # Warm-up: one insert to prime caches
+    inc.insert_timed([extra_seeds[0]])
+
+    # Measure average over remaining 9 single-seed inserts
+    warm_totals = {"bfs_ms": 0., "detect_ms": 0., "dedup_ms": 0., "assign_ms": 0.}
+    warm_wall = 0.
+    WARM_N = len(extra_seeds) - 1
+    for s in extra_seeds[1:]:
+        t0 = time.perf_counter()
+        _, _, wt = inc.insert_timed([s])
+        warm_wall += time.perf_counter() - t0
+        for k in warm_totals:
+            warm_totals[k] += wt[k]
+
+    warm_wall_avg = warm_wall / WARM_N * 1000
+    _results["insert_timed()  warm  (single seed, partial triangulate)"] = warm_wall / WARM_N
+    print()
+    print(f"    {'insert_timed()  warm  (single seed, avg over ' + str(WARM_N) + ')':<52} {warm_wall_avg:>9.1f} ms")
+    print()
+    print(f"    GPU sub-phase breakdown (warm, avg):")
+    for k in ("bfs_ms", "detect_ms", "dedup_ms", "assign_ms"):
+        label = k.replace("_ms", "").ljust(6)
+        print(f"    {'  ' + label:<52} {warm_totals[k]/WARM_N:>9.1f} ms")
+else:
+    print("    [CUDA extension not available -- skipped]")
+
+# -- 7. Summary --------------------------------------------------------------
+section("7. Summary")
 COL = 46
 labels = [
     ("Generate seeds",               "Generate unique positions"),
@@ -237,6 +292,8 @@ labels = [
     ("RegularDelaunay  (CUDA)",      "compute()  (warm-up excluded)"),
     ("GridTriang. detect (NumPy)",   "Triangle detection + deduplication"),
     ("GridTriang. full   (CUDA)",    "compute_timed()  (detection + dedup + assignment)"),
+    ("Incremental cold   (CUDA)",    "insert_timed()  cold  (all seeds, full triangulate)"),
+    ("Incremental warm   (CUDA)",    "insert_timed()  warm  (single seed, partial triangulate)"),
 ]
 
 print(f"\n    {'Phase':<{COL}}  {'Time':>11}  {'vs ref BFS':>10}")
