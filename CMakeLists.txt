@@ -23,6 +23,7 @@ if(WITH_CUDA)
     target_include_directories(_delauney_cuda PRIVATE src/cuda)
     target_compile_options(_delauney_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     )
 
     install(TARGETS _delauney_cuda DESTINATION delauney)
