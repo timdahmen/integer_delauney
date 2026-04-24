@@ -13,7 +13,7 @@ dev = ["pytest>=8", "pytest-cov"]
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-cmake.args = ["-DWITH_CUDA=ON"]
+cmake.args = ["-DWITH_CUDA=ON", "-GNinja"]
 wheel.packages = ["src/delauney"]
 
 [tool.pytest.ini_options]
