@@ -39,9 +39,11 @@ region_colors = plt.cm.hsv(_hues)
 region_cmap = mcolors.ListedColormap(region_colors)
 
 # Separate (shuffled) colormap for the N triangles
-_hues_t = np.linspace(0, 1, len(tri_map), endpoint=False)
+_hues_t = np.linspace(0, 1, len(tri_map)+1, endpoint=False)
 _hues_t = _hues_t[_rng2.permutation(len(tri_map))]
 tri_colors = plt.cm.hsv(_hues_t)
+# tri_colors = [0] + tri_colors
+tri_colors[0,3] = 0
 tri_cmap = mcolors.ListedColormap(tri_colors)
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 7), dpi=120)
@@ -67,7 +69,7 @@ ax = axes[1]
 # Background: colour each pixel by its triangle_id
 ax.imshow(
     tgrid[:, :, 2],
-    cmap=tri_cmap, vmin=0, vmax=len(tri_map) - 1,
+    cmap=tri_cmap, vmin=-1, vmax=len(tri_map) - 1,
     origin='upper', interpolation='nearest', aspect='equal',
     alpha=0.55,
 )
