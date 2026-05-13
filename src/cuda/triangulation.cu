@@ -190,7 +190,7 @@ void assign_triangles_kernel(
         }
     }
 
-    t_grid[y * W + x] = (best != -1) ? best : (N_triangles - 1);
+    t_grid[y * W + x] = best;
 }
 
 // ---------------------------------------------------------------------------

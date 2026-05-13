@@ -260,7 +260,7 @@ void assign_triangles_kernel(
                 if (best == -1 || tid > best) best = tid;
         }
     }
-    t_grid[y * W + x] = (best != -1) ? best : (N_triangles - 1);
+    t_grid[y * W + x] = best;
 }
 
 // ---------------------------------------------------------------------------
@@ -557,7 +557,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     rebuild_csr_and_upload_();
 
     // Remap d_t_grid_ through old→new table
-    int32_t fallback = h_triangles_.empty() ? 0 : (int32_t)h_triangles_.size() - 1;
+    int32_t fallback = -1;
     if (old_count > 0) {
         int32_t* d_remap;
         cudaMalloc(&d_remap, old_count * sizeof(int32_t));
