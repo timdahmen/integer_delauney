@@ -2,15 +2,18 @@
 //
 // Step 2 (GPU): scan all 4 L-shape orientations; raw hits → device buffer.
 // Step 3 (GPU): thrust::sort + thrust::unique on the device buffer.
-// Step 4 (GPU): window-based nearest-neighbor assign.
-//   For each pixel, read its Voronoi distance d, scan a (2R+1)² window of
-//   the seed-id grid (R = min(d + WINDOW_SLACK, WINDOW_CAP)), collect unique
-//   nearby seed IDs, then test only the triangles adjacent to those seeds via
-//   a per-seed CSR list.  Reduces per-pixel tests from O(T) to O(k·t) where
-//   k ≈ nearby seeds (~10-70) and t ≈ triangles/seed (~7).
+// Step 4 (GPU): seed-position-scan triangle assignment.
+//   For each pixel, iterate all seeds; skip any whose Manhattan distance to
+//   the pixel exceeds window_cap (= max_manhattan_side + SLACK).  For seeds
+//   that pass the guard, iterate their CSR triangle list and run the
+//   containment test.  window_cap is derived from the longest detected
+//   triangle side, so the window always covers at least one vertex of the
+//   containing triangle regardless of Voronoi ownership.
+//   Expected cost: O(N_seeds_in_window × tris/seed) ≈ O(16) seeds for
+//   uniform distributions; scales with local seed density, not total N.
 //
 // Host copies:
-//   • voronoi seed_id + distance channels  → device  (input, once)
+//   • voronoi seed_id channel              → device  (input, once)
 //   • seed positions                        → device  (input, once)
 //   • deduplicated triangles               ← device  (output, ~7 MB)
 //   • CSR adjacency list                   → device  (built host-side, ~3 MB)
@@ -115,33 +118,35 @@ bool point_in_triangle(float px, float py,
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 2: window-based triangle assignment
+// Kernel 2: seed-position-scan triangle assignment
 //
 // For each pixel:
-//   1. Read Voronoi distance d; set search radius R = min(d+SLACK, CAP).
-//   2. Scan the (2R+1)x(2R+1) seed-id window; collect unique seed IDs.
-//   3. For each nearby seed, iterate its CSR triangle list and run the
-//      containment test.  Duplicate triangle tests (same tri reachable via
-//      multiple seeds) are allowed — they are idempotent.
+//   1. Iterate all seeds; skip any whose Chebyshev distance to the pixel
+//      exceeds window_cap.  window_cap = max_manhattan_side + SLACK, so it
+//      always covers at least one vertex of the containing triangle.
+//   2. For each nearby seed, iterate its CSR triangle list and run the
+//      containment test.  A triangle is reachable via any of its 3 vertices,
+//      so duplicate tests are possible but idempotent.
+//
+// Correctness argument: for any pixel P inside triangle (A,B,C), at least one
+// vertex V satisfies Chebyshev_dist(P,V) <= Manhattan_dist(A,B) (longest side).
+// Because window_cap >= max_side + SLACK, every vertex of the containing
+// triangle falls within the window.
 // ---------------------------------------------------------------------------
 
-static constexpr int WINDOW_SLACK = 3;   // extra radius beyond Voronoi dist
-static constexpr int WINDOW_CAP   = 20;  // hard cap to bound work in sparse areas
-static constexpr int MAX_NEARBY   = 64;  // max unique seeds collected per pixel
+static constexpr int WINDOW_SLACK = 3;    // extra radius beyond max_side
 
 __global__
 void assign_triangles_kernel(
     int32_t* __restrict__             t_grid,
     int W, int H,
-    const int32_t* __restrict__       n_grid,     // seed_id per pixel
-    const int32_t* __restrict__       dist_grid,  // voronoi distance per pixel
     const RawTriangle* __restrict__   triangles,
     const int32_t* __restrict__       seed_xs,
     const int32_t* __restrict__       seed_ys,
     const int32_t* __restrict__       csr_ptr,    // [N_seeds+1]
     const int32_t* __restrict__       csr_idx,    // triangle IDs per seed
     int N_seeds,
-    int N_triangles)
+    int window_cap)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -149,35 +154,11 @@ void assign_triangles_kernel(
 
     float px = x + 0.5f;
     float py = y + 0.5f;
-
-    int dist = dist_grid[y * W + x];
-    int R    = min(dist + WINDOW_SLACK, WINDOW_CAP);
-
-    // Collect unique nearby seeds in a small register/local array.
-    int32_t nearby[MAX_NEARBY];
-    int n_nearby = 0;
-
-    int x0 = max(0, x - R),     x1 = min(W - 1, x + R);
-    int y0 = max(0, y - R),     y1 = min(H - 1, y + R);
-
-    for (int sy = y0; sy <= y1; ++sy) {
-        for (int sx = x0; sx <= x1; ++sx) {
-            int32_t sid = n_grid[sy * W + sx];
-            bool dup = false;
-            for (int i = 0; i < n_nearby; ++i)
-                if (nearby[i] == sid) { dup = true; break; }
-            if (!dup && n_nearby < MAX_NEARBY)
-                nearby[n_nearby++] = sid;
-        }
-    }
-
-    // Test triangles reachable via nearby seeds.
-    // A triangle with all 3 vertices in the window appears 3 times (once per
-    // seed); the containment test is idempotent so duplicates are harmless.
     int32_t best = -1;
-    for (int i = 0; i < n_nearby; ++i) {
-        int32_t sid = nearby[i];
-        if (sid < 0 || sid >= N_seeds) continue;
+
+    for (int sid = 0; sid < N_seeds; ++sid) {
+        if (abs(seed_xs[sid] - x) > window_cap) continue;
+        if (abs(seed_ys[sid] - y) > window_cap) continue;
         for (int j = csr_ptr[sid]; j < csr_ptr[sid + 1]; ++j) {
             int32_t tid = csr_idx[j];
             const RawTriangle& tri = triangles[tid];
@@ -225,23 +206,19 @@ void cuda_compute_triangulation(
     }
 
     // -----------------------------------------------------------------------
-    // Upload inputs: seed_id channel, distance channel, seed positions
+    // Upload inputs: seed_id channel, seed positions
     // -----------------------------------------------------------------------
 
-    std::vector<int32_t> h_n(N), h_dist(N);
-    for (int i = 0; i < N; ++i) {
-        h_n[i]    = voronoi_grid[i * 2];
-        h_dist[i] = voronoi_grid[i * 2 + 1];
-    }
+    std::vector<int32_t> h_n(N);
+    for (int i = 0; i < N; ++i)
+        h_n[i] = voronoi_grid[i * 2];
 
-    int32_t *d_n = nullptr, *d_dist = nullptr;
+    int32_t *d_n = nullptr;
     int32_t *d_sx = nullptr, *d_sy = nullptr;
     cudaMalloc(&d_n,    N       * sizeof(int32_t));
-    cudaMalloc(&d_dist, N       * sizeof(int32_t));
     cudaMalloc(&d_sx,   N_seeds * sizeof(int32_t));
     cudaMalloc(&d_sy,   N_seeds * sizeof(int32_t));
     cudaMemcpy(d_n,    h_n.data(),       N       * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dist, h_dist.data(),    N       * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_sx,   seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_sy,   seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
 
@@ -330,7 +307,7 @@ void cuda_compute_triangulation(
     cudaMemcpy(d_csr_idx, h_csr_idx.data(),  csr_size     * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     // -----------------------------------------------------------------------
-    // Step 4: assign pixels to triangles (window-based nearest-neighbor)
+    // Step 4: assign pixels to triangles (seed-position-scan)
     // -----------------------------------------------------------------------
 
     int32_t* d_t = nullptr;
@@ -338,13 +315,30 @@ void cuda_compute_triangulation(
 
     if (timings) record(ev4);
 
+    // window_cap: Chebyshev guard on seed distance.  For any pixel P inside
+    // triangle (A,B,C), at least one vertex V satisfies
+    //   max(|Px-Vx|, |Py-Vy|) <= max_manhattan_side
+    // so setting window_cap = max_side + SLACK guarantees every vertex of the
+    // containing triangle is visited, regardless of Voronoi ownership.
+    int max_side = 0;
+    for (int tid = 0; tid < N_triangles; ++tid) {
+        const auto& r = h_dedup[tid];
+        auto md = [&](int32_t i, int32_t j) {
+            return abs(seed_xs[i] - seed_xs[j]) + abs(seed_ys[i] - seed_ys[j]);
+        };
+        int s1 = md(r.orig_a, r.orig_b);
+        int s2 = md(r.orig_a, r.orig_c);
+        int s3 = md(r.orig_b, r.orig_c);
+        max_side = max(max_side, max(s1, max(s2, s3)));
+    }
+    const int window_cap = max(20, max_side + WINDOW_SLACK);
+
     if (N_triangles > 0) {
         assign_triangles_kernel<<<grid_dim, block>>>(
             d_t, W, H,
-            d_n, d_dist,
             d_raw, d_sx, d_sy,
             d_csr_ptr, d_csr_idx,
-            N_seeds, N_triangles);
+            N_seeds, window_cap);
         cudaDeviceSynchronize();
     } else {
         cudaMemset(d_t, -1, N * sizeof(int32_t));
@@ -377,7 +371,6 @@ void cuda_compute_triangulation(
 
     cudaFree(d_raw);
     cudaFree(d_n);
-    cudaFree(d_dist);
     cudaFree(d_t);
     cudaFree(d_sx);
     cudaFree(d_sy);
