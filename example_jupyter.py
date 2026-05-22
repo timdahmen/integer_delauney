@@ -16,8 +16,10 @@
 # %% — PARAMETERS
 W, H = 512, 512           # grid width, height in pixels
 N    = 512                # number of seeds requested
-ALLOW_DUPLICATES = False  # True → skip deduplication to expose overwrite bug
-RNG_SEED = 42
+ALLOW_DUPLICATES  = False  # True: skip deduplication to expose overwrite bug
+CREATE_NEIGHBOURS = False  # 
+N_NEIGHBOURS      = 64
+RNG_SEED          = 42
 
 # %% — imports and computation
 import numpy as np
@@ -39,6 +41,12 @@ else:
     seeds    = list(coords)
     n_unique = N
     n_dupes  = 0
+
+if CREATE_NEIGHBOURS:
+    for i in range(N_NEIGHBOURS):
+        x,y = seeds[2*i]
+        seeds[2*i+1] = (x+1,y)
+
 
 # Compute Voronoi diagram
 vgrid = RegularDelaunay().compute(W, H, seeds)   # int32 (H, W, 2)
@@ -77,7 +85,7 @@ tri_colors = plt.cm.hsv(_hues_t)
 tri_colors[0, 3] = 0          # make index 0 transparent (maps to -1 via vmin=-1)
 tri_cmap = mcolors.ListedColormap(tri_colors)
 
-fig, axes = plt.subplots(1, 2, figsize=(14, 7), dpi=120)
+fig, axes = plt.subplots(1, 2, figsize=(14, 7), dpi=360)
 fig.patch.set_facecolor('#1a1a2e')
 for ax in axes:
     ax.set_facecolor('#1a1a2e')

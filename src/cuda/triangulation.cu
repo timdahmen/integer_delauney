@@ -1,6 +1,14 @@
 // CUDA kernels for GridTriangulation.
 //
-// Step 2 (GPU): scan all 4 L-shape orientations; raw hits → device buffer.
+// Step 2 (GPU): 2x2-block scan for triangle detection.
+//   Each pixel (x,y) is the top-left corner of a 2x2 block covering pixels
+//   (x,y)=a, (x+1,y)=b, (x,y+1)=c, (x+1,y+1)=d.
+//   - 3 distinct seed IDs → one triangle from the 3 distinct seeds.
+//   - 4 distinct seed IDs → two triangles: (a,b,c) and (b,c,d), splitting
+//     the quad along the (b,c) anti-diagonal.  Both triangles are valid since
+//     4 Voronoi cells sharing a corner implies the 4 seeds are in convex
+//     position.
+//   Max output: 2*(W-1)*(H-1) raw entries (at most 2 per block).
 // Step 3 (GPU): thrust::sort + thrust::unique on the device buffer.
 // Step 4 (GPU): seed-position-scan triangle assignment.
 //   For each pixel, iterate all seeds; skip any whose Manhattan distance to
@@ -58,7 +66,7 @@ struct RawEqual {
 };
 
 // ---------------------------------------------------------------------------
-// Kernel 1: detect triangle seeds (all 4 L-shape orientations)
+// Kernel 1: detect triangle seeds via 2x2 block scan
 // ---------------------------------------------------------------------------
 
 __global__
@@ -70,27 +78,42 @@ void find_triangle_seeds_kernel(
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= W || y >= H) return;
+    if (x >= W - 1 || y >= H - 1) return;   // 2x2 block must be in bounds
 
-    auto idx = [&](int cx, int cy) -> int32_t {
-        return n_grid[cy * W + cx];
-    };
+    int32_t a = n_grid[ y      * W + x    ];  // top-left
+    int32_t b = n_grid[ y      * W + x + 1];  // top-right
+    int32_t c = n_grid[(y + 1) * W + x    ];  // bottom-left
+    int32_t d = n_grid[(y + 1) * W + x + 1];  // bottom-right
 
-    auto try_register = [&](int gx, int gy, int32_t a, int32_t b, int32_t c) {
-        if (a == UNDEF || b == UNDEF || c == UNDEF) return;
-        if (a == b || a == c || b == c) return;
-        int32_t pos = atomicAdd(counter, 1);
-        int32_t sa = a, sb = b, sc = c;
+    // Sort three seed IDs and atomically write one RawTriangle entry.
+    auto register_tri = [&](int32_t oa, int32_t ob, int32_t oc) {
+        int32_t sa = oa, sb = ob, sc = oc;
         if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
         if (sb > sc) { int32_t t = sb; sb = sc; sc = t; }
         if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
-        raw_buf[pos] = {gx, gy, sa, sb, sc, a, b, c};
+        int32_t pos = atomicAdd(counter, 1);
+        raw_buf[pos] = {x, y, sa, sb, sc, oa, ob, oc};
     };
 
-    if (x >= 1   && y <= H-2) try_register(x, y, idx(x-1,y), idx(x,y),   idx(x,  y+1));
-    if (x <= W-2 && y <= H-2) try_register(x, y, idx(x,  y), idx(x+1,y), idx(x,  y+1));
-    if (x <= W-2 && y >= 1  ) try_register(x, y, idx(x,  y), idx(x+1,y), idx(x,  y-1));
-    if (x >= 1   && y >= 1  ) try_register(x, y, idx(x-1,y), idx(x,  y), idx(x,  y-1));
+    // Collect distinct seed IDs from the 2x2 block.
+    int32_t quad[4] = {a, b, c, d};
+    int32_t s[4];
+    int n = 0;
+    for (int i = 0; i < 4; ++i) {
+        bool dup = false;
+        for (int j = 0; j < n; ++j) if (s[j] == quad[i]) { dup = true; break; }
+        if (!dup) s[n++] = quad[i];
+    }
+
+    if (n == 3) {
+        // Three cells meet at this corner: one Delaunay triangle.
+        register_tri(s[0], s[1], s[2]);
+    } else if (n == 4) {
+        // Four cells meet: split the convex quad along the (b,c) anti-diagonal.
+        register_tri(a, b, c);
+        register_tri(b, c, d);
+    }
+    // n <= 2: at most two distinct cells, no triangle.
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +252,7 @@ void cuda_compute_triangulation(
     // Step 2: detect raw triangle seeds
     // -----------------------------------------------------------------------
 
-    const int max_raw = N * 4;
+    const int max_raw = 2 * (W - 1) * (H - 1);  // at most 2 triangles per 2x2 block
     RawTriangle* d_raw = nullptr;
     cudaMalloc(&d_raw, max_raw * sizeof(RawTriangle));
 
