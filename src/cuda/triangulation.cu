@@ -175,8 +175,8 @@ void assign_triangles_kernel(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
 
-    float px = x + 0.5f;
-    float py = y + 0.5f;
+    float px = (float)x;
+    float py = (float)y;
     int32_t best = -1;
 
     for (int sid = 0; sid < N_seeds; ++sid) {
