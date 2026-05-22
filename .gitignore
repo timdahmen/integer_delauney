@@ -214,3 +214,6 @@ __marimo__/
 
 # Claude internal
 .claude/
+
+# VS Code settings
+.vscode/
