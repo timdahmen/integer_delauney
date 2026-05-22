@@ -13,11 +13,11 @@
 //   uniform distributions; scales with local seed density, not total N.
 //
 // Host copies:
-//   • voronoi seed_id channel              → device  (input, once)
-//   • seed positions                        → device  (input, once)
-//   • deduplicated triangles               ← device  (output, ~7 MB)
-//   • CSR adjacency list                   → device  (built host-side, ~3 MB)
-//   • triangle_id grid                     ← device  (output, W*H ints)
+//   - voronoi seed_id channel              -> device  (input, once)
+//   - seed positions                       -> device  (input, once)
+//   - deduplicated triangles               <- device  (output, ~7 MB)
+//   - CSR adjacency list                   -> device  (built host-side, ~3 MB)
+//   - triangle_id grid                     <- device  (output, W*H ints)
 
 #include "triangulation.cuh"
 
