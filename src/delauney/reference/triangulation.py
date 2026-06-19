@@ -1,5 +1,6 @@
 """NumPy reference implementation of GridTriangulation."""
 import numpy as np
+from delauney.reference.voronoi import RegularDelaunay as _RefVoronoi
 
 
 class GridTriangulation:
@@ -17,6 +18,7 @@ class GridTriangulation:
         self,
         voronoi_grid: np.ndarray,
         seed_positions: list[tuple[int, int]],
+        border_padding: int = 0,
     ) -> tuple[dict, np.ndarray]:
         """Return (triangle_map, triangulation_grid).
 
@@ -29,6 +31,11 @@ class GridTriangulation:
             (i.e. index == seed_id after the x-then-y sort applied internally
             by RegularDelaunay).  Pass the *original* seed list; this method
             re-applies the same sort so that index == seed_id.
+        border_padding:
+            Extend the Voronoi by this many pixels in each direction before
+            triangle detection so that border triangles whose Voronoi vertex
+            lies outside the original image are not missed.  The output grid
+            is always the original (H, W, 3) resolution.
 
         Returns
         -------
@@ -42,7 +49,19 @@ class GridTriangulation:
         sorted_seeds = seeds_arr[order].astype(np.float64)  # for geometric ops
 
         H, W = voronoi_grid.shape[:2]
-        n_grid = voronoi_grid[:, :, 0]  # seed_id per cell
+
+        # Build the grid used for triangle detection.  With border_padding > 0
+        # we run a fresh Voronoi on a larger canvas so that Voronoi vertices
+        # outside the original image become visible and border triangles are
+        # detected.  Shifting all seeds by (P, P) preserves lexicographic
+        # order, so seed IDs stay consistent with sorted_seeds.
+        P = border_padding
+        if P > 0:
+            shifted = [(int(x) + P, int(y) + P) for x, y in sorted_seeds]
+            pad_vgrid = _RefVoronoi().compute(W + 2 * P, H + 2 * P, shifted)
+            n_grid = pad_vgrid[:, :, 0]
+        else:
+            n_grid = voronoi_grid[:, :, 0]  # seed_id per cell
 
         # Step 2: scan all 4 L-shape orientations so that every triple-region
         # meeting is found regardless of which diagonal it sits on.
@@ -66,7 +85,9 @@ class GridTriangulation:
                 return
             if triplet not in seen_triplets:
                 seen_triplets[triplet] = next_id
-                triangle_map[next_id] = (gx, gy, a, b, c)
+                # Shift detection pixel back to original coordinate space.
+                # Border triangles will have gx or gy outside [0,W-1]/[0,H-1].
+                triangle_map[next_id] = (gx - P, gy - P, a, b, c)
                 next_id += 1
 
         # left+down: cell=(x,y), left=(x-1,y), down=(x,y+1)

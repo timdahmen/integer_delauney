@@ -28,6 +28,7 @@
 //   - triangle_id grid                     <- device  (output, W*H ints)
 
 #include "triangulation.cuh"
+#include "voronoi.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -208,10 +209,18 @@ void cuda_compute_triangulation(
     const std::vector<int32_t>& seed_ys,
     std::vector<TriangleEntry>& triangle_map_out,
     std::vector<int32_t>& out_grid,
-    TriTimings* timings)
+    TriTimings* timings,
+    int border_padding)
 {
     const int N        = W * H;
     const int N_seeds  = (int)seed_xs.size();
+    const int P        = border_padding;
+
+    // Detection grid dimensions: padded canvas captures Voronoi vertices that
+    // lie outside the original image, producing the missing border triangles.
+    const int W_det = W + 2 * P;
+    const int H_det = H + 2 * P;
+    const int N_det = W_det * H_det;
 
     auto make_event = [](cudaEvent_t* e) { cudaEventCreate(e); };
     auto record     = [](cudaEvent_t e)  { cudaEventRecord(e); };
@@ -229,30 +238,52 @@ void cuda_compute_triangulation(
     }
 
     // -----------------------------------------------------------------------
-    // Upload inputs: seed_id channel, seed positions
+    // Build h_n: seed_id channel for the detection grid.
+    //
+    // With border_padding > 0 we run a fresh Voronoi on the padded canvas with
+    // seeds shifted by (P, P).  Shifting preserves lexicographic order, so
+    // cuda_compute_voronoi assigns the same IDs as the original run.
     // -----------------------------------------------------------------------
 
-    std::vector<int32_t> h_n(N);
-    for (int i = 0; i < N; ++i)
-        h_n[i] = voronoi_grid[i * 2];
+    std::vector<int32_t> h_n(N_det);
+
+    if (P > 0) {
+        std::vector<Seed> padded_seeds(N_seeds);
+        for (int i = 0; i < N_seeds; ++i)
+            padded_seeds[i] = {seed_xs[i] + P, seed_ys[i] + P};
+
+        std::vector<int32_t> padded_flat;
+        cuda_compute_voronoi(W_det, H_det, padded_seeds, padded_flat);
+
+        for (int i = 0; i < N_det; ++i)
+            h_n[i] = padded_flat[i * 2];   // seed_id at even indices
+    } else {
+        for (int i = 0; i < N; ++i)
+            h_n[i] = voronoi_grid[i * 2];
+    }
+
+    // -----------------------------------------------------------------------
+    // Upload inputs: detection seed_id grid, seed positions (always original)
+    // -----------------------------------------------------------------------
 
     int32_t *d_n = nullptr;
     int32_t *d_sx = nullptr, *d_sy = nullptr;
-    cudaMalloc(&d_n,    N       * sizeof(int32_t));
+    cudaMalloc(&d_n,    N_det   * sizeof(int32_t));
     cudaMalloc(&d_sx,   N_seeds * sizeof(int32_t));
     cudaMalloc(&d_sy,   N_seeds * sizeof(int32_t));
-    cudaMemcpy(d_n,    h_n.data(),       N       * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sx,   seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sy,   seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_n,  h_n.data(),       N_det   * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sx, seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sy, seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     dim3 block(16, 16);
-    dim3 grid_dim((W + 15) / 16, (H + 15) / 16);
+    dim3 grid_det((W_det + 15) / 16, (H_det + 15) / 16);
+    dim3 grid_out((W     + 15) / 16, (H     + 15) / 16);
 
     // -----------------------------------------------------------------------
-    // Step 2: detect raw triangle seeds
+    // Step 2: detect raw triangle seeds on the (possibly padded) grid
     // -----------------------------------------------------------------------
 
-    const int max_raw = 2 * (W - 1) * (H - 1);  // at most 2 triangles per 2x2 block
+    const int max_raw = 2 * (W_det - 1) * (H_det - 1);
     RawTriangle* d_raw = nullptr;
     cudaMalloc(&d_raw, max_raw * sizeof(RawTriangle));
 
@@ -262,7 +293,7 @@ void cuda_compute_triangulation(
 
     if (timings) record(ev0);
 
-    find_triangle_seeds_kernel<<<grid_dim, block>>>(d_n, W, H, d_raw, d_counter);
+    find_triangle_seeds_kernel<<<grid_det, block>>>(d_n, W_det, H_det, d_raw, d_counter);
     cudaDeviceSynchronize();
 
     int32_t raw_count = 0;
@@ -285,7 +316,10 @@ void cuda_compute_triangulation(
 
     if (timings) record(ev3);
 
-    // Copy deduplicated entries to host (for the Python dict + CSR build)
+    // Copy deduplicated entries to host.
+    // Shift detection pixel (x,y) back from padded space to original space;
+    // border triangles will have x or y outside [0,W-1]/[0,H-1] which is correct
+    // (their Voronoi vertex lies outside the original image).
     std::vector<RawTriangle> h_dedup(N_triangles);
     cudaMemcpy(h_dedup.data(), d_raw, N_triangles * sizeof(RawTriangle),
                cudaMemcpyDeviceToHost);
@@ -293,7 +327,7 @@ void cuda_compute_triangulation(
     triangle_map_out.clear();
     triangle_map_out.reserve(N_triangles);
     for (const auto& r : h_dedup)
-        triangle_map_out.push_back({r.x, r.y, r.orig_a, r.orig_b, r.orig_c});
+        triangle_map_out.push_back({r.x - P, r.y - P, r.orig_a, r.orig_b, r.orig_c});
 
     // -----------------------------------------------------------------------
     // Build CSR: seed → triangle list  (host, then upload)
@@ -331,6 +365,10 @@ void cuda_compute_triangulation(
 
     // -----------------------------------------------------------------------
     // Step 4: assign pixels to triangles (seed-position-scan)
+    //
+    // Always runs on the original W×H with original seed coordinates.
+    // Border triangles (detected via padding) cover pixels near the image edge
+    // because their seed vertices are inside the original image.
     // -----------------------------------------------------------------------
 
     int32_t* d_t = nullptr;
@@ -338,11 +376,6 @@ void cuda_compute_triangulation(
 
     if (timings) record(ev4);
 
-    // window_cap: Chebyshev guard on seed distance.  For any pixel P inside
-    // triangle (A,B,C), at least one vertex V satisfies
-    //   max(|Px-Vx|, |Py-Vy|) <= max_manhattan_side
-    // so setting window_cap = max_side + SLACK guarantees every vertex of the
-    // containing triangle is visited, regardless of Voronoi ownership.
     int max_side = 0;
     for (int tid = 0; tid < N_triangles; ++tid) {
         const auto& r = h_dedup[tid];
@@ -357,7 +390,7 @@ void cuda_compute_triangulation(
     const int window_cap = max(20, max_side + WINDOW_SLACK);
 
     if (N_triangles > 0) {
-        assign_triangles_kernel<<<grid_dim, block>>>(
+        assign_triangles_kernel<<<grid_out, block>>>(
             d_t, W, H,
             d_raw, d_sx, d_sy,
             d_csr_ptr, d_csr_idx,

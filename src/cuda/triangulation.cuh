@@ -22,4 +22,5 @@ void cuda_compute_triangulation(
     const std::vector<int32_t>& seed_ys,
     std::vector<TriangleEntry>& triangle_map_out,
     std::vector<int32_t>& out_grid,
-    TriTimings* timings = nullptr);
+    TriTimings* timings = nullptr,
+    int border_padding = 0);

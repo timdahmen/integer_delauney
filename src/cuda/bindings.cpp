@@ -86,8 +86,12 @@ class PyGridTriangulation {
 public:
     py::tuple compute(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
-        const py::object& seeds_obj)
+        const py::object& seeds_obj,
+        int border_padding = 0)
     {
+        if (border_padding < 0)
+            throw std::invalid_argument("border_padding must be >= 0");
+
         auto info = vgrid.request();
         if (info.ndim != 3 || info.shape[2] != 2)
             throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
@@ -109,17 +113,21 @@ public:
 
         cuda_compute_triangulation(W, H,
             static_cast<const int32_t*>(info.ptr),
-            seed_xs, seed_ys, tri_map, flat_out, nullptr);
+            seed_xs, seed_ys, tri_map, flat_out, nullptr, border_padding);
 
         return _build_output(tri_map, flat_out, H, W);
     }
 
     // compute_timed() — same as compute() but also returns a timings dict.
-    // Signature: (voronoi_grid, seed_positions) -> (tri_map, grid, timings)
+    // Signature: (voronoi_grid, seed_positions, border_padding=0) -> (tri_map, grid, timings)
     py::tuple compute_timed(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
-        const py::object& seeds_obj)
+        const py::object& seeds_obj,
+        int border_padding = 0)
     {
+        if (border_padding < 0)
+            throw std::invalid_argument("border_padding must be >= 0");
+
         auto info = vgrid.request();
         if (info.ndim != 3 || info.shape[2] != 2)
             throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
@@ -141,7 +149,7 @@ public:
 
         cuda_compute_triangulation(W, H,
             static_cast<const int32_t*>(info.ptr),
-            seed_xs, seed_ys, tri_map, flat_out, &timings);
+            seed_xs, seed_ys, tri_map, flat_out, &timings, border_padding);
 
         py::dict py_timings;
         py_timings["detect_ms"] = timings.detect_ms;
@@ -272,12 +280,18 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def(py::init<>())
         .def("compute", &PyGridTriangulation::compute,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
+             py::arg("border_padding") = 0,
              "Extract Delaunay triangulation from Voronoi grid.\n\n"
+             "border_padding: extend the Voronoi by this many pixels in each\n"
+             "direction before triangle detection so that border triangles whose\n"
+             "Voronoi vertex lies outside the original image are not missed.\n"
+             "The output grid is always the original (H, W, 3) resolution.\n\n"
              "Returns (triangle_map, triangulation_grid) where "
              "triangle_map is {int: (x,y,id_a,id_b,id_c)} and "
              "triangulation_grid has shape (H, W, 3).")
         .def("compute_timed", &PyGridTriangulation::compute_timed,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
+             py::arg("border_padding") = 0,
              "Same as compute() but also returns a timings dict.\n\n"
              "Returns (triangle_map, triangulation_grid, timings) where "
              "timings has keys detect_ms, dedup_ms, assign_ms (float, ms).");
