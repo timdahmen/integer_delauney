@@ -160,6 +160,53 @@ public:
         return py::make_tuple(result[0], result[1], py_timings);
     }
 
+    // compute_debug() — same as compute() but also returns the padded Voronoi
+    // grid used internally for triangle detection.
+    // Returns (triangle_map, triangulation_grid, padded_voronoi_grid) where
+    // padded_voronoi_grid has shape (H+2*P, W+2*P, 2).
+    py::tuple compute_debug(
+        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
+        const py::object& seeds_obj,
+        int border_padding = 0)
+    {
+        if (border_padding < 0)
+            throw std::invalid_argument("border_padding must be >= 0");
+
+        auto info = vgrid.request();
+        if (info.ndim != 3 || info.shape[2] != 2)
+            throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
+
+        int H = static_cast<int>(info.shape[0]);
+        int W = static_cast<int>(info.shape[1]);
+
+        auto seeds = sort_seeds(seeds_obj, W, H);
+        int N_seeds = static_cast<int>(seeds.size());
+        std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
+        for (int i = 0; i < N_seeds; ++i) {
+            seed_xs[i] = seeds[i].x;
+            seed_ys[i] = seeds[i].y;
+        }
+
+        std::vector<TriangleEntry> tri_map;
+        std::vector<int32_t> flat_out;
+        std::vector<int32_t> padded_flat;
+
+        cuda_compute_triangulation(W, H,
+            static_cast<const int32_t*>(info.ptr),
+            seed_xs, seed_ys, tri_map, flat_out,
+            nullptr, border_padding, &padded_flat);
+
+        int H_det = H + 2 * border_padding;
+        int W_det = W + 2 * border_padding;
+        py::array_t<int32_t> padded_arr({H_det, W_det, 2});
+        if (!padded_flat.empty())
+            std::memcpy(padded_arr.mutable_data(), padded_flat.data(),
+                        padded_flat.size() * sizeof(int32_t));
+
+        auto result = _build_output(tri_map, flat_out, H, W);
+        return py::make_tuple(result[0], result[1], padded_arr);
+    }
+
 private:
     static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
                                    const std::vector<int32_t>& flat_out,
@@ -294,7 +341,13 @@ PYBIND11_MODULE(_delauney_cuda, m)
              py::arg("border_padding") = 0,
              "Same as compute() but also returns a timings dict.\n\n"
              "Returns (triangle_map, triangulation_grid, timings) where "
-             "timings has keys detect_ms, dedup_ms, assign_ms (float, ms).");
+             "timings has keys detect_ms, dedup_ms, assign_ms (float, ms).")
+        .def("compute_debug", &PyGridTriangulation::compute_debug,
+             py::arg("voronoi_grid"), py::arg("seed_positions"),
+             py::arg("border_padding") = 0,
+             "Same as compute() but also returns the padded Voronoi grid.\n\n"
+             "Returns (triangle_map, triangulation_grid, padded_voronoi_grid) where "
+             "padded_voronoi_grid has shape (H+2*P, W+2*P, 2).");
 
     py::class_<PyIncrementalDelaunay>(m, "IncrementalDelaunay")
         .def(py::init<int, int, int>(),

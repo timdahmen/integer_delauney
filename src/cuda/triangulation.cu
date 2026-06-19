@@ -11,8 +11,8 @@
 //   Max output: 2*(W-1)*(H-1) raw entries (at most 2 per block).
 // Step 3 (GPU): thrust::sort + thrust::unique on the device buffer.
 // Step 4 (GPU): seed-position-scan triangle assignment.
-//   For each pixel, iterate all seeds; skip any whose Manhattan distance to
-//   the pixel exceeds window_cap (= max_manhattan_side + SLACK).  For seeds
+//   For each pixel, iterate all seeds; skip any whose Chebyshev distance to
+//   the pixel exceeds window_cap (= max_l2_side + SLACK).  For seeds
 //   that pass the guard, iterate their CSR triangle list and run the
 //   containment test.  window_cap is derived from the longest detected
 //   triangle side, so the window always covers at least one vertex of the
@@ -36,6 +36,7 @@
 #include <thrust/unique.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -153,7 +154,7 @@ bool point_in_triangle(float px, float py,
 //      so duplicate tests are possible but idempotent.
 //
 // Correctness argument: for any pixel P inside triangle (A,B,C), at least one
-// vertex V satisfies Chebyshev_dist(P,V) <= Manhattan_dist(A,B) (longest side).
+// vertex V satisfies Chebyshev_dist(P,V) <= L2_dist(A,B) (longest side).
 // Because window_cap >= max_side + SLACK, every vertex of the containing
 // triangle falls within the window.
 // ---------------------------------------------------------------------------
@@ -210,7 +211,8 @@ void cuda_compute_triangulation(
     std::vector<TriangleEntry>& triangle_map_out,
     std::vector<int32_t>& out_grid,
     TriTimings* timings,
-    int border_padding)
+    int border_padding,
+    std::vector<int32_t>* padded_voronoi_out)
 {
     const int N        = W * H;
     const int N_seeds  = (int)seed_xs.size();
@@ -254,6 +256,9 @@ void cuda_compute_triangulation(
 
         std::vector<int32_t> padded_flat;
         cuda_compute_voronoi(W_det, H_det, padded_seeds, padded_flat);
+
+        if (padded_voronoi_out)
+            *padded_voronoi_out = padded_flat;
 
         for (int i = 0; i < N_det; ++i)
             h_n[i] = padded_flat[i * 2];   // seed_id at even indices
@@ -379,12 +384,14 @@ void cuda_compute_triangulation(
     int max_side = 0;
     for (int tid = 0; tid < N_triangles; ++tid) {
         const auto& r = h_dedup[tid];
-        auto md = [&](int32_t i, int32_t j) {
-            return abs(seed_xs[i] - seed_xs[j]) + abs(seed_ys[i] - seed_ys[j]);
+        auto l2 = [&](int32_t i, int32_t j) {
+            float dx = (float)(seed_xs[i] - seed_xs[j]);
+            float dy = (float)(seed_ys[i] - seed_ys[j]);
+            return (int)std::sqrtf(dx * dx + dy * dy);
         };
-        int s1 = md(r.orig_a, r.orig_b);
-        int s2 = md(r.orig_a, r.orig_c);
-        int s3 = md(r.orig_b, r.orig_c);
+        int s1 = l2(r.orig_a, r.orig_b);
+        int s2 = l2(r.orig_a, r.orig_c);
+        int s3 = l2(r.orig_b, r.orig_c);
         max_side = max(max_side, max(s1, max(s2, s3)));
     }
     const int window_cap = max(20, max_side + WINDOW_SLACK);
