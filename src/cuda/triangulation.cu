@@ -18,6 +18,8 @@
 
 #include "triangulation.cuh"
 
+#include "nvtx_range.h"
+
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
@@ -229,6 +231,8 @@ void cuda_compute_triangulation(
     std::vector<int32_t>& out_grid,
     TriTimings* timings)
 {
+    DELAUNEY_NVTX_RANGE_C("cuda_compute_triangulation", delauney_nvtx::kPhase);
+
     const int N        = W * H;
     const int N_seeds  = (int)seed_xs.size();
 
@@ -251,24 +255,28 @@ void cuda_compute_triangulation(
     // Upload inputs: seed_id channel, distance channel, seed positions
     // -----------------------------------------------------------------------
 
-    // Upload the seed grid as-is (one contiguous 8MB copy) and split
-    // it on the GPU instead of looping over it on the CPU first.
-    int32_t* seed_distance_grid = nullptr;
-    cudaMalloc(&seed_distance_grid, (size_t)N * 2 * sizeof(int32_t));
-    cudaMemcpy(seed_distance_grid, voronoi_grid, (size_t)N * 2 * sizeof(int32_t),
-        cudaMemcpyHostToDevice);
-
     int32_t *d_n = nullptr, *d_dist = nullptr;
     int32_t *d_sx = nullptr, *d_sy = nullptr;
-    cudaMalloc(&d_n,    N       * sizeof(int32_t));
-    cudaMalloc(&d_dist, N       * sizeof(int32_t));
-    cudaMalloc(&d_sx,   N_seeds * sizeof(int32_t));
-    cudaMalloc(&d_sy,   N_seeds * sizeof(int32_t));
+    int32_t* seed_distance_grid = nullptr;
+    {
+        DELAUNEY_NVTX_RANGE_C("tri: upload inputs", delauney_nvtx::kMemcpy);
 
-    split_seed_distance_grid_kernel <<<(N + 255) / 256, 256 >>> (seed_distance_grid, d_n, d_dist, N);
+        // Upload the seed grid as-is (one contiguous 8MB copy) and split
+        // it on the GPU instead of looping over it on the CPU first.
+        cudaMalloc(&seed_distance_grid, (size_t)N * 2 * sizeof(int32_t));
+        cudaMemcpy(seed_distance_grid, voronoi_grid, (size_t)N * 2 * sizeof(int32_t),
+            cudaMemcpyHostToDevice);
 
-    cudaMemcpy(d_sx,   seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sy,   seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMalloc(&d_n,    N       * sizeof(int32_t));
+        cudaMalloc(&d_dist, N       * sizeof(int32_t));
+        cudaMalloc(&d_sx,   N_seeds * sizeof(int32_t));
+        cudaMalloc(&d_sy,   N_seeds * sizeof(int32_t));
+
+        split_seed_distance_grid_kernel <<<(N + 255) / 256, 256 >>> (seed_distance_grid, d_n, d_dist, N);
+
+        cudaMemcpy(d_sx,   seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_sy,   seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+    }
 
 
     dim3 block(16, 16);
@@ -286,16 +294,19 @@ void cuda_compute_triangulation(
     cudaMalloc(&d_counter, sizeof(int32_t));
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
-    if (timings) record(ev0);
-
-    find_triangle_seeds_kernel<<<grid_dim, block>>>(d_n, W, H, d_raw, d_counter);
-    cudaDeviceSynchronize();
-
     int32_t raw_count = 0;
-    cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_counter);
+    {
+        DELAUNEY_NVTX_RANGE_C("tri: detect", delauney_nvtx::kKernel);
+        if (timings) record(ev0);
 
-    if (timings) record(ev1);
+        find_triangle_seeds_kernel<<<grid_dim, block>>>(d_n, W, H, d_raw, d_counter);
+        cudaDeviceSynchronize();
+
+        cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        cudaFree(d_counter);
+
+        if (timings) record(ev1);
+    }
 
     // -----------------------------------------------------------------------
     // Step 3: deduplicate on device with Thrust sort + unique
@@ -303,23 +314,33 @@ void cuda_compute_triangulation(
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
 
-    if (timings) record(ev2);
+    int N_triangles = 0;
+    {
+        DELAUNEY_NVTX_RANGE_C("tri: dedup (thrust)", delauney_nvtx::kKernel);
+        if (timings) record(ev2);
 
-    thrust::sort(d_ptr, d_ptr + raw_count, RawLess{});
-    auto new_end   = thrust::unique(d_ptr, d_ptr + raw_count, RawEqual{});
-    int N_triangles = (int)(new_end - d_ptr);
+        thrust::sort(d_ptr, d_ptr + raw_count, RawLess{});
+        auto new_end = thrust::unique(d_ptr, d_ptr + raw_count, RawEqual{});
+        N_triangles  = (int)(new_end - d_ptr);
 
-    if (timings) record(ev3);
+        if (timings) record(ev3);
+    }
 
-    // Copy deduplicated entries to host (for the Python dict + CSR build)
+    // Copy deduplicated entries to host (for the triangle map + CSR build)
     std::vector<RawTriangle> h_dedup(N_triangles);
-    cudaMemcpy(h_dedup.data(), d_raw, N_triangles * sizeof(RawTriangle),
-               cudaMemcpyDeviceToHost);
+    {
+        DELAUNEY_NVTX_RANGE_C("tri: D2H dedup triangles", delauney_nvtx::kMemcpy);
+        cudaMemcpy(h_dedup.data(), d_raw, N_triangles * sizeof(RawTriangle),
+                   cudaMemcpyDeviceToHost);
+    }
 
-    triangle_map_out.clear();
-    triangle_map_out.reserve(N_triangles);
-    for (const auto& r : h_dedup)
-        triangle_map_out.push_back({r.x, r.y, r.orig_a, r.orig_b, r.orig_c});
+    {
+        DELAUNEY_NVTX_RANGE("tri: build triangle map (host)");
+        triangle_map_out.clear();
+        triangle_map_out.reserve(N_triangles);
+        for (const auto& r : h_dedup)
+            triangle_map_out.push_back({r.x, r.y, r.orig_a, r.orig_b, r.orig_c});
+    }
 
     // -----------------------------------------------------------------------
     // Build CSR: seed → triangle list  (host, then upload)
@@ -329,31 +350,36 @@ void cuda_compute_triangulation(
     // csr_idx[i]   = triangle ID
     // -----------------------------------------------------------------------
 
-    std::vector<int32_t> h_csr_ptr(N_seeds + 1, 0);
-    for (int tid = 0; tid < N_triangles; ++tid) {
-        h_csr_ptr[h_dedup[tid].orig_a + 1]++;
-        h_csr_ptr[h_dedup[tid].orig_b + 1]++;
-        h_csr_ptr[h_dedup[tid].orig_c + 1]++;
-    }
-    for (int s = 1; s <= N_seeds; ++s)
-        h_csr_ptr[s] += h_csr_ptr[s - 1];
-
-    const int csr_size = h_csr_ptr[N_seeds];  // == 3 * N_triangles
-    std::vector<int32_t> h_csr_idx(csr_size);
-    std::vector<int32_t> fill(N_seeds, 0);
-
-    for (int tid = 0; tid < N_triangles; ++tid) {
-        for (int32_t s : {h_dedup[tid].orig_a, h_dedup[tid].orig_b, h_dedup[tid].orig_c}) {
-            h_csr_idx[h_csr_ptr[s] + fill[s]] = tid;
-            fill[s]++;
-        }
-    }
-
     int32_t *d_csr_ptr = nullptr, *d_csr_idx = nullptr;
-    cudaMalloc(&d_csr_ptr, (N_seeds + 1) * sizeof(int32_t));
-    cudaMalloc(&d_csr_idx,  csr_size     * sizeof(int32_t));
-    cudaMemcpy(d_csr_ptr, h_csr_ptr.data(), (N_seeds + 1) * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_csr_idx, h_csr_idx.data(),  csr_size     * sizeof(int32_t), cudaMemcpyHostToDevice);
+    {
+        DELAUNEY_NVTX_RANGE("tri: build CSR (host)");
+
+        std::vector<int32_t> h_csr_ptr(N_seeds + 1, 0);
+        for (int tid = 0; tid < N_triangles; ++tid) {
+            h_csr_ptr[h_dedup[tid].orig_a + 1]++;
+            h_csr_ptr[h_dedup[tid].orig_b + 1]++;
+            h_csr_ptr[h_dedup[tid].orig_c + 1]++;
+        }
+        for (int s = 1; s <= N_seeds; ++s)
+            h_csr_ptr[s] += h_csr_ptr[s - 1];
+
+        const int csr_size = h_csr_ptr[N_seeds];  // == 3 * N_triangles
+        std::vector<int32_t> h_csr_idx(csr_size);
+        std::vector<int32_t> fill(N_seeds, 0);
+
+        for (int tid = 0; tid < N_triangles; ++tid) {
+            for (int32_t s : {h_dedup[tid].orig_a, h_dedup[tid].orig_b, h_dedup[tid].orig_c}) {
+                h_csr_idx[h_csr_ptr[s] + fill[s]] = tid;
+                fill[s]++;
+            }
+        }
+
+        cudaMalloc(&d_csr_ptr, (N_seeds + 1) * sizeof(int32_t));
+        cudaMalloc(&d_csr_idx,  csr_size     * sizeof(int32_t));
+        DELAUNEY_NVTX_MARK("tri: H2D CSR");
+        cudaMemcpy(d_csr_ptr, h_csr_ptr.data(), (N_seeds + 1) * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_csr_idx, h_csr_idx.data(),  csr_size     * sizeof(int32_t), cudaMemcpyHostToDevice);
+    }
 
     // -----------------------------------------------------------------------
     // Step 4: assign pixels to triangles (window-based nearest-neighbor)
@@ -362,34 +388,43 @@ void cuda_compute_triangulation(
     int32_t* d_t = nullptr;
     cudaMalloc(&d_t, N * sizeof(int32_t));
 
-    if (timings) record(ev4);
+    {
+        DELAUNEY_NVTX_RANGE_C("tri: assign", delauney_nvtx::kKernel);
+        if (timings) record(ev4);
 
-    if (N_triangles > 0) {
-        assign_triangles_kernel<<<grid_dim, block>>>(
-            d_t, W, H,
-            d_n, d_dist,
-            d_raw, d_sx, d_sy,
-            d_csr_ptr, d_csr_idx,
-            N_seeds, N_triangles);
-        cudaDeviceSynchronize();
-    } else {
-        cudaMemset(d_t, -1, N * sizeof(int32_t));
+        if (N_triangles > 0) {
+            assign_triangles_kernel<<<grid_dim, block>>>(
+                d_t, W, H,
+                d_n, d_dist,
+                d_raw, d_sx, d_sy,
+                d_csr_ptr, d_csr_idx,
+                N_seeds, N_triangles);
+            cudaDeviceSynchronize();
+        } else {
+            cudaMemset(d_t, -1, N * sizeof(int32_t));
+        }
+
+        if (timings) record(ev5);
     }
-
-    if (timings) record(ev5);
 
     // -----------------------------------------------------------------------
     // Step 5: build output grid (H * W * 3) and fill timings
     // -----------------------------------------------------------------------
 
     std::vector<int32_t> h_t(N);
-    cudaMemcpy(h_t.data(), d_t, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    {
+        DELAUNEY_NVTX_RANGE_C("tri: D2H triangle grid", delauney_nvtx::kMemcpy);
+        cudaMemcpy(h_t.data(), d_t, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    }
 
-    out_grid.resize(N * 3);
-    for (int i = 0; i < N; ++i) {
-        out_grid[i * 3]     = voronoi_grid[i * 2];
-        out_grid[i * 3 + 1] = voronoi_grid[i * 2 + 1];
-        out_grid[i * 3 + 2] = h_t[i];
+    {
+        DELAUNEY_NVTX_RANGE("tri: build out grid (host)");
+        out_grid.resize(N * 3);
+        for (int i = 0; i < N; ++i) {
+            out_grid[i * 3]     = voronoi_grid[i * 2];
+            out_grid[i * 3 + 1] = voronoi_grid[i * 2 + 1];
+            out_grid[i * 3 + 2] = h_t[i];
+        }
     }
 
     if (timings) {
