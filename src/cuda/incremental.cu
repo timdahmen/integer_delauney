@@ -580,31 +580,66 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
         }
     }
 
-    // Compact: keep non-stale, append new; build remap old→new
+    // This is kept initialized with -1 because I could not figure out where the remap[tid] = -1 line 
+    // would need to be ... it created a bevy of issuess. This is load-bearing, do not remove it.
     std::vector<int32_t> remap(old_count, -1);
     {
-        DELAUNEY_NVTX_RANGE("inc: compact registry (host)");
-        std::vector<HTriangle> compacted;
-        compacted.reserve(old_count - (int)std::count(is_stale.begin(),is_stale.end(),true)
-                          + (int)to_add.size());
+        DELAUNEY_NVTX_RANGE("inc: compact registry and remap (host)");
+
+        // Fill each stale slot with the last live triangle.
+        int next = old_count;
+        int last = old_count - 1;
         for (int tid = 0; tid < old_count; ++tid) {
-            if (!is_stale[tid]) {
-                remap[tid] = (int32_t)compacted.size();
-                compacted.push_back(h_triangles_[tid]);
+            if (is_stale[tid]) {
+                // In-place erase, stale, we dont need this
+                h_triplet_to_tid_.erase(pack_triplet_(
+                    h_triangles_[tid].a,
+                    h_triangles_[tid].b,
+                    h_triangles_[tid].c
+                ));
+
+                // Skip if no in-place remapping is necessary
+                if (tid < next) {      
+                    // Skip over missing elements. Not a bottleneck,
+                    // has a linear amount of runs total and needs to be done anywayW
+                    while (last > tid && is_stale[last]) {
+                        --last;
+                    }
+
+                    // Next free slot
+                    if (last <= tid) { 
+                        next = tid; 
+                    } else {
+                        // Or remap to the known last next free slot (swap)
+                        h_triangles_[tid] = h_triangles_[last];
+                        remap[last] = tid;
+
+                        // No, you cannot re-use the triplet from before, it is overwritten
+                        // literally two lines above. I spent way too much time here. I did not see the issue.
+                        h_triplet_to_tid_[
+                            pack_triplet_(h_triangles_[tid].a,
+                                h_triangles_[tid].b,
+                                h_triangles_[tid].c)
+                            ] = tid;
+                        next = last;
+                        --last;
+                    } 
+                }
+            } else {
+                // Blindly doing this overwrites our logic
+                // Side-effect of merging this into one loop
+                if (tid < next) {
+                    remap[tid] = tid;
+                }
             }
         }
-        for (const auto& t : to_add) compacted.push_back(t);
 
-        h_triangles_ = std::move(compacted);
-    }
+        h_triangles_.resize(next);
 
-    // Rebuild lookup maps
-    {
-        DELAUNEY_NVTX_RANGE("inc: rebuild lookup maps (host)");
-        h_triplet_to_tid_.clear();
-        for (int tid = 0; tid < (int)h_triangles_.size(); ++tid) {
-            const auto& t = h_triangles_[tid];
-            h_triplet_to_tid_[pack_triplet_(t.a, t.b, t.c)] = tid;
+        // Add new ones to the end, no need for the index
+        for (const auto& t : to_add) {
+            h_triangles_.push_back(t);
+            h_triplet_to_tid_[pack_triplet_(t.a, t.b, t.c)] = (int32_t)h_triangles_.size() - 1;
         }
     }
 
