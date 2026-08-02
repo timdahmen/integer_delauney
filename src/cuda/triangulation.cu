@@ -193,6 +193,29 @@ void assign_triangles_kernel(
     t_grid[y * W + x] = (best != -1) ? best : (N_triangles - 1);
 }
 
+
+// ---------------------------------------------------------------------------
+// Kernel 3: Split an grid into separate arrays.
+//
+// Every GPU thread processes exactly one grid cell.
+// ---------------------------------------------------------------------------
+
+__global__
+void split_seed_distance_grid_kernel(
+    const int32_t* __restrict__ seed_distance_grid,
+    int32_t* __restrict__ seed_ids,
+    int32_t* __restrict__ distances,
+    int num_cells)
+{
+	int cell = blockIdx.x * blockDim.x + threadIdx.x;   // cell index in the grid
+
+	if (cell >= num_cells)  // out-of-bounds check
+        return;
+
+	seed_ids[cell] = seed_distance_grid[cell * 2];        // seed ID channel
+	distances[cell] = seed_distance_grid[cell * 2 + 1];   // distance channel
+}
+
 // ---------------------------------------------------------------------------
 // Host entry point
 // ---------------------------------------------------------------------------
@@ -228,11 +251,12 @@ void cuda_compute_triangulation(
     // Upload inputs: seed_id channel, distance channel, seed positions
     // -----------------------------------------------------------------------
 
-    std::vector<int32_t> h_n(N), h_dist(N);
-    for (int i = 0; i < N; ++i) {
-        h_n[i]    = voronoi_grid[i * 2];
-        h_dist[i] = voronoi_grid[i * 2 + 1];
-    }
+    // Upload the seed grid as-is (one contiguous 8MB copy) and split
+    // it on the GPU instead of looping over it on the CPU first.
+    int32_t* seed_distance_grid = nullptr;
+    cudaMalloc(&seed_distance_grid, (size_t)N * 2 * sizeof(int32_t));
+    cudaMemcpy(seed_distance_grid, voronoi_grid, (size_t)N * 2 * sizeof(int32_t),
+        cudaMemcpyHostToDevice);
 
     int32_t *d_n = nullptr, *d_dist = nullptr;
     int32_t *d_sx = nullptr, *d_sy = nullptr;
@@ -240,10 +264,12 @@ void cuda_compute_triangulation(
     cudaMalloc(&d_dist, N       * sizeof(int32_t));
     cudaMalloc(&d_sx,   N_seeds * sizeof(int32_t));
     cudaMalloc(&d_sy,   N_seeds * sizeof(int32_t));
-    cudaMemcpy(d_n,    h_n.data(),       N       * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_dist, h_dist.data(),    N       * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    split_seed_distance_grid_kernel <<<(N + 255) / 256, 256 >>> (seed_distance_grid, d_n, d_dist, N);
+
     cudaMemcpy(d_sx,   seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_sy,   seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+
 
     dim3 block(16, 16);
     dim3 grid_dim((W + 15) / 16, (H + 15) / 16);
@@ -383,4 +409,5 @@ void cuda_compute_triangulation(
     cudaFree(d_sy);
     cudaFree(d_csr_ptr);
     cudaFree(d_csr_idx);
+    cudaFree(seed_distance_grid);
 }

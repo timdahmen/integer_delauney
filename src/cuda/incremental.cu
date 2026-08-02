@@ -642,10 +642,16 @@ void IncrementalDelaunay::insert(
             throw std::invalid_argument("seed coordinate out of bounds");
 
     // Duplicate check within batch
-    for (int i = 0; i < k; ++i)
-    for (int j = i+1; j < k; ++j)
-        if (new_xs[i] == new_xs[j] && new_ys[i] == new_ys[j])
+	// Use a hash to keep this part O(k) instead of O(k^2)
+	std::unordered_set<uint64_t> batch_hash;
+	batch_hash.reserve(k);  // Reserve space to avoid rehashing
+    for (int i = 0; i < k; ++i) {
+        // for (int j = i+1; j < k; ++j)
+		auto key = pack_xy_(new_xs[i], new_ys[i]);  // Pack x and y into a single 64-bit key
+        if (!batch_hash.insert(key).second) {
             throw std::invalid_argument("duplicate seed positions within batch");
+        }
+    }
 
     // Duplicate check against existing seeds
     for (int i = 0; i < k; ++i)
