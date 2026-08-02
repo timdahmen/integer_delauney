@@ -1,0 +1,37 @@
+﻿{
+  "configurations": [
+    {
+      "name": "x64-Debug",
+      "generator": "Ninja",
+      "configurationType": "Debug",
+      "inheritEnvironments": [ "msvc_x64_x64" ],
+      "buildRoot": "${projectDir}\\out\\build\\${name}",
+      "installRoot": "${projectDir}\\out\\install\\${name}",
+      "cmakeCommandArgs": "",
+      "buildCommandArgs": "",
+      "ctestCommandArgs": "",
+      "variables": [
+        {
+          "name": "pybind11_DIR",
+          "value": "C:/Users/maxim/source/repos/integer_delauney/.venv/Lib/site-packages/pybind11/share/cmake/pybind11",
+          "type": "PATH"
+        },
+        {
+          "name": "WITH_CUDA",
+          "value": "ON",
+          "type": "BOOL"
+        },
+        {
+          "name": "CUDAToolkit_ROOT",
+          "value": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3",
+          "type": "PATH"
+        },
+        {
+          "name": "CUDA_TOOLKIT_ROOT_DIR",
+          "value": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3",
+          "type": "PATH"
+        }
+      ]
+    }
+  ]
+}
