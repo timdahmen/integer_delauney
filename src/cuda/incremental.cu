@@ -443,13 +443,12 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
 
     {
         DELAUNEY_NVTX_RANGE("inc: build registry (host)");
-        h_triangles_.clear(); h_triplet_to_tid_.clear(); h_canon_to_tid_.clear();
+        h_triangles_.clear(); h_triplet_to_tid_.clear();
         h_triangles_.reserve(N_tri);
         for (int32_t tid = 0; tid < N_tri; ++tid) {
             const auto& r = h_dedup[tid];
             h_triangles_.push_back({r.x, r.y, r.a, r.b, r.c, r.orig_a, r.orig_b, r.orig_c});
             h_triplet_to_tid_[pack_triplet_(r.a, r.b, r.c)] = tid;
-            h_canon_to_tid_[pack_xy_(r.x, r.y)] = tid;
         }
         // d_raw_buf_ already has the deduplicated triangles in correct order
     }
@@ -602,11 +601,10 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     // Rebuild lookup maps
     {
         DELAUNEY_NVTX_RANGE("inc: rebuild lookup maps (host)");
-        h_triplet_to_tid_.clear(); h_canon_to_tid_.clear();
+        h_triplet_to_tid_.clear();
         for (int tid = 0; tid < (int)h_triangles_.size(); ++tid) {
             const auto& t = h_triangles_[tid];
             h_triplet_to_tid_[pack_triplet_(t.a, t.b, t.c)] = tid;
-            h_canon_to_tid_[pack_xy_(t.x, t.y)] = tid;
         }
     }
 
