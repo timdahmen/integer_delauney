@@ -19,6 +19,7 @@
 #include "incremental.cuh"
 
 #include <algorithm>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -91,6 +92,8 @@ public:
         auto info = vgrid.request();
         if (info.ndim != 3 || info.shape[2] != 2)
             throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
+
+
 
         int H = static_cast<int>(info.shape[0]);
         int W = static_cast<int>(info.shape[1]);
@@ -258,9 +261,9 @@ private:
 
 PYBIND11_MODULE(_delauney_cuda, m)
 {
-    m.doc() = "CUDA-accelerated Voronoi + Delaunay triangulation";
+	m.doc() = "CUDA-accelerated Voronoi + Delaunay triangulation";
 
-    py::class_<PyRegularDelaunay>(m, "RegularDelaunay")
+	py::class_<PyRegularDelaunay>(m, "RegularDelaunay")
         .def(py::init<>())
         .def("compute", &PyRegularDelaunay::compute,
              py::arg("width"), py::arg("height"), py::arg("seeds"),
