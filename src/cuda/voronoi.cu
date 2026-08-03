@@ -23,12 +23,24 @@
 
 static constexpr int32_t UNDEFINED = -1;
 
+// size of shared memory tile and TILE_SIZExTILE_SIZE threads per block
+// (TILE_SIZE+2) * (TILE_SIZE+2) * sizeof(VoronoiCell) has to be below hardware limit of shared memory per block
+// and TILE_SIZE * TILE_SIZE has to be below hardware limit of threads per block
+static constexpr uint32_t TILE_SIZE = 32;
+
 // Compare two VoronoiCell candidates; return true if b beats a.
 // Winner criterion: lower distance wins; on tie, higher seed_id wins.
 __device__ __forceinline__ bool beats(const VoronoiCell& a, const VoronoiCell& b) {
 	if (b.distance < a.distance) return true;
 	if (b.distance == a.distance && b.id > a.id) return true;
 	return false;
+}
+
+// load a VoronoiCell from the source grid, returning cell, UNDEFINED if out of bounds
+__device__ __forceinline__ VoronoiCell
+load_cell(const int x, const int y, const int W, const int H, const VoronoiCell* src) {
+	if (x < 0 || x >= W || y < 0 || y >= H) return {UNDEFINED, UNDEFINED};
+	return src[y * W + x];
 }
 
 // ---------------------------------------------------------------------------
@@ -40,26 +52,33 @@ __global__ void voronoi_step_kernel(const VoronoiCell* __restrict__ src,
 									int W,
 									int H,
 									int32_t* __restrict__ updated_flag) {
-	int x = blockIdx.x * blockDim.x + threadIdx.x;
-	int y = blockIdx.y * blockDim.y + threadIdx.y;
+	__shared__ VoronoiCell tile[TILE_SIZE + 2][TILE_SIZE + 2]; // +2 for halo, for cross-tile access
+
+	const int x = blockIdx.x * TILE_SIZE + threadIdx.x;
+	const int y = blockIdx.y * TILE_SIZE + threadIdx.y;
+	const int tile_x = threadIdx.x + 1;
+	const int tile_y = threadIdx.y + 1;
+
+	// each thread loads its own cell into shared memory
+	tile[tile_y][tile_x] = load_cell(x, y, W, H, src);
+	// load halo cells for cross-tile access
+	if (threadIdx.x == 0) tile[tile_y][0] = load_cell(x - 1, y, W, H, src);
+	else if (threadIdx.x == TILE_SIZE - 1) tile[tile_y][TILE_SIZE + 1] = load_cell(x + 1, y, W, H, src);
+	if (threadIdx.y == 0) tile[0][tile_x] = load_cell(x, y - 1, W, H, src);
+	else if (threadIdx.y == TILE_SIZE - 1) tile[TILE_SIZE + 1][tile_x] = load_cell(x, y + 1, W, H, src);
+
+	__syncthreads(); // wait for shared memory to be populated
+
 	if (x >= W || y >= H) return;
 
-	int idx = y * W + x;
-	VoronoiCell cur = src[idx];
-
+	VoronoiCell cur = tile[tile_y][tile_x];
 	VoronoiCell best = cur;
 
 	// Check 4 cardinal neighbours; candidate distance = neighbour.distance + 1
 	const int dx[4] = {-1, 1, 0, 0};
 	const int dy[4] = {0, 0, -1, 1};
-
 	for (int k = 0; k < 4; ++k) {
-		int nx = x + dx[k];
-		int ny = y + dy[k];
-		if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
-
-		int n_idx = ny * W + nx;
-		VoronoiCell neighbor = src[n_idx];
+		VoronoiCell neighbor = tile[tile_y + dy[k]][tile_x + dx[k]];
 		if (neighbor.id == UNDEFINED) continue;
 
 		VoronoiCell candidate = neighbor;
@@ -70,6 +89,7 @@ __global__ void voronoi_step_kernel(const VoronoiCell* __restrict__ src,
 		}
 	}
 
+	const int idx = y * W + x;
 	dst[idx] = best;
 
 	// Mark update if the cell changed (includes first-time fills)
@@ -112,10 +132,10 @@ void cuda_compute_voronoi(const int W,
 
 	cudaMemcpy(d_a, h_grid.data(), cell_bytes, cudaMemcpyHostToDevice);
 
-	dim3 block(16, 16);
-	dim3 grid((W + 15) / 16, (H + 15) / 16);
+	dim3 block(TILE_SIZE, TILE_SIZE);
+	dim3 grid((W + TILE_SIZE - 1) / TILE_SIZE, (H + TILE_SIZE - 1) / TILE_SIZE);
 
-	for (;;) {
+	while (true) {
 		int32_t zero = 0;
 		cudaMemcpy(d_flag, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
 
