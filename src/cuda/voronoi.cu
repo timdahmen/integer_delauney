@@ -49,52 +49,72 @@ load_cell(const int x, const int y, const int W, const int H, const VoronoiCell*
 
 __global__ void voronoi_step_kernel(const VoronoiCell* __restrict__ src,
 									VoronoiCell* __restrict__ dst,
-									int W,
-									int H,
-									int32_t* __restrict__ updated_flag) {
-	__shared__ VoronoiCell tile[TILE_SIZE + 2][TILE_SIZE + 2]; // +2 for halo, for cross-tile access
-
+									const int W,
+									const int H,
+									int32_t* __restrict__ updated_flag,
+									uint8_t* __restrict__ tile_settled_flags) {
 	const int x = blockIdx.x * TILE_SIZE + threadIdx.x;
 	const int y = blockIdx.y * TILE_SIZE + threadIdx.y;
+	const int tile_idx = blockIdx.y * gridDim.x + blockIdx.x;
+	const int cell_idx = y * W + x;
+	const bool in_bounds = (x < W && y < H);
+
+	if (tile_settled_flags[tile_idx]) {
+		if (in_bounds) dst[cell_idx] = src[cell_idx];
+		return;
+	}
+
+	__shared__ VoronoiCell tile[TILE_SIZE + 2][TILE_SIZE + 2]; // +2 for halo, for cross-tile access
 	const int tile_x = threadIdx.x + 1;
 	const int tile_y = threadIdx.y + 1;
 
 	// each thread loads its own cell into shared memory
 	tile[tile_y][tile_x] = load_cell(x, y, W, H, src);
 	// load halo cells for cross-tile access
-	if (threadIdx.x == 0) tile[tile_y][0] = load_cell(x - 1, y, W, H, src);
-	else if (threadIdx.x == TILE_SIZE - 1) tile[tile_y][TILE_SIZE + 1] = load_cell(x + 1, y, W, H, src);
-	if (threadIdx.y == 0) tile[0][tile_x] = load_cell(x, y - 1, W, H, src);
-	else if (threadIdx.y == TILE_SIZE - 1) tile[TILE_SIZE + 1][tile_x] = load_cell(x, y + 1, W, H, src);
+	if (threadIdx.x == 0)
+		tile[tile_y][0] = load_cell(x - 1, y, W, H, src);
+	else if (threadIdx.x == TILE_SIZE - 1)
+		tile[tile_y][TILE_SIZE + 1] = load_cell(x + 1, y, W, H, src);
+	if (threadIdx.y == 0)
+		tile[0][tile_x] = load_cell(x, y - 1, W, H, src);
+	else if (threadIdx.y == TILE_SIZE - 1)
+		tile[TILE_SIZE + 1][tile_x] = load_cell(x, y + 1, W, H, src);
 
 	__syncthreads(); // wait for shared memory to be populated
-
-	if (x >= W || y >= H) return;
 
 	VoronoiCell cur = tile[tile_y][tile_x];
 	VoronoiCell best = cur;
 
-	// Check 4 cardinal neighbours; candidate distance = neighbour.distance + 1
-	const int dx[4] = {-1, 1, 0, 0};
-	const int dy[4] = {0, 0, -1, 1};
-	for (int k = 0; k < 4; ++k) {
-		VoronoiCell neighbor = tile[tile_y + dy[k]][tile_x + dx[k]];
-		if (neighbor.id == UNDEFINED) continue;
+	if (in_bounds) {
+		if (cur.id == UNDEFINED) {
+			// Check 4 cardinal neighbours; candidate distance = neighbour.distance + 1
+			const int dx[4] = {-1, 1, 0, 0};
+			const int dy[4] = {0, 0, -1, 1};
+			for (int k = 0; k < 4; ++k) {
+				VoronoiCell neighbor = tile[tile_y + dy[k]][tile_x + dx[k]];
+				if (neighbor.id == UNDEFINED) continue;
 
-		VoronoiCell candidate = neighbor;
-		candidate.distance = neighbor.distance + 1;
+				VoronoiCell candidate = neighbor;
+				candidate.distance = neighbor.distance + 1;
 
-		if (best.id == UNDEFINED || beats(best, candidate)) {
-			best = candidate;
+				if (best.id == UNDEFINED || beats(best, candidate)) {
+					best = candidate;
+				}
+			}
+
+			dst[cell_idx] = best;
+			// Mark update if the cell changed (includes first-time fills)
+			// No AtomicOr needed, since any thread setting it is enough
+			if (best.id != cur.id || best.distance != cur.distance) *updated_flag = 1;
+		} else {
+			dst[cell_idx] = cur; // already settled: propagate to other buffer
 		}
 	}
 
-	const int idx = y * W + x;
-	dst[idx] = best;
-
-	// Mark update if the cell changed (includes first-time fills)
-	if (best.id != cur.id || best.distance != cur.distance) {
-		atomicOr(updated_flag, 1);
+	bool contributes_unsettled = in_bounds && (best.id == UNDEFINED);
+	bool block_fully_settled = !__syncthreads_or(contributes_unsettled);
+	if (block_fully_settled && threadIdx.x == 0 && threadIdx.y == 0) {
+		tile_settled_flags[tile_idx] = 1;
 	}
 }
 
@@ -124,22 +144,27 @@ void cuda_compute_voronoi(const int W,
 	// Allocate double buffers on device
 	VoronoiCell *d_a = nullptr, *d_b = nullptr;
 	int32_t* d_flag = nullptr;
+	uint8_t* d_tile_settled_flags = nullptr;
 	const size_t cell_bytes = N * sizeof(VoronoiCell);
 
 	cudaMalloc(&d_a, cell_bytes);
 	cudaMalloc(&d_b, cell_bytes);
 	cudaMalloc(&d_flag, sizeof(int32_t));
 
+	// TODO compress to bitfield to save mem
 	cudaMemcpy(d_a, h_grid.data(), cell_bytes, cudaMemcpyHostToDevice);
 
 	dim3 block(TILE_SIZE, TILE_SIZE);
 	dim3 grid((W + TILE_SIZE - 1) / TILE_SIZE, (H + TILE_SIZE - 1) / TILE_SIZE);
 
-	while (true) {
-		int32_t zero = 0;
-		cudaMemcpy(d_flag, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+	const int num_tiles = grid.x * grid.y * grid.z;
+	cudaMalloc(&d_tile_settled_flags, num_tiles * sizeof(uint8_t));
+	cudaMemset(d_tile_settled_flags, 0, num_tiles * sizeof(uint8_t));
 
-		voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, d_flag);
+	while (true) {
+		cudaMemset(d_flag, 0, sizeof(int32_t));
+
+		voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, d_flag, d_tile_settled_flags);
 		cudaDeviceSynchronize();
 
 		// Swap buffers
@@ -166,4 +191,5 @@ void cuda_compute_voronoi(const int W,
 	cudaFree(d_a);
 	cudaFree(d_b);
 	cudaFree(d_flag);
+	cudaFree(d_tile_settled_flags);
 }
