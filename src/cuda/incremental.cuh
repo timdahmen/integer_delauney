@@ -44,7 +44,7 @@ private:
     int32_t* d_t_grid_;      // (H*W)   triangle_id per pixel
     int32_t* d_csr_ptr_;     // (max_seeds+1) CSR row starts
     int32_t* d_csr_idx_;     // (max_seeds*8) CSR triangle IDs
-    int32_t* d_updated_flag_;// (1)     BFS convergence flag
+    uint8_t* d_updated_flag_;// (2)     BFS convergence flags
     int32_t* d_mask_;        // (H*W)   reused for border / reassign masks
 
     // ---- host-side triangle registry ----
