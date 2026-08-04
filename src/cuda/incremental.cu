@@ -552,8 +552,6 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
-    if (det_ms) { cudaEvent_t e; cudaEventCreate(&e); cudaEventRecord(e); }
-
     int32_t raw_count = 0;
     {
         DELAUNEY_NVTX_RANGE_C("inc: detect (masked)", delauney_nvtx::kKernel);
