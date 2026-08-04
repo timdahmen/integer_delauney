@@ -674,6 +674,32 @@ int run(int argc, char** argv)
                     warm_tot.detect_ms += wt.detect_ms;
                     warm_tot.dedup_ms  += wt.dedup_ms;
                     warm_tot.assign_ms += wt.assign_ms;
+
+                    const auto& h = wt.host;
+                    auto& H = warm_tot.host;
+                    H.validate_ms       += h.validate_ms;
+                    H.seed_reg_ms       += h.seed_reg_ms;
+                    H.seed_h2d_ms       += h.seed_h2d_ms;
+                    H.write_seeds_ms    += h.write_seeds_ms;
+                    H.bfs_ms            += h.bfs_ms;
+                    H.d2h_changed_ms    += h.d2h_changed_ms;
+                    H.expand_ms         += h.expand_ms;
+                    H.mark_stale_ms     += h.mark_stale_ms;
+                    H.h2d_border_ms     += h.h2d_border_ms;
+                    H.detect_ms         += h.detect_ms;
+                    H.dedup_ms          += h.dedup_ms;
+                    H.d2h_new_ms        += h.d2h_new_ms;
+                    H.collect_ms        += h.collect_ms;
+                    H.compact_ms        += h.compact_ms;
+                    H.upload_tri_ms     += h.upload_tri_ms;
+                    H.csr_ms            += h.csr_ms;
+                    H.remap_ms          += h.remap_ms;
+                    H.h2d_reassign_ms   += h.h2d_reassign_ms;
+                    H.assign_ms         += h.assign_ms;
+                    H.out_trimap_ms     += h.out_trimap_ms;
+                    H.out_d2h_ms        += h.out_d2h_ms;
+                    H.out_interleave_ms += h.out_interleave_ms;
+                    H.scratch_ms        += h.scratch_ms;
                 }
             }
 
@@ -691,6 +717,49 @@ int run(int argc, char** argv)
             print_ms("  detect", warm_tot.detect_ms / WARM_N);
             print_ms("  dedup",  warm_tot.dedup_ms  / WARM_N);
             print_ms("  assign", warm_tot.assign_ms / WARM_N);
+
+            {
+                const auto& H = warm_tot.host;
+                const double n = (double)WARM_N;
+                struct Row { const char* label; float total; };
+                const Row rows[] = {
+                    { "  insert: validate seeds",        H.validate_ms },
+                    { "  insert: register seeds",        H.seed_reg_ms },
+                    { "  insert: seed H2D + clear",      H.seed_h2d_ms },
+                    { "  insert: write_seeds kernel",    H.write_seeds_ms },
+                    { "  insert: bfs (wall)",            H.bfs_ms },
+                    { "  partial: D2H changed mask",     H.d2h_changed_ms },
+                    { "  partial: expand masks",         H.expand_ms },
+                    { "  partial: mark stale",           H.mark_stale_ms },
+                    { "  partial: H2D border mask",      H.h2d_border_ms },
+                    { "  partial: detect",               H.detect_ms },
+                    { "  partial: dedup",                H.dedup_ms },
+                    { "  partial: D2H new triangles",    H.d2h_new_ms },
+                    { "  partial: collect new triplets", H.collect_ms },
+                    { "  partial: compact registry",     H.compact_ms },
+                    { "  partial: upload_triangles",     H.upload_tri_ms },
+                    { "  partial: rebuild_csr",          H.csr_ms },
+                    { "  partial: remap t_grid",         H.remap_ms },
+                    { "  partial: H2D reassign mask",    H.h2d_reassign_ms },
+                    { "  partial: assign",               H.assign_ms },
+                    { "  outputs: fill tri_map",         H.out_trimap_ms },
+                    { "  outputs: D2H grids",            H.out_d2h_ms },
+                    { "  outputs: interleave",           H.out_interleave_ms },
+                };
+
+                double sum = 0.0;
+                for (const auto& r : rows) sum += r.total / n;
+
+                std::printf("\n    Host wall-clock breakdown (warm, avg):\n");
+                for (const auto& r : rows) {
+                    const double ms = r.total / n;
+                    std::printf("    %-46s %8.2f ms  %5.1f %%\n",
+                                r.label, ms, sum > 0.0 ? 100.0 * ms / sum : 0.0);
+                }
+                std::printf("    %-46s %8.2f ms\n", "  accounted total", sum);
+                std::printf("    %-46s %8.2f ms  (of which, counted above)\n",
+                            "  cudaMalloc/cudaFree scratch", H.scratch_ms / n);
+            }
         } else {
             std::printf("    [CUDA device not available -- skipped]\n");
         }

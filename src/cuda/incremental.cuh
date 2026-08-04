@@ -5,11 +5,45 @@
 #include <vector>
 #include "triangulation.cuh"   // TriangleEntry
 
+// Host-side wall-clock breakdown of one insert(), in milliseconds.
+// Phases are non-overlapping and mirror the NVTX ranges, except scratch_ms,
+// which is an "of which" sub-measure counted inside other phases.
+struct IncrementalHostTimings {
+    // insert()
+    float validate_ms      = 0.f;  // bounds + duplicate checks
+    float seed_reg_ms      = 0.f;  // host seed registry update
+    float seed_h2d_ms      = 0.f;  // d_sx_/d_sy_ upload + d_changed_ clear
+    float write_seeds_ms   = 0.f;  // scratch seed arrays + write_seeds kernel
+    float bfs_ms           = 0.f;  // run_bfs_ wall time (incl. per-iter syncs)
+    // partial_triangulate_()
+    float d2h_changed_ms   = 0.f;
+    float expand_ms        = 0.f;  // border/reassign dilation loop
+    float mark_stale_ms    = 0.f;
+    float h2d_border_ms    = 0.f;
+    float detect_ms        = 0.f;
+    float dedup_ms         = 0.f;
+    float d2h_new_ms       = 0.f;
+    float collect_ms       = 0.f;
+    float compact_ms       = 0.f;
+    float upload_tri_ms    = 0.f;
+    float csr_ms           = 0.f;
+    float remap_ms         = 0.f;
+    float h2d_reassign_ms  = 0.f;
+    float assign_ms        = 0.f;
+    // build_outputs_()
+    float out_trimap_ms    = 0.f;
+    float out_d2h_ms       = 0.f;
+    float out_interleave_ms= 0.f;
+    // overlapping sub-measure
+    float scratch_ms       = 0.f;  // cudaMalloc/cudaFree of per-insert scratch
+};
+
 struct IncrementalTimings {
     float bfs_ms    = 0.f;
     float detect_ms = 0.f;
     float dedup_ms  = 0.f;
     float assign_ms = 0.f;
+    IncrementalHostTimings host;
 };
 
 class IncrementalDelaunay {
@@ -53,6 +87,9 @@ private:
     int32_t* p_reassign_ = nullptr;  // (N)    H2D  assign mask (host-write-only)
     int32_t* p_t_        = nullptr;  // (N)    D2H  triangle id per pixel
     int32_t* p_grid_     = nullptr;  // (N*2)  D2H  voronoi grid
+
+    // Host timing sink for the in-flight insert(); null when not profiling.
+    IncrementalHostTimings* ht_ = nullptr;
 
     // ---- host-side triangle registry ----
     struct HTriangle {

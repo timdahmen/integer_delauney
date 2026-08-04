@@ -22,6 +22,7 @@
 #include <thrust/unique.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -34,6 +35,28 @@
 // ---------------------------------------------------------------------------
 
 static constexpr int32_t UNDEF_SEED = -1;
+
+// Scoped host wall-clock accumulator. A null sink disables it entirely, so
+// non-profiling callers pay only a branch.
+namespace {
+struct HostTimer {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point t0;
+    float* out;
+    explicit HostTimer(float* o) : out(o) { if (out) t0 = Clock::now(); }
+    ~HostTimer() {
+        if (out)
+            *out += std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
+    }
+    HostTimer(const HostTimer&) = delete;
+    HostTimer& operator=(const HostTimer&) = delete;
+};
+}  // namespace
+
+// Times the enclosing scope into ht_->field. Note that CUDA calls are async:
+// these measure launch cost plus whatever the following sync absorbs.
+#define DELAUNEY_HOST_TIME(field) \
+    HostTimer _host_timer_(ht_ ? &ht_->field : nullptr)
 
 struct RawTriangle {
     int32_t x, y;
@@ -319,6 +342,7 @@ IncrementalDelaunay::~IncrementalDelaunay()
 void IncrementalDelaunay::run_bfs_(float* bfs_ms_out)
 {
     DELAUNEY_NVTX_RANGE_C("inc: bfs", delauney_nvtx::kKernel);
+    DELAUNEY_HOST_TIME(bfs_ms);
 
     dim3 block(16, 16);
     dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
@@ -357,6 +381,7 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out)
 void IncrementalDelaunay::upload_triangles_()
 {
     DELAUNEY_NVTX_RANGE_C("inc: upload_triangles", delauney_nvtx::kMemcpy);
+    DELAUNEY_HOST_TIME(upload_tri_ms);
 
     int N_tri = (int)h_triangles_.size();
     std::vector<RawTriangle> h_raw(N_tri);
@@ -374,6 +399,7 @@ void IncrementalDelaunay::upload_triangles_()
 void IncrementalDelaunay::rebuild_csr_and_upload_()
 {
     DELAUNEY_NVTX_RANGE("inc: rebuild_csr (host)");
+    DELAUNEY_HOST_TIME(csr_ms);
 
     int N_tri = (int)h_triangles_.size();
     std::vector<int32_t> h_csr_ptr(N_ + 1, 0);
@@ -507,12 +533,14 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     // Download change mask
     {
         DELAUNEY_NVTX_RANGE_C("inc: D2H changed mask", delauney_nvtx::kMemcpy);
+        DELAUNEY_HOST_TIME(d2h_changed_ms);
         cudaMemcpy(p_changed_, d_changed_, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
     }
 
     // Build border (expand by 2 for L-shapes) and reassign (expand by WINDOW_CAP)
     {
         DELAUNEY_NVTX_RANGE("inc: expand masks (host)");
+        DELAUNEY_HOST_TIME(expand_ms);
         for (int y = 0; y < H_; ++y) {
             for (int x = 0; x < W_; ++x) {
                 if (!p_changed_[y * W_ + x]) continue;
@@ -535,6 +563,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     std::vector<bool> is_stale(old_count, false);
     {
         DELAUNEY_NVTX_RANGE("inc: mark stale (host)");
+        DELAUNEY_HOST_TIME(mark_stale_ms);
         for (int tid = 0; tid < old_count; ++tid) {
             const auto& t = h_triangles_[tid];
             if (t.x >= 0 && t.x < W_ && t.y >= 0 && t.y < H_)
@@ -545,19 +574,28 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     // Detect new triangles in border
     {
         DELAUNEY_NVTX_RANGE_C("inc: H2D border mask", delauney_nvtx::kMemcpy);
+        DELAUNEY_HOST_TIME(h2d_border_ms);
         cudaMemcpy(d_mask_, p_border_, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_raw_buf_);
-    int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
+    int32_t* d_counter;
+    {
+        DELAUNEY_HOST_TIME(scratch_ms);
+        cudaMalloc(&d_counter, sizeof(int32_t));
+    }
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
     int32_t raw_count = 0;
     {
         DELAUNEY_NVTX_RANGE_C("inc: detect (masked)", delauney_nvtx::kKernel);
+        DELAUNEY_HOST_TIME(detect_ms);
         find_triangle_seeds_kernel<<<grid_dim, block>>>(d_grid_, W_, H_, d_raw, d_counter, d_mask_);
         cudaDeviceSynchronize();
         cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    }
+    {
+        DELAUNEY_HOST_TIME(scratch_ms);
         cudaFree(d_counter);
     }
 
@@ -565,6 +603,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     int n_new = 0;
     {
         DELAUNEY_NVTX_RANGE_C("inc: dedup (thrust)", delauney_nvtx::kKernel);
+        DELAUNEY_HOST_TIME(dedup_ms);
         thrust::sort(d_ptr, d_ptr + raw_count, RawLess{});
         auto new_end = thrust::unique(d_ptr, d_ptr + raw_count, RawEqual{});
         n_new = (int)(new_end - d_ptr);
@@ -573,6 +612,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     std::vector<RawTriangle> h_new(n_new);
     if (n_new > 0) {
         DELAUNEY_NVTX_RANGE_C("inc: D2H new triangles", delauney_nvtx::kMemcpy);
+        DELAUNEY_HOST_TIME(d2h_new_ms);
         cudaMemcpy(h_new.data(), d_raw, n_new * sizeof(RawTriangle), cudaMemcpyDeviceToHost);
     }
 
@@ -582,6 +622,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     std::vector<HTriangle> to_add;
     {
         DELAUNEY_NVTX_RANGE("inc: collect new triplets (host)");
+        DELAUNEY_HOST_TIME(collect_ms);
         for (const auto& r : h_new) {
             auto key = pack_triplet_(r.a, r.b, r.c);
             auto it = h_triplet_to_tid_.find(key);
@@ -595,6 +636,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     std::vector<int32_t> remap(old_count, -1);
     {
         DELAUNEY_NVTX_RANGE("inc: compact registry and remap (host)");
+        DELAUNEY_HOST_TIME(compact_ms);
 
         // Fill each stale slot with the last live triangle.
         int next = old_count;
@@ -662,22 +704,33 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     if (old_count > 0) {
         DELAUNEY_NVTX_RANGE_C("inc: remap t_grid", delauney_nvtx::kKernel);
         int32_t* d_remap;
-        cudaMalloc(&d_remap, old_count * sizeof(int32_t));
-        cudaMemcpy(d_remap, remap.data(), old_count * sizeof(int32_t), cudaMemcpyHostToDevice);
-        remap_tgrid_kernel<<<(N+255)/256, 256>>>(d_t_grid_, N, d_remap, old_count, fallback);
-        cudaDeviceSynchronize();
-        cudaFree(d_remap);
+        {
+            DELAUNEY_HOST_TIME(scratch_ms);
+            cudaMalloc(&d_remap, old_count * sizeof(int32_t));
+        }
+        {
+            DELAUNEY_HOST_TIME(remap_ms);
+            cudaMemcpy(d_remap, remap.data(), old_count * sizeof(int32_t), cudaMemcpyHostToDevice);
+            remap_tgrid_kernel<<<(N+255)/256, 256>>>(d_t_grid_, N, d_remap, old_count, fallback);
+            cudaDeviceSynchronize();
+        }
+        {
+            DELAUNEY_HOST_TIME(scratch_ms);
+            cudaFree(d_remap);
+        }
     }
 
     // Re-assign pixels in expanded reassign region
     {
         DELAUNEY_NVTX_RANGE_C("inc: H2D reassign mask", delauney_nvtx::kMemcpy);
+        DELAUNEY_HOST_TIME(h2d_reassign_ms);
         cudaMemcpy(d_mask_, p_reassign_, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
 
     int N_tri = (int)h_triangles_.size();
     if (N_tri > 0) {
         DELAUNEY_NVTX_RANGE_C("inc: assign (masked)", delauney_nvtx::kKernel);
+        DELAUNEY_HOST_TIME(assign_ms);
         assign_triangles_kernel<<<grid_dim, block>>>(
             d_t_grid_, W_, H_, d_grid_,
             static_cast<RawTriangle*>(d_raw_buf_),
@@ -698,20 +751,25 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
     const int N = W_ * H_;
     int N_tri = (int)h_triangles_.size();
 
-    tri_map_out.resize(N_tri);
-    for (int tid = 0; tid < N_tri; ++tid) {
-        const auto& t = h_triangles_[tid];
-        tri_map_out[tid] = {t.x, t.y, t.orig_a, t.orig_b, t.orig_c};
+    {
+        DELAUNEY_HOST_TIME(out_trimap_ms);
+        tri_map_out.resize(N_tri);
+        for (int tid = 0; tid < N_tri; ++tid) {
+            const auto& t = h_triangles_[tid];
+            tri_map_out[tid] = {t.x, t.y, t.orig_a, t.orig_b, t.orig_c};
+        }
     }
 
     {
         DELAUNEY_NVTX_RANGE_C("inc: D2H grids", delauney_nvtx::kMemcpy);
+        DELAUNEY_HOST_TIME(out_d2h_ms);
         cudaMemcpy(p_t_,    d_t_grid_, N     * sizeof(int32_t), cudaMemcpyDeviceToHost);
         cudaMemcpy(p_grid_, d_grid_,   N * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
     }
 
     {
         DELAUNEY_NVTX_RANGE("inc: interleave out grid (host)");
+        DELAUNEY_HOST_TIME(out_interleave_ms);
         tgrid_out.resize(N * 3);
         for (int i = 0; i < N; ++i) {
             tgrid_out[i*3]   = p_grid_[i*2];
@@ -745,6 +803,13 @@ void IncrementalDelaunay::insert(
 {
     DELAUNEY_NVTX_RANGE_C("IncrementalDelaunay::insert", delauney_nvtx::kPhase);
 
+    // Route host phase timings for this call; cleared on every exit path.
+    ht_ = timings ? &timings->host : nullptr;
+    struct HtGuard {
+        IncrementalHostTimings** p;
+        ~HtGuard() { *p = nullptr; }
+    } _ht_guard{&ht_};
+
     int k = (int)new_xs.size();
     if (k == 0) { build_outputs_(tri_map_out, tgrid_out); return; }
 
@@ -753,6 +818,7 @@ void IncrementalDelaunay::insert(
 
     {
         DELAUNEY_NVTX_RANGE("inc: validate seeds (host)");
+        DELAUNEY_HOST_TIME(validate_ms);
 
         // Validate bounds
         for (int i = 0; i < k; ++i)
@@ -781,35 +847,50 @@ void IncrementalDelaunay::insert(
 
     // Register seeds
     std::vector<int32_t> new_ids(k);
-    for (int i = 0; i < k; ++i) {
-        new_ids[i] = N_ + i;
-        h_sx_.push_back(new_xs[i]);
-        h_sy_.push_back(new_ys[i]);
-        h_seed_set_.insert(pack_xy_(new_xs[i], new_ys[i]));
+    {
+        DELAUNEY_HOST_TIME(seed_reg_ms);
+        for (int i = 0; i < k; ++i) {
+            new_ids[i] = N_ + i;
+            h_sx_.push_back(new_xs[i]);
+            h_sy_.push_back(new_ys[i]);
+            h_seed_set_.insert(pack_xy_(new_xs[i], new_ys[i]));
+        }
+        N_ += k;
     }
-    N_ += k;
 
-    // Upload new seed positions to persistent device arrays
-    cudaMemcpy(d_sx_ + N_ - k, new_xs.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sy_ + N_ - k, new_ys.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
+    {
+        DELAUNEY_HOST_TIME(seed_h2d_ms);
+        // Upload new seed positions to persistent device arrays
+        cudaMemcpy(d_sx_ + N_ - k, new_xs.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_sy_ + N_ - k, new_ys.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-    // Reset change accumulator before writing seeds (so seed positions
-    // are the first entries in d_changed_ — necessary for partial_triangulate_
-    // to cover detection positions that touch the seed cell directly).
-    cudaMemset(d_changed_, 0, (size_t)W_ * H_ * sizeof(int32_t));
+        // Reset change accumulator before writing seeds (so seed positions
+        // are the first entries in d_changed_ — necessary for partial_triangulate_
+        // to cover detection positions that touch the seed cell directly).
+        cudaMemset(d_changed_, 0, (size_t)W_ * H_ * sizeof(int32_t));
+    }
 
     // Write seeds into grid (also marks seed cells in d_changed_)
     DELAUNEY_NVTX_MARK("inc: write seeds");
     int32_t *d_kxs, *d_kys, *d_kids;
-    cudaMalloc(&d_kxs,  k * sizeof(int32_t));
-    cudaMalloc(&d_kys,  k * sizeof(int32_t));
-    cudaMalloc(&d_kids, k * sizeof(int32_t));
-    cudaMemcpy(d_kxs,  new_xs.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kys,  new_ys.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kids, new_ids.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    write_seeds_kernel<<<(k+255)/256, 256>>>(d_grid_, d_changed_, W_, d_kxs, d_kys, d_kids, k);
-    cudaDeviceSynchronize();
-    cudaFree(d_kxs); cudaFree(d_kys); cudaFree(d_kids);
+    {
+        DELAUNEY_HOST_TIME(scratch_ms);
+        cudaMalloc(&d_kxs,  k * sizeof(int32_t));
+        cudaMalloc(&d_kys,  k * sizeof(int32_t));
+        cudaMalloc(&d_kids, k * sizeof(int32_t));
+    }
+    {
+        DELAUNEY_HOST_TIME(write_seeds_ms);
+        cudaMemcpy(d_kxs,  new_xs.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_kys,  new_ys.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_kids, new_ids.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
+        write_seeds_kernel<<<(k+255)/256, 256>>>(d_grid_, d_changed_, W_, d_kxs, d_kys, d_kids, k);
+        cudaDeviceSynchronize();
+    }
+    {
+        DELAUNEY_HOST_TIME(scratch_ms);
+        cudaFree(d_kxs); cudaFree(d_kys); cudaFree(d_kids);
+    }
 
     // BFS
     float bfs_ms = 0.f;
