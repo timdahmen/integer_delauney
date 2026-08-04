@@ -175,16 +175,10 @@ void cuda_compute_voronoi(const int W,
 		if (!h_flag) break;
 	}
 
-	// Convert result back to flat int32 array for compatibility with bindings
-	std::vector<VoronoiCell> h_result(N);
-	cudaMemcpy(h_result.data(), d_a, cell_bytes, cudaMemcpyDeviceToHost);
-
-	// Flatten VoronoiCell array to (id, distance) pairs for output
+	// can copy directly into vector<i32> since VoronoiCell size and alignment are compatible
+	static_assert(sizeof(VoronoiCell) == 2 * sizeof(int32_t), "Unexpected VoronoiCell layout");
 	out_grid.resize(N * 2);
-	for (int i = 0; i < N; ++i) {
-		out_grid[i * 2] = h_result[i].id;
-		out_grid[i * 2 + 1] = h_result[i].distance;
-	}
+	cudaMemcpy(out_grid.data(), d_a, cell_bytes, cudaMemcpyDeviceToHost);
 
 	cudaFree(d_a);
 	cudaFree(d_b);
