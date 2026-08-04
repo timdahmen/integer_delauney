@@ -47,6 +47,13 @@ private:
     int32_t* d_updated_flag_;// (1)     BFS convergence flag
     int32_t* d_mask_;        // (H*W)   reused for border / reassign masks
 
+    // ---- persistent pinned host staging buffers ----
+    int32_t* p_changed_  = nullptr;  // (N)    D2H  BFS change mask
+    int32_t* p_border_   = nullptr;  // (N)    H2D  detect mask (host-read)
+    int32_t* p_reassign_ = nullptr;  // (N)    H2D  assign mask (host-write-only)
+    int32_t* p_t_        = nullptr;  // (N)    D2H  triangle id per pixel
+    int32_t* p_grid_     = nullptr;  // (N*2)  D2H  voronoi grid
+
     // ---- host-side triangle registry ----
     struct HTriangle {
         int32_t x, y;

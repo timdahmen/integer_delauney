@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 #include <unordered_map>
@@ -291,6 +292,13 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds)
     cudaMemset(d_grid_,    -1, (size_t)N * 2 * sizeof(int32_t));  // UNDEF
     cudaMemset(d_t_grid_,  -1, (size_t)N     * sizeof(int32_t));
     cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t));
+
+    // Pinned host allocations. Warning, these are expensive 
+    cudaHostAlloc(&p_changed_,  (size_t)N     * sizeof(int32_t), cudaHostAllocDefault);
+    cudaHostAlloc(&p_border_,   (size_t)N     * sizeof(int32_t), cudaHostAllocDefault);
+    cudaHostAlloc(&p_reassign_, (size_t)N     * sizeof(int32_t), cudaHostAllocDefault);
+    cudaHostAlloc(&p_t_,        (size_t)N     * sizeof(int32_t), cudaHostAllocDefault);
+    cudaHostAlloc(&p_grid_,     (size_t)N * 2 * sizeof(int32_t), cudaHostAllocDefault);
 }
 
 IncrementalDelaunay::~IncrementalDelaunay()
@@ -299,6 +307,9 @@ IncrementalDelaunay::~IncrementalDelaunay()
     cudaFree(d_sx_);      cudaFree(d_sy_);        cudaFree(d_raw_buf_);
     cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
     cudaFree(d_updated_flag_); cudaFree(d_mask_);
+
+    cudaFreeHost(p_changed_); cudaFreeHost(p_border_); cudaFreeHost(p_reassign_);
+    cudaFreeHost(p_t_); cudaFreeHost(p_grid_);
 }
 
 // ---------------------------------------------------------------------------
@@ -490,29 +501,30 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     dim3 block(16, 16);
     dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
 
+    std::memset(p_border_,   0, (size_t)N * sizeof(int32_t));
+    std::memset(p_reassign_, 0, (size_t)N * sizeof(int32_t));
+
     // Download change mask
-    std::vector<int32_t> h_changed(N);
     {
         DELAUNEY_NVTX_RANGE_C("inc: D2H changed mask", delauney_nvtx::kMemcpy);
-        cudaMemcpy(h_changed.data(), d_changed_, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(p_changed_, d_changed_, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
     }
 
     // Build border (expand by 2 for L-shapes) and reassign (expand by WINDOW_CAP)
-    std::vector<int32_t> h_border(N, 0), h_reassign(N, 0);
     {
         DELAUNEY_NVTX_RANGE("inc: expand masks (host)");
         for (int y = 0; y < H_; ++y) {
             for (int x = 0; x < W_; ++x) {
-                if (!h_changed[y * W_ + x]) continue;
+                if (!p_changed_[y * W_ + x]) continue;
                 for (int dy = -2; dy <= 2; ++dy)
                 for (int dx = -2; dx <= 2; ++dx) {
                     int bx = x+dx, by = y+dy;
-                    if (bx>=0 && bx<W_ && by>=0 && by<H_) h_border[by*W_+bx] = 1;
+                    if (bx>=0 && bx<W_ && by>=0 && by<H_) p_border_[by*W_+bx] = 1;
                 }
                 for (int dy = -WINDOW_CAP; dy <= WINDOW_CAP; ++dy)
                 for (int dx = -WINDOW_CAP; dx <= WINDOW_CAP; ++dx) {
                     int bx = x+dx, by = y+dy;
-                    if (bx>=0 && bx<W_ && by>=0 && by<H_) h_reassign[by*W_+bx] = 1;
+                    if (bx>=0 && bx<W_ && by>=0 && by<H_) p_reassign_[by*W_+bx] = 1;
                 }
             }
         }
@@ -526,14 +538,14 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
         for (int tid = 0; tid < old_count; ++tid) {
             const auto& t = h_triangles_[tid];
             if (t.x >= 0 && t.x < W_ && t.y >= 0 && t.y < H_)
-                if (h_border[t.y * W_ + t.x]) is_stale[tid] = true;
+                if (p_border_[t.y * W_ + t.x]) is_stale[tid] = true;
         }
     }
 
     // Detect new triangles in border
     {
         DELAUNEY_NVTX_RANGE_C("inc: H2D border mask", delauney_nvtx::kMemcpy);
-        cudaMemcpy(d_mask_, h_border.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_mask_, p_border_, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_raw_buf_);
@@ -662,7 +674,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     // Re-assign pixels in expanded reassign region
     {
         DELAUNEY_NVTX_RANGE_C("inc: H2D reassign mask", delauney_nvtx::kMemcpy);
-        cudaMemcpy(d_mask_, h_reassign.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_mask_, p_reassign_, N * sizeof(int32_t), cudaMemcpyHostToDevice);
     }
 
     int N_tri = (int)h_triangles_.size();
@@ -694,20 +706,19 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
         tri_map_out[tid] = {t.x, t.y, t.orig_a, t.orig_b, t.orig_c};
     }
 
-    std::vector<int32_t> h_t(N), h_grid(N * 2);
     {
         DELAUNEY_NVTX_RANGE_C("inc: D2H grids", delauney_nvtx::kMemcpy);
-        cudaMemcpy(h_t.data(),    d_t_grid_, N     * sizeof(int32_t), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_grid.data(), d_grid_,   N * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(p_t_,    d_t_grid_, N     * sizeof(int32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(p_grid_, d_grid_,   N * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
     }
 
     {
         DELAUNEY_NVTX_RANGE("inc: interleave out grid (host)");
         tgrid_out.resize(N * 3);
         for (int i = 0; i < N; ++i) {
-            tgrid_out[i*3]   = h_grid[i*2];
-            tgrid_out[i*3+1] = h_grid[i*2+1];
-            tgrid_out[i*3+2] = h_t[i];
+            tgrid_out[i*3]   = p_grid_[i*2];
+            tgrid_out[i*3+1] = p_grid_[i*2+1];
+            tgrid_out[i*3+2] = p_t_[i];
         }
     }
 }
