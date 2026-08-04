@@ -8,6 +8,10 @@
 // Host-side wall-clock breakdown of one insert(), in milliseconds.
 // Phases are non-overlapping and mirror the NVTX ranges, except scratch_ms,
 // which is an "of which" sub-measure counted inside other phases.
+//
+// An insert() takes exactly one of the two triangulation paths, so the phases
+// they have in common (detect / dedup / d2h_new / csr / assign) share fields.
+// Fields marked "cold" or "warm" are only ever written by that one path.
 struct IncrementalHostTimings {
     // insert()
     float validate_ms      = 0.f;  // bounds + duplicate checks
@@ -15,20 +19,21 @@ struct IncrementalHostTimings {
     float seed_h2d_ms      = 0.f;  // d_sx_/d_sy_ upload + d_changed_ clear
     float write_seeds_ms   = 0.f;  // scratch seed arrays + write_seeds kernel
     float bfs_ms           = 0.f;  // run_bfs_ wall time (incl. per-iter syncs)
-    // partial_triangulate_()
-    float d2h_changed_ms   = 0.f;
-    float expand_ms        = 0.f;  // border/reassign dilation loop
-    float mark_stale_ms    = 0.f;
-    float h2d_border_ms    = 0.f;
+    // full_triangulate_() / partial_triangulate_()
+    float d2h_changed_ms   = 0.f;  // warm
+    float expand_ms        = 0.f;  // warm: border/reassign dilation loop
+    float mark_stale_ms    = 0.f;  // warm
+    float h2d_border_ms    = 0.f;  // warm
     float detect_ms        = 0.f;
     float dedup_ms         = 0.f;
-    float d2h_new_ms       = 0.f;
-    float collect_ms       = 0.f;
-    float compact_ms       = 0.f;
-    float upload_tri_ms    = 0.f;
+    float d2h_new_ms       = 0.f;  // D2H of the deduplicated triangles
+    float build_registry_ms= 0.f;  // cold: h_triangles_ + h_triplet_to_tid_
+    float collect_ms       = 0.f;  // warm
+    float compact_ms       = 0.f;  // warm
+    float upload_tri_ms    = 0.f;  // warm
     float csr_ms           = 0.f;
-    float remap_ms         = 0.f;
-    float h2d_reassign_ms  = 0.f;
+    float remap_ms         = 0.f;  // warm
+    float h2d_reassign_ms  = 0.f;  // warm
     float assign_ms        = 0.f;
     // build_outputs_()
     float out_trimap_ms    = 0.f;

@@ -429,7 +429,10 @@ void IncrementalDelaunay::rebuild_csr_and_upload_()
 // full_triangulate_: detect → dedup → CSR → assign (no mask)
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms)
+// The out-params carry the GPU (cudaEvent) timings; the DELAUNEY_HOST_TIME
+// scopes record host wall time for the same phases into ht_.  They are named
+// distinctly from the IncrementalHostTimings fields to keep the two apart.
+void IncrementalDelaunay::full_triangulate_(float* det_gpu, float* dedup_gpu, float* asgn_gpu)
 {
     DELAUNEY_NVTX_RANGE_C("inc: full_triangulate", delauney_nvtx::kPhase);
 
@@ -444,42 +447,53 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
     };
 
     cudaEvent_t e0,e1,e2,e3,e4,e5;
-    if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3);mk(&e4);mk(&e5); }
+    if (det_gpu) { mk(&e0);mk(&e1);mk(&e2);mk(&e3);mk(&e4);mk(&e5); }
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_raw_buf_);
-    int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
+    int32_t* d_counter;
+    {
+        DELAUNEY_HOST_TIME(scratch_ms);
+        cudaMalloc(&d_counter, sizeof(int32_t));
+    }
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
     int32_t raw_count = 0;
     {
         DELAUNEY_NVTX_RANGE_C("inc: detect", delauney_nvtx::kKernel);
-        if (det_ms) rc(e0);
+        DELAUNEY_HOST_TIME(detect_ms);
+        if (det_gpu) rc(e0);
         find_triangle_seeds_kernel<<<grid_dim, block>>>(d_grid_, W_, H_, d_raw, d_counter, nullptr);
         cudaDeviceSynchronize();
         cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        if (det_gpu) rc(e1);
+    }
+    {
+        DELAUNEY_HOST_TIME(scratch_ms);
         cudaFree(d_counter);
-        if (det_ms) rc(e1);
     }
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
     int N_tri = 0;
     {
         DELAUNEY_NVTX_RANGE_C("inc: dedup (thrust)", delauney_nvtx::kKernel);
-        if (dedup_ms) rc(e2);
+        DELAUNEY_HOST_TIME(dedup_ms);
+        if (dedup_gpu) rc(e2);
         thrust::sort(d_ptr, d_ptr + raw_count, RawLess{});
         auto new_end = thrust::unique(d_ptr, d_ptr + raw_count, RawEqual{});
         N_tri = (int)(new_end - d_ptr);
-        if (dedup_ms) rc(e3);
+        if (dedup_gpu) rc(e3);
     }
 
     std::vector<RawTriangle> h_dedup(N_tri);
     {
         DELAUNEY_NVTX_RANGE_C("inc: D2H dedup triangles", delauney_nvtx::kMemcpy);
+        DELAUNEY_HOST_TIME(d2h_new_ms);
         cudaMemcpy(h_dedup.data(), d_raw, N_tri * sizeof(RawTriangle), cudaMemcpyDeviceToHost);
     }
 
     {
         DELAUNEY_NVTX_RANGE("inc: build registry (host)");
+        DELAUNEY_HOST_TIME(build_registry_ms);
         h_triangles_.clear(); h_triplet_to_tid_.clear();
         h_triangles_.reserve(N_tri);
         for (int32_t tid = 0; tid < N_tri; ++tid) {
@@ -494,7 +508,8 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
 
     {
         DELAUNEY_NVTX_RANGE_C("inc: assign", delauney_nvtx::kKernel);
-        if (asgn_ms) rc(e4);
+        DELAUNEY_HOST_TIME(assign_ms);
+        if (asgn_gpu) rc(e4);
         if (N_tri > 0) {
             assign_triangles_kernel<<<grid_dim, block>>>(
                 d_t_grid_, W_, H_, d_grid_, d_raw,
@@ -503,13 +518,13 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
         } else {
             cudaMemset(d_t_grid_, -1, N * sizeof(int32_t));
         }
-        if (asgn_ms) rc(e5);
+        if (asgn_gpu) rc(e5);
     }
 
-    if (det_ms) {
-        *det_ms  = el(e0,e1);
-        *dedup_ms = el(e2,e3);
-        *asgn_ms  = el(e4,e5);
+    if (det_gpu) {
+        *det_gpu   = el(e0,e1);
+        *dedup_gpu = el(e2,e3);
+        *asgn_gpu  = el(e4,e5);
         cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
         cudaEventDestroy(e3); cudaEventDestroy(e4); cudaEventDestroy(e5);
     }

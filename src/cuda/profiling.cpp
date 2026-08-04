@@ -129,6 +129,30 @@ void print_ms(const char* label, float ms)
     std::printf("    %-52s %9.1f ms\n", label, ms);
 }
 
+// One row of a host wall-clock breakdown table.
+struct HostRow { const char* label; float total; };
+
+// Prints a host wall-clock breakdown with per-row percentages.  Every value is
+// divided by `n`, so the same helper serves a single cold insert (n = 1) and a
+// warm average (n = WARM_N).  `scratch` is the overlapping cudaMalloc/cudaFree
+// sub-measure, reported separately because it is already counted in the rows.
+void print_host_breakdown(const char* title, const std::vector<HostRow>& rows,
+                          double n, float scratch)
+{
+    double sum = 0.0;
+    for (const auto& r : rows) sum += r.total / n;
+
+    std::printf("\n    %s\n", title);
+    for (const auto& r : rows) {
+        const double ms = r.total / n;
+        std::printf("    %-46s %8.2f ms  %5.1f %%\n",
+                    r.label, ms, sum > 0.0 ? 100.0 * ms / sum : 0.0);
+    }
+    std::printf("    %-46s %8.2f ms\n", "  accounted total", sum);
+    std::printf("    %-46s %8.2f ms  (of which, counted above)\n",
+                "  cudaMalloc/cudaFree scratch", scratch / n);
+}
+
 // ---------------------------------------------------------------------------
 // CPU reference: Manhattan Voronoi BFS with an iteration counter.
 // Port of _ref_voronoi_timed() -- the NumPy version snapshots the grid per
@@ -653,6 +677,28 @@ int run(int argc, char** argv)
             print_ms("  dedup  (thrust sort + unique)",       inc_t0.dedup_ms);
             print_ms("  assign (assign_triangles kernel)",    inc_t0.assign_ms);
 
+            {
+                const auto& C = inc_t0.host;
+                const std::vector<HostRow> rows = {
+                    { "  insert: validate seeds",         C.validate_ms },
+                    { "  insert: register seeds",         C.seed_reg_ms },
+                    { "  insert: seed H2D + clear",       C.seed_h2d_ms },
+                    { "  insert: write_seeds kernel",     C.write_seeds_ms },
+                    { "  insert: bfs (wall)",             C.bfs_ms },
+                    { "  full: detect",                   C.detect_ms },
+                    { "  full: dedup",                    C.dedup_ms },
+                    { "  full: D2H dedup triangles",      C.d2h_new_ms },
+                    { "  full: build registry",           C.build_registry_ms },
+                    { "  full: rebuild_csr",              C.csr_ms },
+                    { "  full: assign",                   C.assign_ms },
+                    { "  outputs: fill tri_map",          C.out_trimap_ms },
+                    { "  outputs: D2H grids",             C.out_d2h_ms },
+                    { "  outputs: interleave",            C.out_interleave_ms },
+                };
+                print_host_breakdown("Host wall-clock breakdown (cold):",
+                                     rows, 1.0, C.scratch_ms);
+            }
+
             // Warm inserts: single extra seed each (exercises partial_triangulate_).
             const int WARM_N = std::max(1, cfg.warm_inserts);
             const auto extra = make_extra_seeds(W, H, seeds, WARM_N + 1);
@@ -689,6 +735,7 @@ int run(int argc, char** argv)
                     H.detect_ms         += h.detect_ms;
                     H.dedup_ms          += h.dedup_ms;
                     H.d2h_new_ms        += h.d2h_new_ms;
+                    H.build_registry_ms += h.build_registry_ms;
                     H.collect_ms        += h.collect_ms;
                     H.compact_ms        += h.compact_ms;
                     H.upload_tri_ms     += h.upload_tri_ms;
@@ -720,9 +767,7 @@ int run(int argc, char** argv)
 
             {
                 const auto& H = warm_tot.host;
-                const double n = (double)WARM_N;
-                struct Row { const char* label; float total; };
-                const Row rows[] = {
+                const std::vector<HostRow> rows = {
                     { "  insert: validate seeds",        H.validate_ms },
                     { "  insert: register seeds",        H.seed_reg_ms },
                     { "  insert: seed H2D + clear",      H.seed_h2d_ms },
@@ -746,19 +791,8 @@ int run(int argc, char** argv)
                     { "  outputs: D2H grids",            H.out_d2h_ms },
                     { "  outputs: interleave",           H.out_interleave_ms },
                 };
-
-                double sum = 0.0;
-                for (const auto& r : rows) sum += r.total / n;
-
-                std::printf("\n    Host wall-clock breakdown (warm, avg):\n");
-                for (const auto& r : rows) {
-                    const double ms = r.total / n;
-                    std::printf("    %-46s %8.2f ms  %5.1f %%\n",
-                                r.label, ms, sum > 0.0 ? 100.0 * ms / sum : 0.0);
-                }
-                std::printf("    %-46s %8.2f ms\n", "  accounted total", sum);
-                std::printf("    %-46s %8.2f ms  (of which, counted above)\n",
-                            "  cudaMalloc/cudaFree scratch", H.scratch_ms / n);
+                print_host_breakdown("Host wall-clock breakdown (warm, avg):",
+                                     rows, (double)WARM_N, H.scratch_ms);
             }
         } else {
             std::printf("    [CUDA device not available -- skipped]\n");
