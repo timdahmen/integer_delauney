@@ -118,16 +118,6 @@ cross2d(const float ox, const float oy, const float ax, const float ay, const fl
 	return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
 }
 
-__device__ __forceinline__ bool
-point_in_triangle(const float px, const float py, const Vec2i& a, const Vec2i& b, const Vec2i& c) {
-	const float d1 = cross2d(px, py, a.x, a.y, b.x, b.y);
-	const float d2 = cross2d(px, py, b.x, b.y, c.x, c.y);
-	const float d3 = cross2d(px, py, c.x, c.y, a.x, a.y);
-	const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
-	const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
-	return !(has_neg && has_pos);
-}
-
 // ---------------------------------------------------------------------------
 // Kernel 2: window-based triangle assignment
 // TODO fix doc
@@ -156,14 +146,34 @@ __global__ void rasterize_tri_kernel(
 	const int min_y = min(a.y, min(b.y, c.y));
 	const int max_y = max(a.y, max(b.y, c.y));
 
+	// per-edge step constants, computed once per triangle
+	const float alpha1 = static_cast<float>(a.y - b.y), beta1 = static_cast<float>(b.x - a.x);
+	const float alpha2 = static_cast<float>(b.y - c.y), beta2 = static_cast<float>(c.x - b.x);
+	const float alpha3 = static_cast<float>(c.y - a.y), beta3 = static_cast<float>(a.x - c.x);
+
+	// evaluate all 3 edge functions once, at the AABB's top-left pixel
+	const float px0 = min_x + 0.5f, py0 = min_y + 0.5f;
+	float edge_ab = cross2d(px0, py0, a.x, a.y, b.x, b.y);
+	float edge_bc = cross2d(px0, py0, b.x, b.y, c.x, c.y);
+	float edge_ca = cross2d(px0, py0, c.x, c.y, a.x, a.y);
+
 	// check for pixels in AABB if they are in Tri
 	int canvas_pos = 0;
 	for (int y = min_y; y <= max_y; ++y) {
 		canvas_pos = y * W + min_x;
+		float d1 = edge_ab, d2 = edge_bc, d3 = edge_ca;
 		for (int x = min_x; x <= max_x; ++x) {
-			const float px = x + 0.5f, py = y + 0.5f;
-			if (point_in_triangle(px, py, a, b, c)) atomicMax(&canvas[canvas_pos++], tri_id);
+			const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
+			const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
+			if (!(has_neg && has_pos)) atomicMax(&canvas[canvas_pos++], tri_id);
+
+			d1 += alpha1; // step right
+			d2 += alpha2;
+			d3 += alpha3;
 		}
+		edge_ab += beta1; // step down
+		edge_bc += beta2;
+		edge_ca += beta3;
 	}
 }
 
