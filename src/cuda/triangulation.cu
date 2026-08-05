@@ -105,10 +105,16 @@ __global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_g
 		raw_orig[pos] = {a, b, c};
 	};
 
-	if (x >= 1 && y <= H - 2) try_register(x, y, idx(x - 1, y), idx(x, y), idx(x, y + 1));
-	if (x <= W - 2 && y <= H - 2) try_register(x, y, idx(x, y), idx(x + 1, y), idx(x, y + 1));
-	if (x <= W - 2 && y >= 1) try_register(x, y, idx(x, y), idx(x + 1, y), idx(x, y - 1));
-	if (x >= 1 && y >= 1) try_register(x, y, idx(x - 1, y), idx(x, y), idx(x, y - 1));
+	const int32_t center = idx(x, y);
+	const int32_t left = (x >= 1) ? idx(x - 1, y) : UNDEF;
+	const int32_t right = (x <= W - 2) ? idx(x + 1, y) : UNDEF;
+	const int32_t up = (y >= 1) ? idx(x, y - 1) : UNDEF;
+	const int32_t down = (y <= H - 2) ? idx(x, y + 1) : UNDEF;
+
+	if (y <= H - 2) try_register(x, y, left, center, down);
+	if (x <= W - 2) try_register(x, y, center, right, down);
+	if (y >= 1) try_register(x, y, center, right, up);
+	if (x >= 1) try_register(x, y, left, center, up);
 }
 
 // ---------------------------------------------------------------------------
