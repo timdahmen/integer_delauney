@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/sort.h>
 #include <thrust/tuple.h>
@@ -289,10 +290,10 @@ void cuda_compute_triangulation(const int W,
 
 	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_voronoi_grid, W, H, d_tri_xy, d_tri_key, d_tri_orig, d_counter);
 	{
-		cudaError_t sync_err = cudaDeviceSynchronize();
-		if (sync_err != cudaSuccess) {
-			throw std::runtime_error(std::string("find_triangle_seeds_kernel execution failed: ") +
-									 cudaGetErrorString(sync_err));
+		cudaError_t launch_err = cudaGetLastError();
+		if (launch_err != cudaSuccess) {
+			throw std::runtime_error(std::string("find_triangle_seeds_kernel launch failed: ") +
+									 cudaGetErrorString(launch_err));
 		}
 	}
 
@@ -315,7 +316,11 @@ void cuda_compute_triangulation(const int W,
 
 	if (timings) record(ev2);
 
-	thrust::sort_by_key(d_key_ptr, d_key_ptr + raw_count, values_begin, KeyLess{});
+	thrust::sort_by_key(thrust::cuda::par_nosync, d_key_ptr, d_key_ptr + raw_count, values_begin, KeyLess{});
+
+	// resize here, while GPU sorts triangles (thrust::cuda::par_nosync -> async)
+	out_grid.resize(N * 3);
+
 	auto unique_result = thrust::unique_by_key(d_key_ptr, d_key_ptr + raw_count, values_begin, KeyEqual{});
 	const int N_triangles = static_cast<int>(unique_result.first - d_key_ptr);
 
@@ -380,7 +385,6 @@ void cuda_compute_triangulation(const int W,
 	const int num_blocks = (N + num_threads_output - 1) / num_threads_output;
 	build_output_kernel<<<num_blocks, num_threads_output>>>(d_out, d_voronoi_grid, d_canvas, N, default_id);
 
-	out_grid.resize(N * 3);
 	cudaMemcpy(out_grid.data(), d_out, N * 3 * sizeof(int32_t), cudaMemcpyDeviceToHost);
 
 	if (timings) {
