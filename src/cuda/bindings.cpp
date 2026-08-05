@@ -258,9 +258,9 @@ private:
 
 PYBIND11_MODULE(_delauney_cuda, m)
 {
-    m.doc() = "CUDA-accelerated Voronoi + Delaunay triangulation";
+	m.doc() = "CUDA-accelerated Voronoi + Delaunay triangulation";
 
-    py::class_<PyRegularDelaunay>(m, "RegularDelaunay")
+	py::class_<PyRegularDelaunay>(m, "RegularDelaunay")
         .def(py::init<>())
         .def("compute", &PyRegularDelaunay::compute,
              py::arg("width"), py::arg("height"), py::arg("seeds"),
