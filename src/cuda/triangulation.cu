@@ -131,12 +131,12 @@ cross2d(const float ox, const float oy, const float ax, const float ay, const fl
 
 __global__ void rasterize_tri_kernel(
 	int32_t* __restrict__ canvas, const int W, const Vec2i* seed_pos, const Vec3i* tri_seed_ids, const int32_t n_tris) {
-	const int tri_id = blockIdx.x * blockDim.x + threadIdx.x;
+	const int tri_id = blockIdx.x;
 	if (tri_id >= n_tris) return;
 
 	// get Tri data
 	const auto [a_idx, b_idx, c_idx] = tri_seed_ids[tri_id];
-	const Vec2i a = seed_pos[a_idx];
+	const Vec2i a = seed_pos[a_idx]; // same address for whole block
 	const Vec2i b = seed_pos[b_idx];
 	const Vec2i c = seed_pos[c_idx];
 
@@ -145,35 +145,22 @@ __global__ void rasterize_tri_kernel(
 	const int max_x = max(a.x, max(b.x, c.x));
 	const int min_y = min(a.y, min(b.y, c.y));
 	const int max_y = max(a.y, max(b.y, c.y));
+	const int box_w = max_x - min_x + 1;
+	const int box_h = max_y - min_y + 1;
+	const int box_area = box_w * box_h;
 
-	// per-edge step constants, computed once per triangle
-	const float alpha1 = static_cast<float>(a.y - b.y), beta1 = static_cast<float>(b.x - a.x);
-	const float alpha2 = static_cast<float>(b.y - c.y), beta2 = static_cast<float>(c.x - b.x);
-	const float alpha3 = static_cast<float>(c.y - a.y), beta3 = static_cast<float>(a.x - c.x);
+	// check for pixels in AABB if they are in Tri, in strides across multiple threads
+	for (int flat = threadIdx.x; flat < box_area; flat += blockDim.x) {
+		const int x = min_x + (flat % box_w);
+		const int y = min_y + (flat / box_w);
+		const float px = x + 0.5f, py = y + 0.5f;
 
-	// evaluate all 3 edge functions once, at the AABB's top-left pixel
-	const float px0 = min_x + 0.5f, py0 = min_y + 0.5f;
-	float edge_ab = cross2d(px0, py0, a.x, a.y, b.x, b.y);
-	float edge_bc = cross2d(px0, py0, b.x, b.y, c.x, c.y);
-	float edge_ca = cross2d(px0, py0, c.x, c.y, a.x, a.y);
-
-	// check for pixels in AABB if they are in Tri
-	int canvas_pos = 0;
-	for (int y = min_y; y <= max_y; ++y) {
-		canvas_pos = y * W + min_x;
-		float d1 = edge_ab, d2 = edge_bc, d3 = edge_ca;
-		for (int x = min_x; x <= max_x; ++x) {
-			const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
-			const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
-			if (!(has_neg && has_pos)) atomicMax(&canvas[canvas_pos++], tri_id);
-
-			d1 += alpha1; // step right
-			d2 += alpha2;
-			d3 += alpha3;
-		}
-		edge_ab += beta1; // step down
-		edge_bc += beta2;
-		edge_ca += beta3;
+		const float d1 = cross2d(px, py, a.x, a.y, b.x, b.y);
+		const float d2 = cross2d(px, py, b.x, b.y, c.x, c.y);
+		const float d3 = cross2d(px, py, c.x, c.y, a.x, a.y);
+		const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
+		const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
+		if (!(has_neg && has_pos)) atomicMax(&canvas[y * W + x], tri_id);
 	}
 }
 
@@ -327,7 +314,7 @@ void cuda_compute_triangulation(const int W,
 	if (timings) record(ev4);
 
 	if (N_triangles > 0) {
-		int threads_per_block = 256;
+		static constexpr int threads_per_block = 256;
 		int num_blocks = (N_triangles + threads_per_block - 1) / threads_per_block;
 		rasterize_tri_kernel<<<num_blocks, threads_per_block>>>(d_canvas, W, d_seed_pos, d_tri_orig, N_triangles);
 		cudaError_t err = cudaGetLastError();
