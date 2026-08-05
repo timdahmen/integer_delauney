@@ -66,7 +66,7 @@ struct KeyEqual {
 // Kernel 1: detect triangle seeds (all 4 L-shape orientations)
 // ---------------------------------------------------------------------------
 
-__global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ n_grid,
+__global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_grid,
 										   const int W,
 										   const int H,
 										   Vec2i* __restrict__ raw_xy,
@@ -77,7 +77,7 @@ __global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ n_grid,
 	const int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x >= W || y >= H) return;
 
-	auto idx = [&](const int cx, const int cy) -> int32_t { return n_grid[cy * W + cx]; };
+	auto idx = [&](const int cx, const int cy) -> int32_t { return voronoi_grid[(cy * W + cx)*2]; };
 
 	auto try_register = [&](const int gx, const int gy, const int32_t a, const int32_t b, const int32_t c) {
 		if (a == UNDEF || b == UNDEF || c == UNDEF) return;
@@ -127,6 +127,23 @@ point_in_triangle(const float px, const  float py, const Vec2i a, const Vec2i b,
 	const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
 	const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
 	return !(has_neg && has_pos);
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+__global__ void build_output_kernel(int32_t* __restrict__ out,
+									const int32_t* __restrict__ voronoi_grid,
+									const int32_t* __restrict__ canvas,
+									const int N,
+									const int default_id) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= N) return;
+	const int32_t tri_id = canvas[i];
+	out[i * 3] = voronoi_grid[i * 2];
+	out[i * 3 + 1] = voronoi_grid[i * 2 + 1];
+	out[i * 3 + 2] = (tri_id != -1) ? tri_id : default_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,20 +239,17 @@ void cuda_compute_triangulation(const int W,
 	// Upload inputs: seed_id channel, seed positions
 	// -----------------------------------------------------------------------
 
-	std::vector<int32_t> h_n(N);
-	for (int i = 0; i < N; ++i) h_n[i] = voronoi_grid[i * 2];
 	std::vector<Vec2i> h_seed_pos(N_seeds);
 	for (int i = 0; i < N_seeds; ++i) h_seed_pos[i] = {seed_xs[i], seed_ys[i]};
 
-	int32_t *d_seed_ids = nullptr, *d_dist = nullptr;
 	Vec2i* d_seed_pos = nullptr;
-	cudaMalloc(&d_seed_ids, N * sizeof(int32_t));
 	cudaMalloc(&d_seed_pos, N_seeds * sizeof(Vec2i));
-	CudaFreeGuard g_seed_ids(d_seed_ids);
 	CudaFreeGuard g_seed_pos(d_seed_pos);
-	cudaMemcpy(d_seed_ids, h_n.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
 	cudaMemcpy(d_seed_pos, h_seed_pos.data(), N_seeds * sizeof(Vec2i), cudaMemcpyHostToDevice);
-
+	int32_t* d_voronoi_grid = nullptr;
+	cudaMalloc(&d_voronoi_grid, N * 2 * sizeof(int32_t));
+	CudaFreeGuard g_voronoi_grid(d_voronoi_grid);
+	cudaMemcpy(d_voronoi_grid, voronoi_grid, N * 2 * sizeof(int32_t), cudaMemcpyHostToDevice);
 
 	// -----------------------------------------------------------------------
 	// Step 2: detect raw triangle seeds
@@ -262,7 +276,7 @@ void cuda_compute_triangulation(const int W,
 
 	if (timings) record(ev0);
 
-	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_seed_ids, W, H, d_tri_xy, d_tri_key, d_tri_orig, d_counter);
+	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_voronoi_grid, W, H, d_tri_xy, d_tri_key, d_tri_orig, d_counter);
 	{
 		cudaError_t sync_err = cudaDeviceSynchronize();
 		if (sync_err != cudaSuccess) {
@@ -320,7 +334,7 @@ void cuda_compute_triangulation(const int W,
 
 	if (N_triangles > 0) {
 		static constexpr int threads_per_block = 256;
-		int num_blocks = (N_triangles + threads_per_block - 1) / threads_per_block;
+		const int num_blocks = (N_triangles + threads_per_block - 1) / threads_per_block;
 		rasterize_tri_kernel<<<num_blocks, threads_per_block>>>(d_canvas, W, d_seed_pos, d_tri_orig, N_triangles);
 		cudaError_t err = cudaGetLastError();
 		if (err != cudaSuccess) {
@@ -341,17 +355,17 @@ void cuda_compute_triangulation(const int W,
 	// Step 5: build output grid (H * W * 3) and fill timings
 	// -----------------------------------------------------------------------
 
-	std::vector<int32_t> h_canvas(N);
-	cudaMemcpy(h_canvas.data(), d_canvas, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+	int32_t* d_out = nullptr;
+	cudaMalloc(&d_out, N*3*sizeof(int32_t));
+	CudaFreeGuard g_out(d_out);
+	const int32_t default_id = N_triangles - 1;
 
-	const int32_t default_val = N_triangles - 1;
+	static constexpr int num_threads_output = 1024;
+	const int num_blocks = (N + num_threads_output - 1) / num_threads_output;
+	build_output_kernel<<<num_blocks, num_threads_output>>>(d_out, d_voronoi_grid, d_canvas, N, default_id);
+
 	out_grid.resize(N * 3);
-	for (int i = 0; i < N; ++i) {
-		int32_t t = h_canvas[i];
-		out_grid[i * 3] = voronoi_grid[i * 2];
-		out_grid[i * 3 + 1] = voronoi_grid[i * 2 + 1];
-		out_grid[i * 3 + 2] = (t != -1) ? t : default_val;
-	}
+	cudaMemcpy(out_grid.data(), d_out, N * 3 * sizeof(int32_t), cudaMemcpyDeviceToHost);
 
 	if (timings) {
 		timings->detect_ms = elapsed_ms(ev0, ev1);
