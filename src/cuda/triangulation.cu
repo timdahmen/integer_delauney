@@ -1,20 +1,22 @@
 // CUDA kernels for GridTriangulation.
-// TODO fix doc
+// Step 1 (CPU): prepare and upload data to the GPU
 // Step 2 (GPU): scan all 4 L-shape orientations; raw hits → device buffer.
-// Step 3 (GPU): thrust::sort + thrust::unique on the device buffer.
-// Step 4 (GPU): window-based nearest-neighbor assign.
-//   For each pixel, read its Voronoi distance d, scan a (2R+1)² window of
-//   the seed-id grid (R = min(d + WINDOW_SLACK, WINDOW_CAP)), collect unique
-//   nearby seed IDs, then test only the triangles adjacent to those seeds via
-//   a per-seed CSR list.  Reduces per-pixel tests from O(T) to O(k·t) where
-//   k ≈ nearby seeds (~10-70) and t ≈ triangles/seed (~7).
+// Step 3 (GPU): thrust::sort_by_key + thrust::unique_by_key on the device buffer.
+// Step 4 (GPU): triangle rasterisation. 1 block per triangle, using multiple threads per 
+//				 triangle so that consecutive threads access neighbouring memory.
 //
 // Host copies:
-//   • voronoi seed_id + distance channels  → device  (input, once)
-//   • seed positions                        → device  (input, once)
-//   • deduplicated triangles               ← device  (output, ~7 MB)
-//   • CSR adjacency list                   → device  (built host-side, ~3 MB)
-//   • triangle_id grid                     ← device  (output, W*H ints)
+//   • voronoi grid (seed_id + distance, interleaved) → device  (input, once)
+//   • seed positions                                 → device  (input, once)
+//   • deduplicated triangles                         ← device  (output; x,y for
+//                                                      triangle_map_out + orig_a/b/c
+//                                                      for rasterize_tri_kernel)
+//   • triangulation grid (seed_id, distance, tri_id) ← device  (output, W*H*3 ints)
+//
+// No CSR adjacency list: triangle → pixel assignment is now done by a
+// triangle-centric rasterizer (one block per triangle, atomicMax into the
+// canvas) instead of a per-pixel seed-window search, so the seed → triangle
+// CSR this pipeline used to build is no longer needed.
 
 #include "triangulation.cuh"
 
@@ -59,7 +61,6 @@ struct KeyLess {
 struct KeyEqual {
 	__device__ bool operator()(const Vec3i& x, const Vec3i& y) const { return x.a == y.a && x.b == y.b && x.c == y.c; }
 };
-
 
 // ---------------------------------------------------------------------------
 // Kernel 1: detect triangle seeds (all 4 L-shape orientations)
@@ -118,15 +119,24 @@ cross2d(const float ox, const float oy, const float ax, const float ay, const fl
 	return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
 }
 
+__device__ __forceinline__ bool
+point_in_triangle(const float px, const  float py, const Vec2i a, const Vec2i b, const Vec2i c) {
+	const float d1 = cross2d(px, py, a.x, a.y, b.x, b.y);
+	const float d2 = cross2d(px, py, b.x, b.y, c.x, c.y);
+	const float d3 = cross2d(px, py, c.x, c.y, a.x, a.y);
+	const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
+	const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
+	return !(has_neg && has_pos);
+}
+
 // ---------------------------------------------------------------------------
-// Kernel 2: window-based triangle assignment
-// TODO fix doc
-// For each pixel:
-//   1. Read Voronoi distance d; set search radius R = min(d+SLACK, CAP).
-//   2. Scan the (2R+1)x(2R+1) seed-id window; collect unique seed IDs.
-//   3. For each nearby seed, iterate its CSR triangle list and run the
-//      containment test.  Duplicate triangle tests (same tri reachable via
-//      multiple seeds) are allowed — they are idempotent.
+// Kernel 2: Triangle centric rasterisation
+// For each Triangle:
+//	 1. launch 1 block with N threads
+//	 2. load the corner Seeds for the triangle, blockIdx.x (same across entire block, so cheap)
+//	 3. compute triangle AABB, and iterate over it in strides of blockDim.x
+//	 4. each iteration each tread checks for 1 pixel, if it is inside the triangle
+//		- if it is inside the Triangle, atomicMax the triangle seed so the highest ID wins
 // ---------------------------------------------------------------------------
 
 __global__ void rasterize_tri_kernel(
@@ -149,25 +159,20 @@ __global__ void rasterize_tri_kernel(
 	const int box_h = max_y - min_y + 1;
 	const int box_area = box_w * box_h;
 
-	// check for pixels in AABB if they are in Tri, in strides across multiple threads
+	// check for pixels in AABB, if they are in Tri, in strides across multiple threads
 	for (int flat = threadIdx.x; flat < box_area; flat += blockDim.x) {
 		const int x = min_x + (flat % box_w);
 		const int y = min_y + (flat / box_w);
 		const float px = x + 0.5f, py = y + 0.5f;
 
-		const float d1 = cross2d(px, py, a.x, a.y, b.x, b.y);
-		const float d2 = cross2d(px, py, b.x, b.y, c.x, c.y);
-		const float d3 = cross2d(px, py, c.x, c.y, a.x, a.y);
-		const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
-		const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
-		if (!(has_neg && has_pos)) atomicMax(&canvas[y * W + x], tri_id);
+		if (point_in_triangle(px, py, a, b, c)) atomicMax(&canvas[y * W + x], tri_id);
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Guard for cudaMalloc'd device memory.
-// There are multiple throw points in cuda_compute_triangulation. This automates the free, and avoids manual
-// checking/freeing
+// Guard for cudaMalloc device memory.
+// There are multiple throw points in cuda_compute_triangulation. 
+// This automates the free, and avoids manual checking/freeing
 // ---------------------------------------------------------------------------
 struct CudaFreeGuard {
 	void* ptr = nullptr;
@@ -214,7 +219,7 @@ void cuda_compute_triangulation(const int W,
 	}
 
 	// -----------------------------------------------------------------------
-	// Upload inputs: seed_id channel, distance channel, seed positions
+	// Upload inputs: seed_id channel, seed positions
 	// -----------------------------------------------------------------------
 
 	std::vector<int32_t> h_n(N);
@@ -273,7 +278,7 @@ void cuda_compute_triangulation(const int W,
 
 	// -----------------------------------------------------------------------
 	// Step 3: deduplicate on device with Thrust sort_by_key + unique_by_key
-	// Key = RawKey (a,b,c); values = (RawXY, RawOrig) zipped so they're
+	// Key = Vec3i(a,b,c); values = (x/y, Orig_a/b/c) zipped so they're
 	// reordered/compacted in lockstep with the key, in one pass each.
 	// -----------------------------------------------------------------------
 
