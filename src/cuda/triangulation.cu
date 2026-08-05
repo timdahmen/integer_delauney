@@ -2,7 +2,7 @@
 // Step 1 (CPU): prepare and upload data to the GPU
 // Step 2 (GPU): scan all 4 L-shape orientations; raw hits → device buffer.
 // Step 3 (GPU): thrust::sort_by_key + thrust::unique_by_key on the device buffer.
-// Step 4 (GPU): triangle rasterisation. 1 block per triangle, using multiple threads per 
+// Step 4 (GPU): triangle rasterisation. 1 block per triangle, using multiple threads per
 //				 triangle so that consecutive threads access neighbouring memory.
 //
 // Host copies:
@@ -77,7 +77,7 @@ __global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_g
 	const int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x >= W || y >= H) return;
 
-	auto idx = [&](const int cx, const int cy) -> int32_t { return voronoi_grid[(cy * W + cx)*2]; };
+	auto idx = [&](const int cx, const int cy) -> int32_t { return voronoi_grid[(cy * W + cx) * 2]; };
 
 	auto try_register = [&](const int gx, const int gy, const int32_t a, const int32_t b, const int32_t c) {
 		if (a == UNDEF || b == UNDEF || c == UNDEF) return;
@@ -120,7 +120,7 @@ cross2d(const float ox, const float oy, const float ax, const float ay, const fl
 }
 
 __device__ __forceinline__ bool
-point_in_triangle(const float px, const  float py, const Vec2i a, const Vec2i b, const Vec2i c) {
+point_in_triangle(const float px, const float py, const Vec2i a, const Vec2i b, const Vec2i c) {
 	const float d1 = cross2d(px, py, a.x, a.y, b.x, b.y);
 	const float d2 = cross2d(px, py, b.x, b.y, c.x, c.y);
 	const float d3 = cross2d(px, py, c.x, c.y, a.x, a.y);
@@ -144,6 +144,17 @@ __global__ void build_output_kernel(int32_t* __restrict__ out,
 	out[i * 3] = voronoi_grid[i * 2];
 	out[i * 3 + 1] = voronoi_grid[i * 2 + 1];
 	out[i * 3 + 2] = (tri_id != -1) ? tri_id : default_id;
+}
+
+__global__ void build_triangle_map_out(TriangleEntry* __restrict__ out,
+									   const Vec2i* __restrict__ tri_xy,
+									   const Vec3i* __restrict__ tri_og_seeds,
+									   const int N) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= N) return;
+	const auto [x, y] = tri_xy[i];
+	const auto [a, b, c] = tri_og_seeds[i];
+	out[i] = {x, y, a, b, c};
 }
 
 // ---------------------------------------------------------------------------
@@ -188,7 +199,7 @@ __global__ void rasterize_tri_kernel(
 
 // ---------------------------------------------------------------------------
 // Guard for cudaMalloc device memory.
-// There are multiple throw points in cuda_compute_triangulation. 
+// There are multiple throw points in cuda_compute_triangulation.
 // This automates the free, and avoids manual checking/freeing
 // ---------------------------------------------------------------------------
 struct CudaFreeGuard {
@@ -311,15 +322,19 @@ void cuda_compute_triangulation(const int W,
 	if (timings) record(ev3);
 
 	// Copy deduplicated x,y and orig_a/b/c to host (Python dict + CSR build)
-	std::vector<Vec2i> h_xy(N_triangles);
-	std::vector<Vec3i> h_orig(N_triangles);
-	cudaMemcpy(h_xy.data(), d_tri_xy, N_triangles * sizeof(Vec2i), cudaMemcpyDeviceToHost);
-	cudaMemcpy(h_orig.data(), d_tri_orig, N_triangles * sizeof(Vec3i), cudaMemcpyDeviceToHost);
+	{
+		TriangleEntry* d_out_map = nullptr;
+		cudaMalloc(&d_out_map, N_triangles * sizeof(TriangleEntry));
+		CudaFreeGuard g_out_map(d_out_map);
 
-	triangle_map_out.clear();
-	triangle_map_out.reserve(N_triangles);
-	for (int i = 0; i < N_triangles; ++i)
-		triangle_map_out.push_back({h_xy[i].x, h_xy[i].y, h_orig[i].a, h_orig[i].b, h_orig[i].c});
+		static constexpr int num_threads_out_map = 1024;
+		const int num_blocks = (N_triangles + num_threads_out_map - 1) / num_threads_out_map;
+		build_triangle_map_out<<<num_blocks, num_threads_out_map>>>(d_out_map, d_tri_xy, d_tri_orig, N_triangles);
+
+		triangle_map_out.clear();
+		triangle_map_out.resize(N_triangles);
+		cudaMemcpy(triangle_map_out.data(), d_out_map, N_triangles * sizeof(TriangleEntry), cudaMemcpyDeviceToHost);
+	}
 
 	// -----------------------------------------------------------------------
 	// Step 4: assign pixels to triangles
@@ -355,8 +370,9 @@ void cuda_compute_triangulation(const int W,
 	// Step 5: build output grid (H * W * 3) and fill timings
 	// -----------------------------------------------------------------------
 
+
 	int32_t* d_out = nullptr;
-	cudaMalloc(&d_out, N*3*sizeof(int32_t));
+	cudaMalloc(&d_out, N * 3 * sizeof(int32_t));
 	CudaFreeGuard g_out(d_out);
 	const int32_t default_id = N_triangles - 1;
 
