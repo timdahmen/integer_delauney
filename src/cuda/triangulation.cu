@@ -132,6 +132,7 @@ bool point_in_triangle(float px, float py,
 
 static constexpr int WINDOW_SLACK = 3;   // extra radius beyond Voronoi dist
 static constexpr int WINDOW_CAP   = 20;  // hard cap to bound work in sparse areas
+static constexpr int SID_HISTORY_STACK_SIZE = 16;
 
 __global__
 void assign_triangles_kernel(
@@ -167,6 +168,13 @@ void assign_triangles_kernel(
     int32_t best = -1;
     int32_t previous_sid = -1;
 
+    int32_t sid_hist_pseudostack[SID_HISTORY_STACK_SIZE];
+
+    #pragma unroll // Kudos to the one time I get to use this effectively
+    for (int i = 0; i < SID_HISTORY_STACK_SIZE; ++i) {
+        sid_hist_pseudostack[i] = -1;
+    } 
+
     for (int sy = y0; sy <= y1; ++sy) {
         for (int sx = x0; sx <= x1; ++sx) {
             int32_t sid = n_grid[sy * W + sx];
@@ -178,22 +186,38 @@ void assign_triangles_kernel(
                  // Skip if outside boundaries
                 if (sid >= 0 && sid < N_seeds) {
 
-                    // Test what can be seen from here, inverse from the collect then try approach
-                    for (int j = csr_ptr[sid]; j < csr_ptr[sid + 1]; ++j) {
-                        int32_t tid = csr_idx[j];
-                        const RawTriangle& tri = triangles[tid];
-                        float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
-                        float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
-                        float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
+                    // Find out if we have this on the "stack"
+                    bool did_find = false;
+                    #pragma unroll
+                    for (int i = 0; i < SID_HISTORY_STACK_SIZE; ++i) {
+                        did_find |= (sid_hist_pseudostack[i] == sid);
+                    }
+                
+                    if (!did_find) {
+                        // Push the "stack"
+                        #pragma unroll
+                        for (int i = SID_HISTORY_STACK_SIZE - 1; i > 0; --i) {
+                            sid_hist_pseudostack[i] = sid_hist_pseudostack[i - 1];
+                        }
+                        sid_hist_pseudostack[0] = sid;
 
-                        // I want to guess a few fractions of a millisecond can be saved here
-                        // by doing the tid-best check first but that yielded no measurable
-                        // difference for me
-                        if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy)) {
-                            if (best == -1 || tid > best) {
-                                best = tid;
-                            }
-                        }    
+                        // Test what can be seen from here, inverse from the collect then try approach
+                        for (int j = csr_ptr[sid]; j < csr_ptr[sid + 1]; ++j) {
+                            int32_t tid = csr_idx[j];
+                            const RawTriangle& tri = triangles[tid];
+                            float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
+                            float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
+                            float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
+
+                            // I want to guess a few fractions of a millisecond can be saved here
+                            // by doing the tid-best check first but that yielded no measurable
+                            // difference for me
+                            if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy)) {
+                                if (best == -1 || tid > best) {
+                                    best = tid;
+                                }
+                            }    
+                        }
                     }
                 }
             }
