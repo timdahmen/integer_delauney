@@ -121,15 +121,17 @@ bool point_in_triangle(float px, float py,
 //
 // For each pixel:
 //   1. Read Voronoi distance d; set search radius R = min(d+SLACK, CAP).
-//   2. Scan the (2R+1)x(2R+1) seed-id window; collect unique seed IDs.
-//   3. For each nearby seed, iterate its CSR triangle list and run the
+//   2. Scan the (2R+1)x(2R+1) seed-id window; For each match: iterate 
+//      its CSR triangle list and run the
 //      containment test.  Duplicate triangle tests (same tri reachable via
 //      multiple seeds) are allowed — they are idempotent.
+//
+// Optimization note: this seems to create more potential matches but still arrives
+// at the correct conclusion
 // ---------------------------------------------------------------------------
 
 static constexpr int WINDOW_SLACK = 3;   // extra radius beyond Voronoi dist
 static constexpr int WINDOW_CAP   = 20;  // hard cap to bound work in sparse areas
-static constexpr int MAX_NEARBY   = 64;  // max unique seeds collected per pixel
 
 __global__
 void assign_triangles_kernel(
@@ -155,43 +157,48 @@ void assign_triangles_kernel(
     int dist = dist_grid[y * W + x];
     int R    = min(dist + WINDOW_SLACK, WINDOW_CAP);
 
-    // Collect unique nearby seeds in a small register/local array.
-    int32_t nearby[MAX_NEARBY];
-    int n_nearby = 0;
 
     int x0 = max(0, x - R),     x1 = min(W - 1, x + R);
     int y0 = max(0, y - R),     y1 = min(H - 1, y + R);
-
-    for (int sy = y0; sy <= y1; ++sy) {
-        for (int sx = x0; sx <= x1; ++sx) {
-            int32_t sid = n_grid[sy * W + sx];
-            bool dup = false;
-            for (int i = 0; i < n_nearby; ++i)
-                if (nearby[i] == sid) { dup = true; break; }
-            if (!dup && n_nearby < MAX_NEARBY)
-                nearby[n_nearby++] = sid;
-        }
-    }
 
     // Test triangles reachable via nearby seeds.
     // A triangle with all 3 vertices in the window appears 3 times (once per
     // seed); the containment test is idempotent so duplicates are harmless.
     int32_t best = -1;
-    for (int i = 0; i < n_nearby; ++i) {
-        int32_t sid = nearby[i];
-        if (sid < 0 || sid >= N_seeds) continue;
-        for (int j = csr_ptr[sid]; j < csr_ptr[sid + 1]; ++j) {
-            int32_t tid = csr_idx[j];
-            const RawTriangle& tri = triangles[tid];
-            float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
-            float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
-            float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
-            if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy))
-                if (best == -1 || tid > best)
-                    best = tid;
+    int32_t previous_sid = -1;
+
+    for (int sy = y0; sy <= y1; ++sy) {
+        for (int sx = x0; sx <= x1; ++sx) {
+            int32_t sid = n_grid[sy * W + sx];
+           
+            // Skip if same, already handeled
+            if (sid != previous_sid) {
+                previous_sid = sid;
+
+                 // Skip if outside boundaries
+                if (sid >= 0 && sid < N_seeds) {
+
+                    // Test what can be seen from here, inverse from the collect then try approach
+                    for (int j = csr_ptr[sid]; j < csr_ptr[sid + 1]; ++j) {
+                        int32_t tid = csr_idx[j];
+                        const RawTriangle& tri = triangles[tid];
+                        float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
+                        float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
+                        float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
+
+                        // I want to guess a few fractions of a millisecond can be saved here
+                        // by doing the tid-best check first but that yielded no measurable
+                        // difference for me
+                        if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy)) {
+                            if (best == -1 || tid > best) {
+                                best = tid;
+                            }
+                        }    
+                    }
+                }
+            }
         }
     }
-
     t_grid[y * W + x] = (best != -1) ? best : (N_triangles - 1);
 }
 

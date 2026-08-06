@@ -230,9 +230,12 @@ void remap_tgrid_kernel(int32_t* __restrict__ t_grid, int N,
 // Kernel: window-based assignment with optional mask
 // ---------------------------------------------------------------------------
 
+// I am beginning to wonder why this stuff is never defined as global
+// constants and instead strun everywhere ... someone needs to get on that
+// see also: same thing but in triangulation.cu
+
 static constexpr int WINDOW_SLACK = 3;
 static constexpr int WINDOW_CAP   = 20;
-static constexpr int MAX_NEARBY   = 64;
 
 __global__
 void assign_triangles_kernel(
@@ -256,36 +259,43 @@ void assign_triangles_kernel(
     int dist = grid[(y * W + x) * 2 + 1];
     int R    = min(dist + WINDOW_SLACK, WINDOW_CAP);
 
-    int32_t nearby[MAX_NEARBY];
-    int n_nearby = 0;
-
     int x0 = max(0, x-R), x1 = min(W-1, x+R);
     int y0 = max(0, y-R), y1 = min(H-1, y+R);
 
-    for (int sy = y0; sy <= y1; ++sy)
-    for (int sx = x0; sx <= x1; ++sx) {
-        int32_t sid = grid[(sy * W + sx) * 2];
-        bool dup = false;
-        for (int i = 0; i < n_nearby; ++i)
-            if (nearby[i] == sid) { dup = true; break; }
-        if (!dup && n_nearby < MAX_NEARBY)
-            nearby[n_nearby++] = sid;
-    }
-
     int32_t best = -1;
-    for (int i = 0; i < n_nearby; ++i) {
-        int32_t sid = nearby[i];
-        if (sid < 0 || sid >= N_seeds) continue;
-        for (int j = csr_ptr[sid]; j < csr_ptr[sid+1]; ++j) {
-            int32_t tid = csr_idx[j];
-            const RawTriangle& tri = triangles[tid];
-            float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
-            float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
-            float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
-            if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy))
-                if (best == -1 || tid > best) best = tid;
+    int32_t previous_sid = -1;
+
+    for (int sy = y0; sy <= y1; ++sy) {
+        for (int sx = x0; sx <= x1; ++sx) {
+            int32_t sid = grid[(sy * W + sx) * 2];
+
+            // Skip if same, already handeled
+            if (sid != previous_sid) {
+                previous_sid = sid;
+
+                 // Skip if outside boundaries
+                if (sid >= 0 && sid < N_seeds) {
+                    for (int j = csr_ptr[sid]; j < csr_ptr[sid+1]; ++j) {
+                        int32_t tid = csr_idx[j];
+                        const RawTriangle& tri = triangles[tid];
+                        float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
+                        float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
+                        float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
+
+                        // I want to guess a few fractions of a millisecond can be saved here
+                        // by doing the tid-best check first but that yielded no measurable
+                        // difference for me
+                        if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy)) {
+                            if (best == -1 || tid > best) {
+                                best = tid;
+                            }
+                        }
+                    }
+                }
+            }      
         }
     }
+    
     t_grid[y * W + x] = (best != -1) ? best : (N_triangles - 1);
 }
 
