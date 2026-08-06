@@ -390,6 +390,8 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 
 void IncrementalDelaunay::upload_triangles_() {
 	int N_tri = (int)h_triangles_.size();
+	// TODO: Host tri and raw tri are the same type struct
+	//	 however, can be even simpler, with new raster tri kernel
 	std::vector<RawTriangle> h_raw(N_tri);
 	for (int i = 0; i < N_tri; ++i) {
 		const auto& h = h_triangles_[i];
@@ -430,6 +432,8 @@ void IncrementalDelaunay::rebuild_csr_and_upload_() {
 // ---------------------------------------------------------------------------
 
 void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms) {
+	// TODO replace with optimized triangulation from triangulation.cu
+
 	const int N = W_ * H_;
 	dim3 block(16, 16);
 	dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
@@ -478,13 +482,11 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
 
 	h_triangles_.clear();
 	h_triplet_to_tid_.clear();
-	h_canon_to_tid_.clear();
 	h_triangles_.reserve(N_tri);
 	for (int32_t tid = 0; tid < N_tri; ++tid) {
 		const auto& r = h_dedup[tid];
 		h_triangles_.push_back({r.x, r.y, r.a, r.b, r.c, r.orig_a, r.orig_b, r.orig_c});
 		h_triplet_to_tid_[pack_triplet_(r.a, r.b, r.c)] = tid;
-		h_canon_to_tid_[pack_xy_(r.x, r.y)] = tid;
 	}
 	// d_raw_buf_ already has the deduplicated triangles in correct order
 
@@ -527,6 +529,9 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 	cudaMemcpy(h_changed.data(), d_changed_, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
 
 	// Build border (expand by 2 for L-shapes) and reassign (expand by WINDOW_CAP)
+	// TODO: h_reassign not needed, if doing full triangulation each time
+	//    Instead of downloading border to Host, expanding it by 2 and reuploading it later, just make insert_seed
+	//    kernel write the expanded by2 area directly. That kernel is super cheap anyway and saves a lot of mem copy and CPU mem loading
 	std::vector<int32_t> h_border(N, 0), h_reassign(N, 0);
 	for (int y = 0; y < H_; ++y) {
 		for (int x = 0; x < W_; ++x) {
@@ -547,6 +552,9 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 	// Mark stale triangles (canonical pixel in border)
 	int old_count = (int)h_triangles_.size();
 	std::vector<bool> is_stale(old_count, false);
+	// TODO: Are there any stale Tris?
+	//  The find_tri kernel only finds triangles for which x/y are within W/H already, so only non-stale ones should
+	//  exist. It then writes the tested x/y as the tri xy which we check here.
 	for (int tid = 0; tid < old_count; ++tid) {
 		const auto& t = h_triangles_[tid];
 		if (t.x >= 0 && t.x < W_ && t.y >= 0 && t.y < H_)
@@ -588,6 +596,8 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 	for (const auto& r : h_new) {
 		auto key = pack_triplet_(r.a, r.b, r.c);
 		auto it = h_triplet_to_tid_.find(key);
+		// TODO: assuming we can remove is_stale can remove that check here and
+		//   also make h_triplet_to_tid_ a set instead of map (assuming tid not needed later)
 		if (it == h_triplet_to_tid_.end() || is_stale[it->second])
 			to_add.push_back({r.x, r.y, r.a, r.b, r.c, r.orig_a, r.orig_b, r.orig_c});
 	}
@@ -595,31 +605,33 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 	// Compact: keep non-stale, append new; build remap old→new
 	std::vector<int32_t> remap(old_count, -1);
 	std::vector<HTriangle> compacted;
+	// XXX Compated.size = n_old_tri - n_stale_old_Tris
 	compacted.reserve(old_count - (int)std::count(is_stale.begin(), is_stale.end(), true) + (int)to_add.size());
 	for (int tid = 0; tid < old_count; ++tid) {
 		if (!is_stale[tid]) {
+			// XXX push tid of non stale Tris and in remap (tid -> idx Tri in compacted)
 			remap[tid] = (int32_t)compacted.size();
 			compacted.push_back(h_triangles_[tid]);
 		}
 	}
-	for (const auto& t : to_add) compacted.push_back(t);
+	for (const auto& t : to_add) compacted.push_back(t); // XXX add new Tris to compacted
 
 	h_triangles_ = std::move(compacted);
 
 	// Rebuild lookup maps
 	h_triplet_to_tid_.clear();
-	h_canon_to_tid_.clear();
 	for (int tid = 0; tid < (int)h_triangles_.size(); ++tid) {
 		const auto& t = h_triangles_[tid];
 		h_triplet_to_tid_[pack_triplet_(t.a, t.b, t.c)] = tid;
-		h_canon_to_tid_[pack_xy_(t.x, t.y)] = tid;
 	}
 
 	// Upload triangle array and CSR
 	upload_triangles_();
-	rebuild_csr_and_upload_();
+	rebuild_csr_and_upload_(); // TODO: not needed with new raster tir kernel
 
 	// Remap d_t_grid_ through old→new table
+	// TODO: does this just remap the old Tri IDs to the new ones. Should be faster, to just re rasterize all Tris.
+	//   Removes this kernel entirely and the CPU side bookkeeping
 	int32_t fallback = h_triangles_.empty() ? 0 : (int32_t)h_triangles_.size() - 1;
 	if (old_count > 0) {
 		int32_t* d_remap;
@@ -639,6 +651,13 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 													 d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri, d_mask_);
 		cudaDeviceSynchronize();
 	}
+
+	// TODO: SUMMARY:
+	//   Always doing the full triangulation, makes this almost the same as full_triangulate_().
+	//   Saves a lot of Host side bookkeeping and temp allocations
+	//   Only difference to full_triangulate(): for the find_triangle_seeds, doing it with a mask is faster.
+	//   However can use a coarser mask (1 byte/bit per block), which can then also be used to reduce number of loads in
+	//   voronoi kernel (stale tile detection)
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +666,7 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 
 void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
 										 std::vector<int32_t>& tgrid_out) const {
+	// TODO: replace with kernels like in triangulation.cu
 	const int N = W_ * H_;
 	int N_tri = (int)h_triangles_.size();
 
@@ -693,6 +713,8 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 		return;
 	}
 
+	// TODO: use Vec2i for x/y together, like in triangulation.cu
+
 	if (N_ + k > max_seeds_) throw std::invalid_argument("insert would exceed max_seeds capacity");
 
 	// Validate bounds
@@ -701,12 +723,15 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 			throw std::invalid_argument("seed coordinate out of bounds");
 
 	// Duplicate check within batch
+	// TODO: for large number of inserted seeds: use a set to track duplicates so not O(N^2). For small number, linear
+	// search should be better (cache)
 	for (int i = 0; i < k; ++i)
 		for (int j = i + 1; j < k; ++j)
 			if (new_xs[i] == new_xs[j] && new_ys[i] == new_ys[j])
 				throw std::invalid_argument("duplicate seed positions within batch");
 
 	// Duplicate check against existing seeds
+	// TODO: interleave with Validate bounds loop, for fewer loads (x/y already in cache)
 	for (int i = 0; i < k; ++i)
 		if (h_seed_set_.count(pack_xy_(new_xs[i], new_ys[i])))
 			throw std::invalid_argument("seed position already exists");

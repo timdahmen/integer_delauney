@@ -55,7 +55,6 @@ private:
     };
     std::vector<HTriangle>                 h_triangles_;
     std::unordered_map<uint64_t,int32_t>   h_triplet_to_tid_;
-    std::unordered_map<uint64_t,int32_t>   h_canon_to_tid_;
 
     // ---- host-side seed registry ----
     std::vector<int32_t>            h_sx_, h_sy_;
