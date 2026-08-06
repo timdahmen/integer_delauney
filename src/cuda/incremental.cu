@@ -531,7 +531,8 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 	// Build border (expand by 2 for L-shapes) and reassign (expand by WINDOW_CAP)
 	// TODO: h_reassign not needed, if doing full triangulation each time
 	//    Instead of downloading border to Host, expanding it by 2 and reuploading it later, just make insert_seed
-	//    kernel write the expanded by2 area directly. That kernel is super cheap anyway and saves a lot of mem copy and CPU mem loading
+	//    kernel write the expanded by2 area directly. That kernel is super cheap anyway and saves a lot of mem copy and
+	//    CPU mem loading
 	std::vector<int32_t> h_border(N, 0), h_reassign(N, 0);
 	for (int y = 0; y < H_; ++y) {
 		for (int x = 0; x < W_; ++x) {
@@ -707,36 +708,35 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 								 std::vector<TriangleEntry>& tri_map_out,
 								 std::vector<int32_t>& tgrid_out,
 								 IncrementalTimings* timings) {
-	int k = (int)new_xs.size();
+	const int k = static_cast<int>(new_xs.size());
 	if (k == 0) {
 		build_outputs_(tri_map_out, tgrid_out);
 		return;
 	}
 
-	// TODO: use Vec2i for x/y together, like in triangulation.cu
-
 	if (N_ + k > max_seeds_) throw std::invalid_argument("insert would exceed max_seeds capacity");
 
-	// Validate bounds
-	for (int i = 0; i < k; ++i)
+	for (int i = 0; i < k; ++i) {
+		// Validate bounds
 		if (new_xs[i] < 0 || new_xs[i] >= W_ || new_ys[i] < 0 || new_ys[i] >= H_)
 			throw std::invalid_argument("seed coordinate out of bounds");
-
-	// Duplicate check within batch
-	// TODO: for large number of inserted seeds: use a set to track duplicates so not O(N^2). For small number, linear
-	// search should be better (cache)
-	for (int i = 0; i < k; ++i)
-		for (int j = i + 1; j < k; ++j)
-			if (new_xs[i] == new_xs[j] && new_ys[i] == new_ys[j])
-				throw std::invalid_argument("duplicate seed positions within batch");
-
-	// Duplicate check against existing seeds
-	// TODO: interleave with Validate bounds loop, for fewer loads (x/y already in cache)
-	for (int i = 0; i < k; ++i)
+		// Duplicate check against existing seeds
 		if (h_seed_set_.count(pack_xy_(new_xs[i], new_ys[i])))
 			throw std::invalid_argument("seed position already exists");
+	}
 
-	bool is_first = (N_ == 0);
+	// Duplicate check within batch
+	{
+		std::unordered_set<uint64_t> seen(k);
+		for (int i = 0; i < k; ++i) {
+			const uint64_t key = pack_xy_(new_xs[i], new_ys[i]);
+			if (!seen.insert(key).second) throw std::invalid_argument("duplicate seed positions within batch");
+		}
+	}
+
+	const bool is_first = (N_ == 0);
+
+	// TODO: use Vec2i for x/y together, like in triangulation.cu
 
 	// Register seeds
 	std::vector<int32_t> new_ids(k);
