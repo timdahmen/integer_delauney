@@ -19,6 +19,7 @@
 // CSR this pipeline used to build is no longer needed.
 
 #include "triangulation.cuh"
+#include "common.h"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -32,183 +33,7 @@
 #include <stdexcept>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Shared structs
-// ---------------------------------------------------------------------------
-
-
-static constexpr int32_t UNDEF = -1;
-
-static constexpr int RASTER_TRIS_PER_BLOCK = 32;
-static constexpr int THREADS_PER_TRI = 32;
-
-// Split from the original single RawTriangle{x,y,a,b,c,orig_a,orig_b,orig_c}
-// into three groups, grouped by who actually reads them together:
-//   RawXY   - host-only output (triangle_map_out), never read on device after write
-//   RawKey  - dedup/sort key only; discarded once unique() finishes
-//   RawOrig - hot path: read by assign_triangles_kernel for every candidate test
-struct Vec2i {
-	int32_t x, y;
-};
-struct Vec3i {
-	int32_t a, b, c;
-};
-
-struct KeyLess {
-	__device__ bool operator()(const Vec3i& x, const Vec3i& y) const {
-		if (x.a != y.a) return x.a < y.a;
-		if (x.b != y.b) return x.b < y.b;
-		return x.c < y.c;
-	}
-};
-
-struct KeyEqual {
-	__device__ bool operator()(const Vec3i& x, const Vec3i& y) const { return x.a == y.a && x.b == y.b && x.c == y.c; }
-};
-
-// ---------------------------------------------------------------------------
-// Kernel 1: detect triangle seeds (all 4 L-shape orientations)
-// ---------------------------------------------------------------------------
-
-__global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_grid,
-										   const int W,
-										   const int H,
-										   Vec2i* __restrict__ raw_xy,
-										   Vec3i* __restrict__ raw_key,
-										   Vec3i* __restrict__ raw_orig,
-										   int32_t* __restrict__ counter) {
-	const int x = blockIdx.x * blockDim.x + threadIdx.x;
-	const int y = blockIdx.y * blockDim.y + threadIdx.y;
-	if (x >= W || y >= H) return;
-
-	auto idx = [&](const int cx, const int cy) -> int32_t { return voronoi_grid[(cy * W + cx) * 2]; };
-
-	auto try_register = [&](const int gx, const int gy, const int32_t a, const int32_t b, const int32_t c) {
-		if (a == UNDEF || b == UNDEF || c == UNDEF) return;
-		if (a == b || a == c || b == c) return;
-		const int32_t pos = atomicAdd(counter, 1);
-		int32_t sa = a, sb = b, sc = c;
-		if (sa > sb) {
-			const int32_t t = sa;
-			sa = sb;
-			sb = t;
-		}
-		if (sb > sc) {
-			const int32_t t = sb;
-			sb = sc;
-			sc = t;
-		}
-		if (sa > sb) {
-			const int32_t t = sa;
-			sa = sb;
-			sb = t;
-		}
-		raw_xy[pos] = {gx, gy};
-		raw_key[pos] = {sa, sb, sc};
-		raw_orig[pos] = {a, b, c};
-	};
-
-	const int32_t center = idx(x, y);
-	const int32_t left = (x >= 1) ? idx(x - 1, y) : UNDEF;
-	const int32_t right = (x <= W - 2) ? idx(x + 1, y) : UNDEF;
-	const int32_t up = (y >= 1) ? idx(x, y - 1) : UNDEF;
-	const int32_t down = (y <= H - 2) ? idx(x, y + 1) : UNDEF;
-
-	if (y <= H - 2) try_register(x, y, left, center, down);
-	if (x <= W - 2) try_register(x, y, center, right, down);
-	if (y >= 1) try_register(x, y, center, right, up);
-	if (x >= 1) try_register(x, y, left, center, up);
-}
-
-// ---------------------------------------------------------------------------
-// Geometry helpers
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__ float
-cross2d(const float ox, const float oy, const float ax, const float ay, const float bx, const float by) {
-	return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
-}
-
-__device__ __forceinline__ bool
-point_in_triangle(const float px, const float py, const Vec2i a, const Vec2i b, const Vec2i c) {
-	const float d1 = cross2d(px, py, a.x, a.y, b.x, b.y);
-	const float d2 = cross2d(px, py, b.x, b.y, c.x, c.y);
-	const float d3 = cross2d(px, py, c.x, c.y, a.x, a.y);
-	const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
-	const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
-	return !(has_neg && has_pos);
-}
-
-// ---------------------------------------------------------------------------
-// Output helpers
-// ---------------------------------------------------------------------------
-
-__global__ void build_output_kernel(int32_t* __restrict__ out,
-									const int32_t* __restrict__ voronoi_grid,
-									const int32_t* __restrict__ canvas,
-									const int N,
-									const int default_id) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= N) return;
-	const int32_t tri_id = canvas[i];
-	out[i * 3] = voronoi_grid[i * 2];
-	out[i * 3 + 1] = voronoi_grid[i * 2 + 1];
-	out[i * 3 + 2] = (tri_id != -1) ? tri_id : default_id;
-}
-
-__global__ void build_triangle_map_out(TriangleEntry* __restrict__ out,
-									   const Vec2i* __restrict__ tri_xy,
-									   const Vec3i* __restrict__ tri_og_seeds,
-									   const int N) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= N) return;
-	const auto [x, y] = tri_xy[i];
-	const auto [a, b, c] = tri_og_seeds[i];
-	out[i] = {x, y, a, b, c};
-}
-
-// ---------------------------------------------------------------------------
-// Kernel 2: Triangle centric rasterisation
-// For each Triangle:
-//	 1. launch 1 block with N threads
-//	 2. load the corner Seeds for the triangle, blockIdx.x (same across entire block, so cheap)
-//	 3. compute triangle AABB, and iterate over it in strides of blockDim.x
-//	 4. each iteration each tread checks for 1 pixel, if it is inside the triangle
-//		- if it is inside the Triangle, atomicMax the triangle seed so the highest ID wins
-// ---------------------------------------------------------------------------
-
-__global__ void rasterize_tri_kernel(int32_t* __restrict__ canvas,
-									 const int W,
-									 const Vec2i* __restrict__ seed_pos,
-									 const Vec3i* __restrict__ tri_seed_ids,
-									 const int n_tris) {
-	const int warp_id = threadIdx.x / 32; // 32 = warp size
-	const int lane_id = threadIdx.x % 32;
-	const int tri_id = blockIdx.x * RASTER_TRIS_PER_BLOCK + warp_id;
-	if (tri_id >= n_tris) return;
-
-	// get Tri data
-	const auto [a_idx, b_idx, c_idx] = tri_seed_ids[tri_id];
-	const Vec2i a = seed_pos[a_idx];
-	const Vec2i b = seed_pos[b_idx];
-	const Vec2i c = seed_pos[c_idx];
-
-	// compute Tri AABB (all are guaranteed to be within canvas)
-	const int min_x = min(a.x, min(b.x, c.x));
-	const int max_x = max(a.x, max(b.x, c.x));
-	const int min_y = min(a.y, min(b.y, c.y));
-	const int max_y = max(a.y, max(b.y, c.y));
-	const int box_w = max_x - min_x + 1;
-	const int box_h = max_y - min_y + 1;
-	const int box_area = box_w * box_h;
-
-	// threads within a warp stride across this Tri AABB
-	for (int flat = lane_id; flat < box_area; flat += THREADS_PER_TRI) {
-		const int x = min_x + (flat % box_w);
-		const int y = min_y + (flat / box_w);
-		if (point_in_triangle(x + 0.5f, y + 0.5f, a, b, c)) atomicMax(&canvas[y * W + x], tri_id);
-	}
-}
+#include "shared_kernels.cuh"
 
 // ---------------------------------------------------------------------------
 // Guard for cudaMalloc device memory.
@@ -300,7 +125,7 @@ void cuda_compute_triangulation(const int W,
 
 	if (timings) record(ev0);
 
-	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_voronoi_grid, W, H, d_tri_xy, d_tri_key, d_tri_orig, d_counter);
+	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_voronoi_grid, W, H, d_tri_xy, d_tri_key, d_tri_orig, d_counter, max_raw);
 	{
 		cudaError_t launch_err = cudaGetLastError();
 		if (launch_err != cudaSuccess) {

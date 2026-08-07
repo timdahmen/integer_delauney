@@ -3,21 +3,13 @@
 #include <unordered_set>
 #include <vector>
 
-#include "triangulation.cuh" // TriangleEntry
+#include "common.h"
 
 struct IncrementalTimings {
 	float bfs_ms = 0.f;
 	float detect_ms = 0.f;
 	float dedup_ms = 0.f;
 	float assign_ms = 0.f;
-};
-
-// TODO: same as in triangulation.cu, split into separate file
-struct Vec2i {
-	int32_t x, y;
-};
-struct Vec3i {
-	int32_t a, b, c;
 };
 
 class IncrementalDelaunay {

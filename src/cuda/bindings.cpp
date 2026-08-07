@@ -17,6 +17,7 @@
 #include "voronoi.cuh"
 #include "triangulation.cuh"
 #include "incremental.cuh"
+#include "common.h"
 
 #include <algorithm>
 #include <stdexcept>

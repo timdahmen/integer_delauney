@@ -13,6 +13,7 @@
 //        f. Re-assign only pixels in reassign mask.
 
 #include "incremental.cuh"
+#include "shared_kernels.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/copy.h>
@@ -30,70 +31,6 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Internal types (parallel to triangulation.cu and voronoi.cu internals)
-// ---------------------------------------------------------------------------
-
-static constexpr int32_t UNDEF = -1;
-
-static constexpr uint32_t TILE_SIZE_BFS = 32; // tune for shared-mem vs occupancy, see voronoi.cu
-static constexpr int AGGREGATE_ITERATIONS = 4; // tune empirically, same as voronoi.cu
-static constexpr int RASTER_TRIS_PER_BLOCK = 32;
-static constexpr int THREADS_PER_TRI = 32;
-
-static_assert(sizeof(TriangleEntry) == 5 * sizeof(int32_t), "Unexpected TriangleEntry layout");
-
-struct alignas(8) Cell {
-	int32_t id;
-	int32_t distance;
-};
-static_assert(sizeof(Cell) == 2 * sizeof(int32_t), "Unexpected Cell layout");
-
-// dedup key for the detection pass (triplet only)
-struct KeyLess {
-	__host__ __device__ bool operator()(const Vec3i& x, const Vec3i& y) const {
-		if (x.a != y.a) return x.a < y.a;
-		if (x.b != y.b) return x.b < y.b;
-		return x.c < y.c;
-	}
-};
-
-struct KeyEqual {
-	__host__ __device__ bool operator()(const Vec3i& x, const Vec3i& y) const {
-		return x.a == y.a && x.b == y.b && x.c == y.c;
-	}
-};
-
-// ---------------------------------------------------------------------------
-// Device helpers
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__ Cell load_cell(const int x, const int y, const int W, const int H, const Cell* src) {
-	if (x < 0 || x >= W || y < 0 || y >= H) return {UNDEF, UNDEF};
-	return src[y * W + x];
-}
-
-__device__ __forceinline__ float
-cross2d(const float ox, const float oy, const float ax, const float ay, const float bx, const float by) {
-	return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
-}
-
-__device__ __forceinline__ bool
-point_in_triangle(const float px, const float py, const Vec2i a, const Vec2i b, const Vec2i c) {
-	const float d1 = cross2d(px, py, a.x, a.y, b.x, b.y);
-	const float d2 = cross2d(px, py, b.x, b.y, c.x, c.y);
-	const float d3 = cross2d(px, py, c.x, c.y, a.x, a.y);
-	const bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
-	const bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
-	return !(has_neg && has_pos);
-}
-
-__device__ __forceinline__ bool beats(const int32_t a_id, const int32_t a_d, const int32_t b_id, const int32_t b_d) {
-	if (b_d < a_d) return true;
-	if (b_d == a_d && b_id > a_id) return true;
-	return false;
-}
-
-// ---------------------------------------------------------------------------
 // Kernel: write new seeds into the interleaved grid
 // ---------------------------------------------------------------------------
 
@@ -105,189 +42,6 @@ __global__ void write_seeds_kernel(
 	const int cell_idx = y * W + x;
 	grid[cell_idx * 2] = base_id + i;
 	grid[cell_idx * 2 + 1] = 0;
-}
-
-// ---------------------------------------------------------------------------
-// Kernel: BFS step with per-cell change accumulation
-// ---------------------------------------------------------------------------
-
-__global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
-									int32_t* __restrict__ dst_raw,
-									const int W,
-									const int H,
-									uint8_t* __restrict__ flag_write,
-									uint8_t* __restrict__ flag_reset_for_next) {
-	if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-		*flag_reset_for_next = 0;
-	}
-
-	auto* src = reinterpret_cast<const Cell*>(src_raw);
-	auto* dst = reinterpret_cast<Cell*>(dst_raw);
-
-	__shared__ Cell tile[TILE_SIZE_BFS + 2][TILE_SIZE_BFS + 2];
-
-	const int x = blockIdx.x * TILE_SIZE_BFS + threadIdx.x;
-	const int y = blockIdx.y * TILE_SIZE_BFS + threadIdx.y;
-	const int tile_x = threadIdx.x + 1;
-	const int tile_y = threadIdx.y + 1;
-
-	tile[tile_y][tile_x] = load_cell(x, y, W, H, src);
-	if (threadIdx.x == 0)
-		tile[tile_y][0] = load_cell(x - 1, y, W, H, src);
-	else if (threadIdx.x == TILE_SIZE_BFS - 1)
-		tile[tile_y][TILE_SIZE_BFS + 1] = load_cell(x + 1, y, W, H, src);
-	if (threadIdx.y == 0)
-		tile[0][tile_x] = load_cell(x, y - 1, W, H, src);
-	else if (threadIdx.y == TILE_SIZE_BFS - 1)
-		tile[TILE_SIZE_BFS + 1][tile_x] = load_cell(x, y + 1, W, H, src);
-
-	__syncthreads();
-	if (x >= W || y >= H) return;
-
-	Cell cur = tile[tile_y][tile_x];
-	Cell best = cur;
-
-	const int dx[4] = {-1, 1, 0, 0};
-	const int dy[4] = {0, 0, -1, 1};
-	for (int k = 0; k < 4; ++k) {
-		Cell neighbor = tile[tile_y + dy[k]][tile_x + dx[k]];
-		if (neighbor.id == UNDEF) continue;
-		int32_t n_d = neighbor.distance + 1;
-		if (best.id == UNDEF || beats(best.id, best.distance, neighbor.id, n_d)) {
-			best.id = neighbor.id;
-			best.distance = n_d;
-		}
-	}
-
-	dst[y * W + x] = best;
-
-	if (best.id != cur.id || best.distance != cur.distance) {
-		*flag_write = 1;
-	}
-}
-
-
-// ---------------------------------------------------------------------------
-// Kernel: L-shape triangle detection with optional mask
-// Grid is interleaved (seed_id, distance); only channel 0 is read.
-// ---------------------------------------------------------------------------
-
-__global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_grid,
-										   const int W,
-										   const int H,
-										   Vec2i* __restrict__ raw_xy,
-										   Vec3i* __restrict__ raw_key,
-										   Vec3i* __restrict__ raw_orig,
-										   int32_t* __restrict__ counter,
-										   const int cap) {
-	const int x = blockIdx.x * blockDim.x + threadIdx.x;
-	const int y = blockIdx.y * blockDim.y + threadIdx.y;
-	if (x >= W || y >= H) return;
-
-	auto idx = [&](const int cx, const int cy) -> int32_t { return voronoi_grid[(cy * W + cx) * 2]; };
-
-	auto try_register = [&](const int gx, const int gy, const int32_t a, const int32_t b, const int32_t c) {
-		if (a == UNDEF || b == UNDEF || c == UNDEF) return;
-		if (a == b || a == c || b == c) return;
-		const int32_t pos = atomicAdd(counter, 1);
-		if (pos >= cap) return; // check for overflow
-		int32_t sa = a, sb = b, sc = c;
-		if (sa > sb) {
-			const int32_t t = sa;
-			sa = sb;
-			sb = t;
-		}
-		if (sb > sc) {
-			const int32_t t = sb;
-			sb = sc;
-			sc = t;
-		}
-		if (sa > sb) {
-			const int32_t t = sa;
-			sa = sb;
-			sb = t;
-		}
-		raw_xy[pos] = {gx, gy};
-		raw_key[pos] = {sa, sb, sc};
-		raw_orig[pos] = {a, b, c};
-	};
-
-	const int32_t center = idx(x, y);
-	const int32_t left = (x >= 1) ? idx(x - 1, y) : UNDEF;
-	const int32_t right = (x <= W - 2) ? idx(x + 1, y) : UNDEF;
-	const int32_t up = (y >= 1) ? idx(x, y - 1) : UNDEF;
-	const int32_t down = (y <= H - 2) ? idx(x, y + 1) : UNDEF;
-
-	if (y <= H - 2) try_register(x, y, left, center, down);
-	if (x <= W - 2) try_register(x, y, center, right, down);
-	if (y >= 1) try_register(x, y, center, right, up);
-	if (x >= 1) try_register(x, y, left, center, up);
-}
-
-// ---------------------------------------------------------------------------
-// Kernel: triangle-centric rasterisation (1 block per triangle)
-// ---------------------------------------------------------------------------
-
-__global__ void rasterize_tri_kernel2(int32_t* __restrict__ canvas,
-									  const int W,
-									  const Vec2i* __restrict__ seed_pos,
-									  const Vec3i* __restrict__ tri_seed_ids,
-									  const int n_tris) {
-	const int warp_id = threadIdx.x / 32; // 32 = warp size
-	const int lane_id = threadIdx.x % 32;
-	const int tri_id = blockIdx.x * RASTER_TRIS_PER_BLOCK + warp_id;
-	if (tri_id >= n_tris) return;
-
-	// get Tri data
-	const auto [a_idx, b_idx, c_idx] = tri_seed_ids[tri_id];
-	const Vec2i a = seed_pos[a_idx];
-	const Vec2i b = seed_pos[b_idx];
-	const Vec2i c = seed_pos[c_idx];
-
-	// compute Tri AABB (all are guaranteed to be within canvas)
-	const int min_x = min(a.x, min(b.x, c.x));
-	const int max_x = max(a.x, max(b.x, c.x));
-	const int min_y = min(a.y, min(b.y, c.y));
-	const int max_y = max(a.y, max(b.y, c.y));
-	const int box_w = max_x - min_x + 1;
-	const int box_h = max_y - min_y + 1;
-	const int box_area = box_w * box_h;
-
-	// threads within a warp stride across this Tri AABB
-	for (int flat = lane_id; flat < box_area; flat += THREADS_PER_TRI) {
-		const int x = min_x + (flat % box_w);
-		const int y = min_y + (flat / box_w);
-		if (point_in_triangle(x + 0.5f, y + 0.5f, a, b, c)) atomicMax(&canvas[y * W + x], tri_id);
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Kernels: output assembly
-// ---------------------------------------------------------------------------
-// TODO: same as triangulation, put in shared file
-__global__ void build_output_kernel2(int32_t* __restrict__ out,
-									 const int32_t* __restrict__ voronoi_grid,
-									 const int32_t* __restrict__ canvas,
-									 const int N,
-									 const int default_id) {
-	const int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= N) return;
-	const int32_t tri_id = canvas[i];
-	out[i * 3] = voronoi_grid[i * 2];
-	out[i * 3 + 1] = voronoi_grid[i * 2 + 1];
-	out[i * 3 + 2] = (tri_id != -1) ? tri_id : default_id;
-}
-
-// TODO: same as triangulation, put in shared file
-__global__ void build_triangle_map_out2(TriangleEntry* __restrict__ out,
-										const Vec2i* __restrict__ tri_xy,
-										const Vec3i* __restrict__ tri_og_seeds,
-										const int N) {
-	const int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= N) return;
-	const auto [x, y] = tri_xy[i];
-	const auto [a, b, c] = tri_og_seeds[i];
-	out[i] = {x, y, a, b, c};
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +81,6 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds) :
 	h_seed_set_.reserve(max_seeds_);
 }
 
-
 IncrementalDelaunay::~IncrementalDelaunay() {
 	cudaFree(d_grid_);
 	cudaFree(d_tmp_);
@@ -361,7 +114,7 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 
 	int cur_flag = 0;
 	while (true) {
-		for (int i = 0; i < AGGREGATE_ITERATIONS; ++i) {
+		for (int i = 0; i < AGGREGATE_ITERATIONS_BFS; ++i) {
 			uint8_t* flag_write = d_updated_flag_ + cur_flag;
 			uint8_t* flag_reset = d_updated_flag_ + (1 - cur_flag);
 
@@ -439,9 +192,9 @@ void IncrementalDelaunay::triangulate_(float* det_ms,
 		thrust::sort_by_key(thrust::cuda::par_nosync, det_key, det_key + raw_count, det_vals, KeyLess{});
 	}
 
-		// resize, while waiting for sort to be done
-		// this can affect the reported timings for dedup
-		tgrid_out.resize(N * 3);
+	// resize, while waiting for sort to be done
+	// this can affect the reported timings for dedup
+	tgrid_out.resize(N * 3);
 
 	if (raw_count > 0) {
 		auto det_end = thrust::unique_by_key(det_key, det_key + raw_count, det_vals, KeyEqual{});
@@ -463,7 +216,7 @@ void IncrementalDelaunay::triangulate_(float* det_ms,
 		static constexpr int threads_per_block = RASTER_TRIS_PER_BLOCK * 32;
 		static_assert(threads_per_block <= 1024, "threads per block exceeds max");
 		const int n_blocks = (N_tri_ + RASTER_TRIS_PER_BLOCK - 1) / RASTER_TRIS_PER_BLOCK;
-		rasterize_tri_kernel2<<<n_blocks, threads_per_block>>>(d_t_grid_, W_, d_seed_pos_, d_det_orig_, N_tri_);
+		rasterize_tri_kernel<<<n_blocks, threads_per_block>>>(d_t_grid_, W_, d_seed_pos_, d_det_orig_, N_tri_);
 	}
 	if (det_ms) rc(e5);
 
@@ -492,12 +245,12 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
 	tri_map_out.resize(N_tri_);
 	if (N_tri_ > 0) {
 		const int n_blocks = (N_tri_ + threads_per_block - 1) / threads_per_block;
-		build_triangle_map_out2<<<n_blocks, threads_per_block>>>(d_out_map_, d_det_xy_, d_det_orig_, N_tri_);
+		build_triangle_map_out<<<n_blocks, threads_per_block>>>(d_out_map_, d_det_xy_, d_det_orig_, N_tri_);
 	}
 
 	const int32_t default_id = N_tri_ - 1;
 	const int n_blocks = (N + threads_per_block - 1) / threads_per_block;
-	build_output_kernel2<<<n_blocks, threads_per_block>>>(d_out_grid_, d_grid_, d_t_grid_, N, default_id);
+	build_output_kernel<<<n_blocks, threads_per_block>>>(d_out_grid_, d_grid_, d_t_grid_, N, default_id);
 
 	// tgrid_out resized already
 	if (N_tri_ > 0) cudaMemcpy(tri_map_out.data(), d_out_map_, N_tri_ * sizeof(TriangleEntry), cudaMemcpyDeviceToHost);
