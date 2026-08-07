@@ -39,6 +39,8 @@ static constexpr int32_t UNDEF = -1;
 
 static constexpr uint32_t TILE_SIZE_BFS = 32; // tune for shared-mem vs occupancy, see voronoi.cu
 static constexpr int AGGREGATE_ITERATIONS = 4; // tune empirically, same as voronoi.cu
+static constexpr int RASTER_TRIS_PER_BLOCK = 32;
+static constexpr int THREADS_PER_TRI = 32;
 
 static_assert(sizeof(TriangleEntry) == 5 * sizeof(int32_t), "Unexpected TriangleEntry layout");
 
@@ -322,17 +324,19 @@ build_merge_keys_kernel(MergeKey* __restrict__ keys, const Vec3i* __restrict__ o
 // Kernel: triangle-centric rasterisation (1 block per triangle)
 // ---------------------------------------------------------------------------
 
-__global__ void rasterize_tri_kernel(int32_t* __restrict__ canvas,
+__global__ void rasterize_tri_kernel2(int32_t* __restrict__ canvas,
 									 const int W,
 									 const Vec2i* __restrict__ seed_pos,
 									 const Vec3i* __restrict__ tri_seed_ids,
 									 const int n_tris) {
-	const int tri_id = blockIdx.x;
+	const int warp_id = threadIdx.x / 32;	// 32 = warp size
+	const int lane_id = threadIdx.x % 32;
+	const int tri_id = blockIdx.x * RASTER_TRIS_PER_BLOCK + warp_id;
 	if (tri_id >= n_tris) return;
 
 	// get Tri data
 	const auto [a_idx, b_idx, c_idx] = tri_seed_ids[tri_id];
-	const Vec2i a = seed_pos[a_idx]; // same address for whole block
+	const Vec2i a = seed_pos[a_idx];
 	const Vec2i b = seed_pos[b_idx];
 	const Vec2i c = seed_pos[c_idx];
 
@@ -345,13 +349,11 @@ __global__ void rasterize_tri_kernel(int32_t* __restrict__ canvas,
 	const int box_h = max_y - min_y + 1;
 	const int box_area = box_w * box_h;
 
-	// check for pixels in AABB, if they are in Tri, in strides across multiple threads
-	for (int flat = threadIdx.x; flat < box_area; flat += blockDim.x) {
+	// threads within a warp stride across this Tri AABB
+	for (int flat = lane_id; flat < box_area; flat += THREADS_PER_TRI) {
 		const int x = min_x + (flat % box_w);
 		const int y = min_y + (flat / box_w);
-		const float px = x + 0.5f, py = y + 0.5f;
-
-		if (point_in_triangle(px, py, a, b, c)) atomicMax(&canvas[y * W + x], tri_id);
+		if (point_in_triangle(x + 0.5f, y + 0.5f, a, b, c)) atomicMax(&canvas[y * W + x], tri_id);
 	}
 }
 
@@ -636,8 +638,10 @@ void IncrementalDelaunay::triangulate_(const bool is_first, float* det_ms, float
 	// set sentinal value which is lower than all seed ids and will be replaced in build output
 	cudaMemset(d_t_grid_, -1, N * sizeof(int32_t));
 	if (N_tri_ > 0) {
-		static constexpr int threads_per_block = 1024;
-		rasterize_tri_kernel<<<N_tri_, threads_per_block>>>(d_t_grid_, W_, d_seed_pos_, d_reg_orig_[reg_cur_], N_tri_);
+		static constexpr int threads_per_block = RASTER_TRIS_PER_BLOCK * 32;
+		static_assert(threads_per_block <= 1024, "threads per block exceeds max");
+		const int n_blocks = (N_tri_ + RASTER_TRIS_PER_BLOCK - 1) / RASTER_TRIS_PER_BLOCK;
+		rasterize_tri_kernel2<<<n_blocks, threads_per_block>>>(d_t_grid_, W_, d_seed_pos_, d_reg_orig_[reg_cur_], N_tri_);
 	}
 	if (det_ms) rc(e5);
 

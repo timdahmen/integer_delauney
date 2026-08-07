@@ -39,6 +39,9 @@
 
 static constexpr int32_t UNDEF = -1;
 
+static constexpr int RASTER_TRIS_PER_BLOCK = 32;
+static constexpr int THREADS_PER_TRI = 32;
+
 // Split from the original single RawTriangle{x,y,a,b,c,orig_a,orig_b,orig_c}
 // into three groups, grouped by who actually reads them together:
 //   RawXY   - host-only output (triangle_map_out), never read on device after write
@@ -174,14 +177,19 @@ __global__ void build_triangle_map_out(TriangleEntry* __restrict__ out,
 //		- if it is inside the Triangle, atomicMax the triangle seed so the highest ID wins
 // ---------------------------------------------------------------------------
 
-__global__ void rasterize_tri_kernel(
-	int32_t* __restrict__ canvas, const int W, const Vec2i* seed_pos, const Vec3i* tri_seed_ids, const int32_t n_tris) {
-	const int tri_id = blockIdx.x;
+__global__ void rasterize_tri_kernel(int32_t* __restrict__ canvas,
+									 const int W,
+									 const Vec2i* __restrict__ seed_pos,
+									 const Vec3i* __restrict__ tri_seed_ids,
+									 const int n_tris) {
+	const int warp_id = threadIdx.x / 32; // 32 = warp size
+	const int lane_id = threadIdx.x % 32;
+	const int tri_id = blockIdx.x * RASTER_TRIS_PER_BLOCK + warp_id;
 	if (tri_id >= n_tris) return;
 
 	// get Tri data
 	const auto [a_idx, b_idx, c_idx] = tri_seed_ids[tri_id];
-	const Vec2i a = seed_pos[a_idx]; // same address for whole block
+	const Vec2i a = seed_pos[a_idx];
 	const Vec2i b = seed_pos[b_idx];
 	const Vec2i c = seed_pos[c_idx];
 
@@ -194,13 +202,11 @@ __global__ void rasterize_tri_kernel(
 	const int box_h = max_y - min_y + 1;
 	const int box_area = box_w * box_h;
 
-	// check for pixels in AABB, if they are in Tri, in strides across multiple threads
-	for (int flat = threadIdx.x; flat < box_area; flat += blockDim.x) {
+	// threads within a warp stride across this Tri AABB
+	for (int flat = lane_id; flat < box_area; flat += THREADS_PER_TRI) {
 		const int x = min_x + (flat % box_w);
 		const int y = min_y + (flat / box_w);
-		const float px = x + 0.5f, py = y + 0.5f;
-
-		if (point_in_triangle(px, py, a, b, c)) atomicMax(&canvas[y * W + x], tri_id);
+		if (point_in_triangle(x + 0.5f, y + 0.5f, a, b, c)) atomicMax(&canvas[y * W + x], tri_id);
 	}
 }
 
@@ -359,9 +365,10 @@ void cuda_compute_triangulation(const int W,
 	if (timings) record(ev4);
 
 	if (N_triangles > 0) {
-		static constexpr int threads_per_block = 256;
-		const int num_blocks = (N_triangles + threads_per_block - 1) / threads_per_block;
-		rasterize_tri_kernel<<<num_blocks, threads_per_block>>>(d_canvas, W, d_seed_pos, d_tri_orig, N_triangles);
+		static constexpr int threads_per_block = RASTER_TRIS_PER_BLOCK * 32;
+		static_assert(threads_per_block <= 1024, "threads per block exceeds max");
+		const int n_blocks = (N_triangles + RASTER_TRIS_PER_BLOCK - 1) / RASTER_TRIS_PER_BLOCK;
+		rasterize_tri_kernel<<<n_blocks, threads_per_block>>>(d_canvas, W, d_seed_pos, d_tri_orig, N_triangles);
 		cudaError_t err = cudaGetLastError();
 		if (err != cudaSuccess) {
 			throw std::runtime_error(std::string("rasterize_tri_kernel launch failed: ") + cudaGetErrorString(err));
