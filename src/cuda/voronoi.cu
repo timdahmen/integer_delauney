@@ -25,7 +25,7 @@
 
 void cuda_compute_voronoi(const int W,
 						  const int H,
-						  const std::vector<Seed>& seeds,
+						  const std::vector<Vec2i>& seeds,
 						  std::vector<int32_t>& out_grid) // (H * W * 2) int32 result (flat for compatibility)
 {
 	const int N = W * H;

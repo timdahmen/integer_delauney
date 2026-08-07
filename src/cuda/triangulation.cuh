@@ -19,3 +19,12 @@ void cuda_compute_triangulation(int W,
 								std::vector<TriangleEntry>& triangle_map_out,
 								std::vector<int32_t>& out_grid,
 								TriTimings* timings = nullptr);
+
+// wrapper to keep same API with x,y as split inputs
+void cuda_compute_triangulation(int W,
+								int H,
+								const int32_t* voronoi_grid,
+								const std::vector<Vec2i>& seeds,
+								std::vector<TriangleEntry>& triangle_map_out,
+								std::vector<int32_t>& out_grid,
+								TriTimings* timings = nullptr);

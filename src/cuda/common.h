@@ -9,10 +9,6 @@ struct Vec3i {
 	int32_t a, b, c;
 };
 
-struct Seed {
-	int32_t x, y;
-};
-
 struct alignas(8) Cell {
 	int32_t id;
 	int32_t distance;

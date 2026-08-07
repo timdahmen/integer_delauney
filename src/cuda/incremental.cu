@@ -264,25 +264,23 @@ void IncrementalDelaunay::get_voronoi_grid(std::vector<int32_t>& out) const {
 // insert
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
-								 const std::vector<int32_t>& new_ys,
+void IncrementalDelaunay::insert(const std::vector<Vec2i>& new_seeds,
 								 std::vector<TriangleEntry>& tri_map_out,
 								 std::vector<int32_t>& tgrid_out,
 								 IncrementalTimings* timings) {
-	const int k = new_xs.size();
+	const int k = new_seeds.size();
 	if (k == 0) {
 		build_outputs_(tri_map_out, tgrid_out);
 		return;
 	}
 
-	if (new_ys.size() != k) throw std::invalid_argument("new_xs and new_ys must have the same length");
+	if (new_seeds.size() != k) throw std::invalid_argument("new_xs and new_ys must have the same length");
 	if (N_ + k > max_seeds_) throw std::invalid_argument("insert would exceed max_seeds capacity");
 
-	std::vector<Vec2i> batch(k);
 	std::unordered_set<uint64_t> seen;
 	seen.reserve(k * 2);
 	for (int i = 0; i < k; ++i) {
-		const int32_t x = new_xs[i], y = new_ys[i];
+		const auto [x, y] = new_seeds[i];
 		// Validate bounds
 		if (x < 0 || x >= W_ || y < 0 || y >= H_) throw std::invalid_argument("seed coordinate out of bounds");
 		// Duplicate check against existing seeds
@@ -290,15 +288,14 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 		if (!seen.insert(key).second) throw std::invalid_argument("duplicate seed positions within batch");
 		// Duplicate check within batch
 		if (h_seed_set_.count(key)) throw std::invalid_argument("seed position already exists");
-
-		batch[i] = {x, y};
 	}
 
 	const int base_id = N_;
 
-	for (int i = 0; i < k; ++i) h_seed_set_.insert(pack_xy_(batch[i].x, batch[i].y));
+	h_seed_set_.reserve(h_seed_set_.size() + k);
+	for (int i = 0; i < k; ++i) h_seed_set_.insert(pack_xy_(new_seeds[i].x, new_seeds[i].y));
 	N_ += k;
-	cudaMemcpy(d_seed_pos_ + base_id, batch.data(), k * sizeof(Vec2i), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_seed_pos_ + base_id, new_seeds.data(), k * sizeof(Vec2i), cudaMemcpyHostToDevice);
 
 	// Write seeds into grid
 	write_seeds_kernel<<<(k + 255) / 256, 256>>>(d_grid_, W_, d_seed_pos_ + base_id, base_id, k);
@@ -320,4 +317,16 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 	}
 
 	build_outputs_(tri_map_out, tgrid_out);
+}
+
+void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
+								 const std::vector<int32_t>& new_ys,
+								 std::vector<TriangleEntry>& tri_map_out,
+								 std::vector<int32_t>& tgrid_out,
+								 IncrementalTimings* timings) {
+	const size_t n_seeds = new_xs.size();
+	std::vector<Vec2i> seeds(n_seeds);
+	for (int i = 0; i < n_seeds; ++i) seeds[i] = {new_xs[i], new_ys[i]};
+
+	insert(seeds, tri_map_out, tgrid_out, timings);
 }

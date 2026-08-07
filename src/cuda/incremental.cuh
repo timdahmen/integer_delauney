@@ -19,6 +19,12 @@ public:
 
 	// Appends a batch of seeds (insertion-order IDs).
 	// Returns current full triangle_map and triangulation grid (H,W,3).
+	void insert(const std::vector<Vec2i>& new_seeds,
+				std::vector<TriangleEntry>& tri_map_out,
+				std::vector<int32_t>& tgrid_out,
+				IncrementalTimings* timings = nullptr);
+
+	// wrapper to keep same API with x,y as split inputs
 	void insert(const std::vector<int32_t>& new_xs,
 				const std::vector<int32_t>& new_ys,
 				std::vector<TriangleEntry>& tri_map_out,

@@ -18,8 +18,8 @@
 // canvas) instead of a per-pixel seed-window search, so the seed → triangle
 // CSR this pipeline used to build is no longer needed.
 
-#include "triangulation.cuh"
 #include "common.h"
+#include "triangulation.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -51,19 +51,18 @@ struct CudaFreeGuard {
 };
 
 // ---------------------------------------------------------------------------
-// Host entry point
+// Host entry points
 // ---------------------------------------------------------------------------
 
 void cuda_compute_triangulation(const int W,
 								const int H,
 								const int32_t* voronoi_grid,
-								const std::vector<int32_t>& seed_xs,
-								const std::vector<int32_t>& seed_ys,
+								const std::vector<Vec2i>& h_seeds,
 								std::vector<TriangleEntry>& triangle_map_out,
 								std::vector<int32_t>& out_grid,
 								TriTimings* timings) {
 	const int N = W * H;
-	const int N_seeds = static_cast<int>(seed_xs.size());
+	const int N_seeds = static_cast<int>(h_seeds.size());
 
 	auto make_event = [](cudaEvent_t* e) { cudaEventCreate(e); };
 	auto record = [](cudaEvent_t e) { cudaEventRecord(e); };
@@ -88,13 +87,10 @@ void cuda_compute_triangulation(const int W,
 	// Upload inputs: seed_id channel, seed positions
 	// -----------------------------------------------------------------------
 
-	std::vector<Vec2i> h_seed_pos(N_seeds);
-	for (int i = 0; i < N_seeds; ++i) h_seed_pos[i] = {seed_xs[i], seed_ys[i]};
-
 	Vec2i* d_seed_pos = nullptr;
 	cudaMalloc(&d_seed_pos, N_seeds * sizeof(Vec2i));
 	CudaFreeGuard g_seed_pos(d_seed_pos);
-	cudaMemcpy(d_seed_pos, h_seed_pos.data(), N_seeds * sizeof(Vec2i), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_seed_pos, h_seeds.data(), N_seeds * sizeof(Vec2i), cudaMemcpyHostToDevice);
 	int32_t* d_voronoi_grid = nullptr;
 	cudaMalloc(&d_voronoi_grid, N * 2 * sizeof(int32_t));
 	CudaFreeGuard g_voronoi_grid(d_voronoi_grid);
@@ -125,7 +121,8 @@ void cuda_compute_triangulation(const int W,
 
 	if (timings) record(ev0);
 
-	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_voronoi_grid, W, H, d_tri_xy, d_tri_key, d_tri_orig, d_counter, max_raw);
+	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_voronoi_grid, W, H, d_tri_xy, d_tri_key, d_tri_orig, d_counter,
+													max_raw);
 	{
 		cudaError_t launch_err = cudaGetLastError();
 		if (launch_err != cudaSuccess) {
@@ -237,4 +234,19 @@ void cuda_compute_triangulation(const int W,
 		cudaEventDestroy(ev4);
 		cudaEventDestroy(ev5);
 	}
+}
+
+void cuda_compute_triangulation(const int W,
+								const int H,
+								const int32_t* voronoi_grid,
+								const std::vector<int32_t>& seed_xs,
+								const std::vector<int32_t>& seed_ys,
+								std::vector<TriangleEntry>& triangle_map_out,
+								std::vector<int32_t>& out_grid,
+								TriTimings* timings) {
+	const size_t n_seeds = seed_xs.size();
+	std::vector<Vec2i> seeds(n_seeds);
+	for (int i = 0; i < n_seeds; ++i) seeds[i] = {seed_xs[i], seed_ys[i]};
+
+	cuda_compute_triangulation(W, H, voronoi_grid, seeds, triangle_map_out, out_grid, timings);
 }
