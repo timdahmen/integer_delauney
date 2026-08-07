@@ -170,12 +170,22 @@ __global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_g
 // Kernel: BFS step with per-cell change accumulation
 // ---------------------------------------------------------------------------
 
+__device__ __forceinline__ uint32_t
+row_word(const uint32_t* row_mask, const int y, const int tile_col, const int H, const int tiles_x) {
+	if (y < 0 || y >= H || tile_col < 0 || tile_col >= tiles_x) return 0u;
+	return row_mask[y * tiles_x + tile_col];
+}
+
+static_assert(TILE_SIZE_BFS == 32, "kernel requires tiles to be 32 wide");
+
 __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 									int32_t* __restrict__ dst_raw,
 									const int W,
 									const int H,
 									int32_t* __restrict__ flag_write,
-									int32_t* __restrict__ flag_reset_for_next) {
+									int32_t* __restrict__ flag_reset_for_next,
+									const uint32_t* __restrict__ row_mask_read,
+									uint32_t* __restrict__ row_mask_write) {
 	if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
 		*flag_reset_for_next = 0;
 	}
@@ -183,10 +193,15 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 	auto* src = reinterpret_cast<const Cell*>(src_raw);
 	auto* dst = reinterpret_cast<Cell*>(dst_raw);
 
-	__shared__ Cell tile[TILE_SIZE_BFS + 2][TILE_SIZE_BFS + 2];
+	// TODO: dont load mem, if tile done
 
+	const int tiles_x = gridDim.x;
 	const int x = blockIdx.x * TILE_SIZE_BFS + threadIdx.x;
 	const int y = blockIdx.y * TILE_SIZE_BFS + threadIdx.y;
+	const bool in_bounds = (x < W && y < H);
+	const int lane = threadIdx.x; // .x since TileSize = 32
+
+	__shared__ Cell tile[TILE_SIZE_BFS + 2][TILE_SIZE_BFS + 2];
 	const int tile_x = threadIdx.x + 1;
 	const int tile_y = threadIdx.y + 1;
 
@@ -202,27 +217,57 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 		tile[TILE_SIZE_BFS + 1][tile_x] = load_cell(x, y + 1, W, H, src);
 
 	__syncthreads();
-	if (x >= W || y >= H) return;
 
-	Cell cur = tile[tile_y][tile_x];
+	// active check: reads, same across warp
+	const uint32_t row_own = row_word(row_mask_read, y, blockIdx.x, H, tiles_x);
+	const uint32_t row_above = row_word(row_mask_read, y - 1, blockIdx.x, H, tiles_x);
+	const uint32_t row_below = row_word(row_mask_read, y + 1, blockIdx.x, H, tiles_x);
+
+	// if at left bound, load left lane and check that ones right most bit; else check bit to the right
+	const bool left_active = (lane > 0) ? ((row_own >> (lane - 1)) & 1u)
+										: ((row_word(row_mask_read, y, blockIdx.x - 1, H, tiles_x) >> 31) & 1u);
+	// same as above, just other direction
+	const bool right_active =
+		(lane < 31) ? ((row_own >> (lane + 1)) & 1u) : (row_word(row_mask_read, y, blockIdx.x + 1, H, tiles_x) & 1u);
+	const bool onw_active = (row_own >> lane) & 1u;
+	const bool above_active = (row_above >> lane) & 1u;
+	const bool below_active = (row_below >> lane) & 1u;
+	const bool any_active = onw_active || above_active || below_active || left_active || right_active;
+
+	const Cell cur = tile[tile_y][tile_x];
 	Cell best = cur;
+	bool changed = false;
 
 	// find best neighbour
-	constexpr int dx[4] = {-1, 1, 0, 0};
-	constexpr int dy[4] = {0, 0, -1, 1};
-	for (int k = 0; k < 4; ++k) {
-		Cell neighbor = tile[tile_y + dy[k]][tile_x + dx[k]];
-		if (neighbor.id == UNDEF) continue;
-		const int32_t n_d = neighbor.distance + 1;
-		if (best.id == UNDEF || beats(best.id, best.distance, neighbor.id, n_d)) {
-			best.id = neighbor.id;
-			best.distance = n_d;
+	if (in_bounds) {
+		if (any_active) {
+			constexpr int dx[4] = {-1, 1, 0, 0};
+			constexpr int dy[4] = {0, 0, -1, 1};
+			for (int k = 0; k < 4; ++k) {
+				Cell neighbor = tile[tile_y + dy[k]][tile_x + dx[k]];
+				if (neighbor.id == UNDEF) continue;
+				const int32_t n_d = neighbor.distance + 1;
+				if (best.id == UNDEF || beats(best.id, best.distance, neighbor.id, n_d)) {
+					best.id = neighbor.id;
+					best.distance = n_d;
+				}
+			}
+			dst[y * W + x] = best;
+			changed = (best.id != cur.id || best.distance != cur.distance);
+		} else {
+			// no nearby changed last round
+			dst[y * W + x] = cur; // write same value (needed because of ping-pong)
 		}
 	}
 
-	dst[y * W + x] = best;
-
-	if (best.id != cur.id || best.distance != cur.distance) {
-		atomicOr(flag_write, 1);
+	// sync threads and check if any changed
+	const bool any_changed = __syncthreads_or(changed);
+	if (threadIdx.x == 0 && threadIdx.y == 0 && any_changed) {
+		atomicOr(flag_write, 1); // one atomic per block
 	}
+
+	// get bitmask for current iteration changed threads
+	const uint32_t changed_bits = __ballot_sync(0xFFFFFFFFu, changed);
+
+	if (lane == 0) row_mask_write[y * tiles_x + blockIdx.x] = changed_bits;
 }

@@ -27,14 +27,24 @@
 // Kernel: write new seeds into the interleaved grid
 // ---------------------------------------------------------------------------
 
-__global__ void write_seeds_kernel(
-	int32_t* __restrict__ grid, const int W, const Vec2i* __restrict__ new_pos, int32_t base_id, const int k) {
+__global__ void write_seeds_kernel(int32_t* __restrict__ grid,
+								   uint32_t* __restrict__ row_mask,
+								   const int W,
+								   const int H,
+								   const int tiles_x,
+								   const Vec2i* __restrict__ new_pos,
+								   int32_t base_id,
+								   const int n_seeds) {
 	const int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= k) return;
+	if (i >= n_seeds) return;
 	const auto [x, y] = new_pos[i];
 	const int cell_idx = y * W + x;
 	grid[cell_idx * 2] = base_id + i;
 	grid[cell_idx * 2 + 1] = 0;
+
+	const int tile_col = x / TILE_SIZE_BFS;
+	const int lane = x % TILE_SIZE_BFS;
+	atomicOr(&row_mask[y * tiles_x + tile_col], 1u << lane); // write updated bit
 }
 
 // ---------------------------------------------------------------------------
@@ -52,10 +62,13 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds) :
 	// more than a strict planar triangulation -> generous 3x margin
 	tri_cap_ = 3 * max_seeds_;
 	det_cap_ = 4 * N;
+	row_mask_tiles_x_ = (W_ + TILE_SIZE_BFS - 1) / TILE_SIZE_BFS;
 
 	cudaMalloc(&d_grid_, N * 2 * sizeof(int32_t));
 	cudaMalloc(&d_tmp_, N * 2 * sizeof(int32_t));
 	cudaMalloc(&d_updated_flag_, 2 * sizeof(int32_t));
+	cudaMalloc(&d_row_mask_a_, H_ * row_mask_tiles_x_ * sizeof(uint32_t));
+	cudaMalloc(&d_row_mask_b_, H_ * row_mask_tiles_x_ * sizeof(uint32_t));
 	cudaMalloc(&d_seed_pos_, max_seeds_ * sizeof(Vec2i));
 	cudaMalloc(&d_t_grid_, N * sizeof(int32_t));
 
@@ -78,6 +91,8 @@ IncrementalDelaunay::~IncrementalDelaunay() {
 	cudaFree(d_grid_);
 	cudaFree(d_tmp_);
 	cudaFree(d_updated_flag_);
+	cudaFree(d_row_mask_a_);
+	cudaFree(d_row_mask_b_);
 	cudaFree(d_seed_pos_);
 	cudaFree(d_t_grid_);
 	cudaFree(d_det_xy_);
@@ -104,6 +119,7 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 	}
 
 	cudaMemset(d_updated_flag_, 0, 2 * sizeof(int32_t));
+	cudaMemset(d_updated_flag_, 0, 2 * sizeof(int32_t));
 
 	int cur_flag = 0;
 	while (true) {
@@ -111,8 +127,10 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 			int32_t* flag_write = d_updated_flag_ + cur_flag;
 			int32_t* flag_reset = d_updated_flag_ + (1 - cur_flag);
 
-			voronoi_step_kernel<<<grid_dim, block>>>(d_grid_, d_tmp_, W_, H_, flag_write, flag_reset);
+			voronoi_step_kernel<<<grid_dim, block>>>(d_grid_, d_tmp_, W_, H_, flag_write, flag_reset, d_row_mask_a_,
+													 d_row_mask_b_);
 			std::swap(d_grid_, d_tmp_);
+			std::swap(d_row_mask_a_, d_row_mask_b_);
 			cur_flag = 1 - cur_flag;
 		}
 
@@ -297,8 +315,14 @@ void IncrementalDelaunay::insert(const std::vector<Vec2i>& new_seeds,
 	N_ += k;
 	cudaMemcpy(d_seed_pos_ + base_id, new_seeds.data(), k * sizeof(Vec2i), cudaMemcpyHostToDevice);
 
+	// reset masks
+	const size_t row_mask_bytes = H_ * row_mask_tiles_x_ * sizeof(uint32_t);
+	cudaMemset(d_row_mask_a_, 0, row_mask_bytes);
+	cudaMemset(d_row_mask_b_, 0, row_mask_bytes);
+
 	// Write seeds into grid
-	write_seeds_kernel<<<(k + 255) / 256, 256>>>(d_grid_, W_, d_seed_pos_ + base_id, base_id, k);
+	write_seeds_kernel<<<(k + 255) / 256, 256>>>(d_grid_, d_row_mask_a_, W_, H_, row_mask_tiles_x_,
+												 d_seed_pos_ + base_id, base_id, k);
 
 	// BFS
 	float bfs_ms = 0.f;

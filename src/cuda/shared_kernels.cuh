@@ -3,8 +3,7 @@
 #include <cuda_runtime.h>
 
 // size of shared memory tile and TILE_SIZExTILE_SIZE threads per block
-// (TILE_SIZE+2) * (TILE_SIZE+2) * sizeof(VoronoiCell) has to be below hardware limit of shared memory per block
-// and TILE_SIZE * TILE_SIZE has to be below hardware limit of threads per block
+// HAS to be 32 == threads/warp
 static constexpr uint32_t TILE_SIZE_BFS = 32;
 
 // number of kernel invocations that are run, before the flag is checked.
@@ -73,4 +72,6 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 									const int W,
 									const int H,
 									int32_t* __restrict__ flag_write,
-									int32_t* __restrict__ flag_reset_for_next);
+									int32_t* __restrict__ flag_reset_for_next,
+									const uint32_t* __restrict__ row_mask_read,
+									uint32_t* __restrict__ row_mask_write);

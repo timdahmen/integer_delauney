@@ -57,11 +57,15 @@ private:
 	int tri_cap_;
 	int det_cap_; // 4 * W * H       max tri seeds that can be found
 	int N_tri_; // triangles currently in the live registry
+	int row_mask_tiles_x_; // how many masks per tile row
 
 	// ---- Voronoi state ----
 	int32_t* d_grid_; // (H*W*2) interleaved (seed_id, distance)
 	int32_t* d_tmp_; // (H*W*2) BFS ping-pong
 	int32_t* d_updated_flag_; // (2)  BFS convergence flags (ping-pong)
+	uint32_t* d_row_mask_a_; // updated mask a
+	uint32_t* d_row_mask_b_; // updated mask b
+	
 
 	// ---- seeds ----
 	Vec2i* d_seed_pos_; // (max_seeds)

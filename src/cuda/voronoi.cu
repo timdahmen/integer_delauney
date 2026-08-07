@@ -38,8 +38,8 @@ void cuda_compute_voronoi(const int W,
 	}
 	for (size_t i = 0; i < seeds.size(); ++i) {
 		const int idx = seeds[i].y * W + seeds[i].x;
-		h_grid[idx * 2] = static_cast<int32_t>(i); // seed Id
-		h_grid[idx * 2 + 1] = 0; // distance
+		h_grid[idx * 2] = static_cast<int32_t>(i);
+		h_grid[idx * 2 + 1] = 0;
 	}
 
 	// Allocate 2 flags on device, alternate each iteration
@@ -54,6 +54,15 @@ void cuda_compute_voronoi(const int W,
 	cudaMalloc(&d_b, cell_bytes);
 	cudaMemcpy(d_a, h_grid.data(), cell_bytes, cudaMemcpyHostToDevice);
 
+	const int tiles_x = (W + TILE_SIZE_BFS - 1) / TILE_SIZE_BFS;
+	const int row_mask_words = H * tiles_x;
+
+	// Allocate tile settled flag buffers
+	uint32_t *d_row_mask_a = nullptr, *d_row_mask_b = nullptr;
+	cudaMalloc(&d_row_mask_a, row_mask_words * sizeof(uint32_t));
+	cudaMalloc(&d_row_mask_b, row_mask_words * sizeof(uint32_t));
+	cudaMemset(d_row_mask_a, 0xFF, row_mask_words * sizeof(uint32_t));
+
 	dim3 block(TILE_SIZE_BFS, TILE_SIZE_BFS);
 	dim3 grid((W + TILE_SIZE_BFS - 1) / TILE_SIZE_BFS, (H + TILE_SIZE_BFS - 1) / TILE_SIZE_BFS);
 
@@ -64,9 +73,10 @@ void cuda_compute_voronoi(const int W,
 			int32_t* flag_write = d_flags + cur_flag;
 			int32_t* flag_reset = d_flags + (1 - cur_flag);
 
-			voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, flag_write, flag_reset);
+			voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, flag_write, flag_reset, d_row_mask_a, d_row_mask_b);
 
 			std::swap(d_a, d_b); // Swap buffers
+			std::swap(d_row_mask_a, d_row_mask_b);
 			cur_flag = 1 - cur_flag;
 		}
 
@@ -81,4 +91,6 @@ void cuda_compute_voronoi(const int W,
 	cudaFree(d_a);
 	cudaFree(d_b);
 	cudaFree(d_flags);
+	cudaFree(d_row_mask_a);
+	cudaFree(d_row_mask_b);
 }
