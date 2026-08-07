@@ -190,17 +190,35 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 		*flag_reset_for_next = 0;
 	}
 
-	auto* src = reinterpret_cast<const Cell*>(src_raw);
-	auto* dst = reinterpret_cast<Cell*>(dst_raw);
-
-	// TODO: dont load mem, if tile done
-
 	const int tiles_x = gridDim.x;
 	const int x = blockIdx.x * TILE_SIZE_BFS + threadIdx.x;
 	const int y = blockIdx.y * TILE_SIZE_BFS + threadIdx.y;
 	const bool in_bounds = (x < W && y < H);
 	const int lane = threadIdx.x; // .x since TileSize = 32
 
+	auto* src = reinterpret_cast<const Cell*>(src_raw);
+	auto* dst = reinterpret_cast<Cell*>(dst_raw);
+
+	// check if any single bits, or halo bits (range 1) are set, by | all the masks
+	// own row mask
+	uint32_t own_mask = in_bounds ? row_mask_read[y * tiles_x + blockIdx.x] : 0u;
+	// top halo
+	if (threadIdx.y == 0 && y > 0) own_mask |= row_mask_read[(y - 1) * tiles_x + blockIdx.x];
+	// bottom halo
+	if (threadIdx.y == TILE_SIZE_BFS - 1 && y + 1 < H) own_mask |= (row_mask_read[(y + 1) * tiles_x + blockIdx.x]);
+	// left halo
+	if (lane == 0 && blockIdx.x > 0) own_mask |= (row_mask_read[y * tiles_x + (blockIdx.x - 1)] >> 31);
+	// right column halo
+	if (lane == 31 && blockIdx.x + 1 < tiles_x) own_mask |= row_mask_read[y * tiles_x + (blockIdx.x + 1)] & 1u;
+
+	// if any thread has a non 0 mask do not return
+	if (!__syncthreads_or(own_mask != 0u)) {
+		if (in_bounds) dst[y * W + x] = src[y * W + x]; // copy cell forward(ping-pong)
+		if (lane == 0 && in_bounds) row_mask_write[y * tiles_x + blockIdx.x] = 0u; // reset mask
+		return;
+	}
+
+	// create shared buffer
 	__shared__ Cell tile[TILE_SIZE_BFS + 2][TILE_SIZE_BFS + 2];
 	const int tile_x = threadIdx.x + 1;
 	const int tile_y = threadIdx.y + 1;
@@ -224,11 +242,11 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 	const uint32_t row_below = row_word(row_mask_read, y + 1, blockIdx.x, H, tiles_x);
 
 	// if at left bound, load left lane and check that ones right most bit; else check bit to the right
-	const bool left_active = (lane > 0) ? ((row_own >> (lane - 1)) & 1u)
-										: ((row_word(row_mask_read, y, blockIdx.x - 1, H, tiles_x) >> 31) & 1u);
+	const bool left_active =
+		(lane > 0) ? ((row_own >> (lane - 1)) & 1u) : (row_word(row_mask_read, y, blockIdx.x - 1, H, tiles_x) >> 31);
 	// same as above, just other direction
-	const bool right_active =
-		(lane < 31) ? ((row_own >> (lane + 1)) & 1u) : (row_word(row_mask_read, y, blockIdx.x + 1, H, tiles_x) & 1u);
+	const bool right_active = (lane < 31) ? ((row_own >> (lane + 1)) & 1u)
+										  : ((row_word(row_mask_read, y, blockIdx.x + 1, H, tiles_x) & 1u) != 0u);
 	const bool onw_active = (row_own >> lane) & 1u;
 	const bool above_active = (row_above >> lane) & 1u;
 	const bool below_active = (row_below >> lane) & 1u;
