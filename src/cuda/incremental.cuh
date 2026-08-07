@@ -24,6 +24,17 @@ public:
 				std::vector<int32_t>& tgrid_out,
 				IncrementalTimings* timings = nullptr);
 
+	struct InsertResultRef {
+		const std::vector<TriangleEntry>& tri_map;
+		const std::vector<int32_t>& tgrid;
+	};
+
+	// wrapper: uses the persistent internal buffers and
+	// returns them by reference
+	// !!! Only valid until the next call to insert() on this object
+	// copy out if needed for longer
+	InsertResultRef insert(const std::vector<Vec2i>& new_seeds, IncrementalTimings* timings = nullptr);
+
 	// wrapper to keep same API with x,y as split inputs
 	void insert(const std::vector<int32_t>& new_xs,
 				const std::vector<int32_t>& new_ys,
@@ -38,6 +49,10 @@ public:
 
 private:
 	int W_, H_, N_, max_seeds_;
+
+	// --- persistent output buffers (no reallocation for each insert) ---
+	std::vector<TriangleEntry> tri_map_buf_;
+	std::vector<int32_t> tgrid_buf_;
 
 	int tri_cap_;
 	int det_cap_; // 4 * W * H       max tri seeds that can be found
@@ -69,10 +84,7 @@ private:
 
 	// ---- private helpers ----
 	void run_bfs_(float* bfs_ms_out);
-	void triangulate_(float* det_ms,
-					  float* dedup_ms,
-					  float* asgn_ms,
-					  std::vector<int32_t>& tgrid_out);
+	void triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms, std::vector<int32_t>& tgrid_out);
 	void build_outputs_(std::vector<TriangleEntry>& tri_map_out, std::vector<int32_t>& tgrid_out) const;
 
 	static uint64_t pack_triplet_(const int32_t a, const int32_t b, const int32_t c) {

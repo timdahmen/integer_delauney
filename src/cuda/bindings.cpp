@@ -153,20 +153,16 @@ public:
 		std::vector<Vec2i> seeds;
 		seeds.reserve(py::len(seeds_obj));
 		_parse_seeds(seeds_obj, seeds);
-		std::vector<TriangleEntry> tri_map;
-		std::vector<int32_t> tgrid;
-		impl_.insert(seeds, tri_map, tgrid);
-		return _build_output(tri_map, tgrid, impl_.height(), impl_.width());
+		const auto res = impl_.insert(seeds);
+		return _build_output(res.tri_map, res.tgrid, impl_.height(), impl_.width());
 	}
 
 	py::tuple insert_timed(const py::object& seeds_obj) {
 		std::vector<Vec2i> seeds;
 		seeds.reserve(py::len(seeds_obj));
 		_parse_seeds(seeds_obj, seeds);
-		std::vector<TriangleEntry> tri_map;
-		std::vector<int32_t> tgrid;
 		IncrementalTimings t;
-		impl_.insert(seeds, tri_map, tgrid, &t);
+		const auto res = impl_.insert(seeds, &t);
 
 		py::dict py_t;
 		py_t["bfs_ms"] = t.bfs_ms;
@@ -174,7 +170,7 @@ public:
 		py_t["dedup_ms"] = t.dedup_ms;
 		py_t["assign_ms"] = t.assign_ms;
 
-		const auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width());
+		const auto out = _build_output(res.tri_map, res.tgrid, impl_.height(), impl_.width());
 		return py::make_tuple(out[0], out[1], py_t);
 	}
 

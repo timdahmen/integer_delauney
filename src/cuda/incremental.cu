@@ -330,3 +330,9 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 
 	insert(seeds, tri_map_out, tgrid_out, timings);
 }
+
+IncrementalDelaunay::InsertResultRef IncrementalDelaunay::insert(const std::vector<Vec2i>& new_seeds,
+																 IncrementalTimings* timings) {
+	insert(new_seeds, tri_map_buf_, tgrid_buf_);
+	return {tri_map_buf_, tgrid_buf_};
+}
