@@ -17,6 +17,8 @@ if(WITH_CUDA)
         src/cuda/voronoi.cu
         src/cuda/triangulation.cu
         src/cuda/incremental.cu
+        src/cuda/shared_utils.cuh
+        src/cuda/shared_utils.cu
     )
 
     # nvcc flags shared by every target that compiles the kernels.

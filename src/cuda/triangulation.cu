@@ -17,6 +17,7 @@
 //   • triangle_id grid                     ← device  (output, W*H ints)
 
 #include "triangulation.cuh"
+#include "shared_utils.cuh"
 
 #include "nvtx_range.h"
 
@@ -35,12 +36,6 @@
 // ---------------------------------------------------------------------------
 
 static constexpr int32_t UNDEF = -1;
-
-struct RawTriangle {
-    int32_t x, y;
-    int32_t a, b, c;           // sorted dedup key  (a <= b <= c)
-    int32_t orig_a, orig_b, orig_c;
-};
 
 struct RawLess {
     __device__ bool operator()(const RawTriangle& x, const RawTriangle& y) const {
@@ -136,15 +131,13 @@ static constexpr int SID_HISTORY_STACK_SIZE = 16;
 
 __global__
 void assign_triangles_kernel(
-    int32_t* __restrict__             t_grid,
+    int32_t* __restrict__                   t_grid,
     int W, int H,
-    const int32_t* __restrict__       n_grid,     // seed_id per pixel
-    const int32_t* __restrict__       dist_grid,  // voronoi distance per pixel
-    const RawTriangle* __restrict__   triangles,
-    const int32_t* __restrict__       seed_xs,
-    const int32_t* __restrict__       seed_ys,
-    const int32_t* __restrict__       csr_ptr,    // [N_seeds+1]
-    const int32_t* __restrict__       csr_idx,    // triangle IDs per seed
+    const int32_t* __restrict__             n_grid,     // seed_id per pixel
+    const int32_t* __restrict__             dist_grid,  // voronoi distance per pixel
+    const CsrEntryVertexCache* __restrict__ csr_verts_cache,
+    const int32_t* __restrict__             csr_ptr,    // [N_seeds+1]
+    const int32_t* __restrict__             csr_idx,    // triangle IDs per seed
     int N_seeds,
     int N_triangles)
 {
@@ -204,19 +197,16 @@ void assign_triangles_kernel(
                         // Test what can be seen from here, inverse from the collect then try approach
                         for (int j = csr_ptr[sid]; j < csr_ptr[sid + 1]; ++j) {
                             int32_t tid = csr_idx[j];
-                            const RawTriangle& tri = triangles[tid];
-                            float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
-                            float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
-                            float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
+                        
+                            // We only kept the best (largest containing) one, anything
+                            // else should be outside of the area ... if I understood it correctly
+                            if (tid > best) {
+                                const CsrEntryVertexCache& c = csr_verts_cache[j];
 
-                            // I want to guess a few fractions of a millisecond can be saved here
-                            // by doing the tid-best check first but that yielded no measurable
-                            // difference for me
-                            if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy)) {
-                                if (best == -1 || tid > best) {
-                                    best = tid;
+                                if (point_in_triangle(px, py, c.a.x, c.a.y, c.b.x, c.b.y, c.c.x, c.c.y)) {
+                                   best = tid;
                                 }
-                            }    
+                            }
                         }
                     }
                 }
@@ -382,6 +372,8 @@ void cuda_compute_triangulation(
     // -----------------------------------------------------------------------
 
     int32_t *d_csr_ptr = nullptr, *d_csr_idx = nullptr;
+    CsrEntryVertexCache* d_csr_verts_cache = nullptr;
+    int csr_size = 0;
     {
         DELAUNEY_NVTX_RANGE("tri: build CSR (host)");
 
@@ -394,7 +386,7 @@ void cuda_compute_triangulation(
         for (int s = 1; s <= N_seeds; ++s)
             h_csr_ptr[s] += h_csr_ptr[s - 1];
 
-        const int csr_size = h_csr_ptr[N_seeds];  // == 3 * N_triangles
+        csr_size = h_csr_ptr[N_seeds];  // == 3 * N_triangles
         std::vector<int32_t> h_csr_idx(csr_size);
         std::vector<int32_t> fill(N_seeds, 0);
 
@@ -407,9 +399,22 @@ void cuda_compute_triangulation(
 
         cudaMalloc(&d_csr_ptr, (N_seeds + 1) * sizeof(int32_t));
         cudaMalloc(&d_csr_idx,  csr_size     * sizeof(int32_t));
+        cudaMalloc(&d_csr_verts_cache, csr_size * sizeof(CsrEntryVertexCache));
         DELAUNEY_NVTX_MARK("tri: H2D CSR");
         cudaMemcpy(d_csr_ptr, h_csr_ptr.data(), (N_seeds + 1) * sizeof(int32_t), cudaMemcpyHostToDevice);
         cudaMemcpy(d_csr_idx, h_csr_idx.data(),  csr_size     * sizeof(int32_t), cudaMemcpyHostToDevice);
+
+        if (csr_size > 0) {
+            // Kernel size taken from remap / write seed kernel
+            build_csr_verts_kernel<<<((csr_size + 255) / 256), 256>>>(
+                d_csr_verts_cache,
+                d_csr_idx,
+                d_raw,
+                d_sx,
+                d_sy,
+                csr_size
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -425,11 +430,15 @@ void cuda_compute_triangulation(
 
         if (N_triangles > 0) {
             assign_triangles_kernel<<<grid_dim, block>>>(
-                d_t, W, H,
-                d_n, d_dist,
-                d_raw, d_sx, d_sy,
-                d_csr_ptr, d_csr_idx,
-                N_seeds, N_triangles);
+                d_t, 
+                W, H,
+                d_n, 
+                d_dist,
+                d_csr_verts_cache,
+                d_csr_ptr,
+                d_csr_idx,
+                N_seeds, 
+                N_triangles);
             cudaDeviceSynchronize();
         } else {
             cudaMemset(d_t, -1, N * sizeof(int32_t));
@@ -476,4 +485,5 @@ void cuda_compute_triangulation(
     cudaFree(d_csr_ptr);
     cudaFree(d_csr_idx);
     cudaFree(seed_distance_grid);
+    cudaFree(d_csr_verts_cache);
 }

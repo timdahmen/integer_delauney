@@ -74,17 +74,18 @@ private:
     int W_, H_, N_, max_seeds_;
 
     // ---- persistent device buffers ----
-    int32_t* d_grid_;        // (H*W*2) Voronoi: interleaved (seed_id, distance)
-    int32_t* d_tmp_;         // (H*W*2) BFS ping-pong
-    int32_t* d_changed_;     // (H*W)   cells updated during BFS (accumulated)
-    int32_t* d_sx_;          // (max_seeds) seed x
-    int32_t* d_sy_;          // (max_seeds) seed y
-    void*    d_raw_buf_;     // (H*W*4 * sizeof(RawTriangle)) detection scratch
-    int32_t* d_t_grid_;      // (H*W)   triangle_id per pixel
-    int32_t* d_csr_ptr_;     // (max_seeds+1) CSR row starts
-    int32_t* d_csr_idx_;     // (max_seeds*8) CSR triangle IDs
-    int32_t* d_updated_flag_;// (1)     BFS convergence flag
-    int32_t* d_mask_;        // (H*W)   reused for border / reassign masks
+    int32_t* d_grid_;              // (H*W*2) Voronoi: interleaved (seed_id, distance)
+    int32_t* d_tmp_;               // (H*W*2) BFS ping-pong
+    int32_t* d_changed_;           // (H*W)   cells updated during BFS (accumulated)
+    int32_t* d_sx_;                // (max_seeds) seed x
+    int32_t* d_sy_;                // (max_seeds) seed y
+    void*    d_raw_buf_;           // (H*W*4 * sizeof(RawTriangle)) detection scratch
+    int32_t* d_t_grid_;            // (H*W)   triangle_id per pixel
+    int32_t* d_csr_ptr_;           // (max_seeds+1) CSR row starts
+    int32_t* d_csr_idx_;           // (max_seeds*8) CSR triangle IDs
+    int32_t* d_updated_flag_;      // (1)     BFS convergence flag
+    int32_t* d_mask_;              // (H*W)   reused for border / reassign masks
+    void*    d_csr_verts_cache_;   // (max_seeds*8 * sizeof(CsrEntryVertexCache)) vert for each CSR entry
 
     // ---- persistent pinned host staging buffers ----
     int32_t* p_changed_  = nullptr;  // (N)    D2H  BFS change mask

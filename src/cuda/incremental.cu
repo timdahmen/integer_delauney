@@ -13,6 +13,7 @@
 //        f. Re-assign only pixels in reassign mask.
 
 #include "incremental.cuh"
+#include "shared_utils.cuh"
 
 #include "nvtx_range.h"
 
@@ -57,12 +58,6 @@ struct HostTimer {
 // these measure launch cost plus whatever the following sync absorbs.
 #define DELAUNEY_HOST_TIME(field) \
     HostTimer _host_timer_(ht_ ? &ht_->field : nullptr)
-
-struct RawTriangle {
-    int32_t x, y;
-    int32_t a, b, c;            // sorted key
-    int32_t orig_a, orig_b, orig_c;
-};
 
 struct RawLess {
     __device__ bool operator()(const RawTriangle& p, const RawTriangle& q) const {
@@ -240,16 +235,14 @@ static constexpr int SID_HISTORY_STACK_SIZE = 16;
 
 __global__
 void assign_triangles_kernel(
-    int32_t* __restrict__           t_grid,
+    int32_t* __restrict__                   t_grid,
     int W, int H,
-    const int32_t* __restrict__     grid,       // interleaved (seed_id, dist)
-    const RawTriangle* __restrict__ triangles,
-    const int32_t* __restrict__     seed_xs,
-    const int32_t* __restrict__     seed_ys,
-    const int32_t* __restrict__     csr_ptr,
-    const int32_t* __restrict__     csr_idx,
+    const int32_t* __restrict__             grid,       // interleaved (seed_id, dist)
+    const CsrEntryVertexCache* __restrict__ csr_verts_cache,
+    const int32_t* __restrict__             csr_ptr,
+    const int32_t* __restrict__             csr_idx,
     int N_seeds, int N_triangles,
-    const int32_t* __restrict__     mask)       // nullptr → all pixels
+    const int32_t* __restrict__             mask)       // nullptr → all pixels
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -301,17 +294,14 @@ void assign_triangles_kernel(
 
                         for (int j = csr_ptr[sid]; j < csr_ptr[sid+1]; ++j) {
                             int32_t tid = csr_idx[j];
-                            const RawTriangle& tri = triangles[tid];
-                            float ax = (float)seed_xs[tri.orig_a], ay = (float)seed_ys[tri.orig_a];
-                            float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
-                            float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
+                        
+                            // We only kept the best (largest containing) one, anything
+                            // else should be outside of the area ... if I understood it correctly
+                            if (tid > best) {
+                                const CsrEntryVertexCache& c = csr_verts_cache[j];
 
-                            // I want to guess a few fractions of a millisecond can be saved here
-                            // by doing the tid-best check first but that yielded no measurable
-                            // difference for me
-                            if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy)) {
-                                if (best == -1 || tid > best) {
-                                    best = tid;
+                                if (point_in_triangle(px, py, c.a.x, c.a.y, c.b.x, c.b.y, c.c.x, c.c.y)) {
+                                   best = tid;
                                 }
                             }
                         }
@@ -351,6 +341,8 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds)
     cudaMemset(d_t_grid_,  -1, (size_t)N     * sizeof(int32_t));
     cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t));
 
+    cudaMalloc(&d_csr_verts_cache_,  (size_t)max_seeds * 8  * sizeof(CsrEntryVertexCache));
+
     // Pinned host allocations. Warning, these are expensive 
     cudaHostAlloc(&p_changed_,  (size_t)N     * sizeof(int32_t), cudaHostAllocDefault);
     cudaHostAlloc(&p_border_,   (size_t)N     * sizeof(int32_t), cudaHostAllocDefault);
@@ -365,6 +357,8 @@ IncrementalDelaunay::~IncrementalDelaunay()
     cudaFree(d_sx_);      cudaFree(d_sy_);        cudaFree(d_raw_buf_);
     cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
     cudaFree(d_updated_flag_); cudaFree(d_mask_);
+
+    cudaFree(d_csr_verts_cache_);
 
     cudaFreeHost(p_changed_); cudaFreeHost(p_border_); cudaFreeHost(p_reassign_);
     cudaFreeHost(p_t_); cudaFreeHost(p_grid_);
@@ -458,6 +452,18 @@ void IncrementalDelaunay::rebuild_csr_and_upload_()
     }
     cudaMemcpy(d_csr_ptr_, h_csr_ptr.data(), (N_+1)*sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_csr_idx_, h_csr_idx.data(),  csr_size*sizeof(int32_t), cudaMemcpyHostToDevice);
+
+    if (csr_size > 0) {
+        // Kernel size taken from remap / write seed kernel
+        build_csr_verts_kernel<<<((csr_size + 255) / 256), 256>>>(
+            static_cast<CsrEntryVertexCache*>(d_csr_verts_cache_),
+            d_csr_idx_,
+            static_cast<RawTriangle*>(d_raw_buf_), 
+            d_sx_, 
+            d_sy_, 
+            csr_size
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -547,8 +553,14 @@ void IncrementalDelaunay::full_triangulate_(float* det_gpu, float* dedup_gpu, fl
         if (asgn_gpu) rc(e4);
         if (N_tri > 0) {
             assign_triangles_kernel<<<grid_dim, block>>>(
-                d_t_grid_, W_, H_, d_grid_, d_raw,
-                d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri, nullptr);
+                d_t_grid_, 
+                W_, H_, 
+                d_grid_, 
+                static_cast<CsrEntryVertexCache*>(d_csr_verts_cache_),
+                d_csr_ptr_,
+                d_csr_idx_,
+                N_, N_tri, 
+                nullptr);
             cudaDeviceSynchronize();
         } else {
             cudaMemset(d_t_grid_, -1, N * sizeof(int32_t));
@@ -782,9 +794,14 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
         DELAUNEY_NVTX_RANGE_C("inc: assign (masked)", delauney_nvtx::kKernel);
         DELAUNEY_HOST_TIME(assign_ms);
         assign_triangles_kernel<<<grid_dim, block>>>(
-            d_t_grid_, W_, H_, d_grid_,
-            static_cast<RawTriangle*>(d_raw_buf_),
-            d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri, d_mask_);
+            d_t_grid_, 
+            W_, H_, 
+            d_grid_,
+            static_cast<CsrEntryVertexCache*>(d_csr_verts_cache_),
+            d_csr_ptr_,
+            d_csr_idx_,
+            N_, N_tri,
+            d_mask_);
         cudaDeviceSynchronize();
     }
 }
