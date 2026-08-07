@@ -324,8 +324,7 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds) :
 	cudaMemset(d_t_grid_, UNDEF, N * sizeof(int32_t));
 	cudaMemset(d_updated_flag_, 0, 2 * sizeof(uint8_t));
 
-	h_seed_pos_.reserve(max_seeds_);
-	h_seed_set_.reserve(max_seeds_ * 2);
+	h_seed_set_.reserve(max_seeds_);
 }
 
 
@@ -549,10 +548,7 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 
 	const int base_id = N_;
 
-	for (int i = 0; i < k; ++i) {
-		h_seed_pos_.push_back(batch[i]);
-		h_seed_set_.insert(pack_xy_(batch[i].x, batch[i].y));
-	}
+	for (int i = 0; i < k; ++i) h_seed_set_.insert(pack_xy_(batch[i].x, batch[i].y));
 	N_ += k;
 	cudaMemcpy(d_seed_pos_ + base_id, batch.data(), k * sizeof(Vec2i), cudaMemcpyHostToDevice);
 

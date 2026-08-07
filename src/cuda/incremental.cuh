@@ -67,7 +67,6 @@ private:
 	int32_t* d_out_grid_; // (H*W*3)
 
 	// ---- host-side seed registry ----
-	std::vector<Vec2i> h_seed_pos_; // TODO: remove, not read
 	std::unordered_set<uint64_t> h_seed_set_; // fast duplicate check
 
 	// ---- private helpers ----
