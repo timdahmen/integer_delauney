@@ -1,16 +1,9 @@
 // CUDA implementation of IncrementalDelaunay.
-// TODO: fix docs
+//
 // insert(batch) pipeline:
 //   1. Write new seeds into d_grid_ at distance 0.
-//   2. BFS until convergence; d_changed_ accumulates every cell that moved.
-//   3. First insert → full triangulation.
-//      Subsequent inserts → partial triangulation:
-//        a. Expand d_changed_ by 2 px → border mask (re-detect here).
-//        b. Remove triangles whose canonical pixel is in border.
-//        c. Re-detect in border, merge new triplets.
-//        d. Remap d_t_grid_ through old→new ID table.
-//        e. Expand d_changed_ by WINDOW_CAP → reassign mask.
-//        f. Re-assign only pixels in reassign mask.
+//   2. BFS until convergence;
+//	 3. All inserts do a full triangulation. This is cheaper, than keeping a mask and only updating new Tris
 
 #include "incremental.cuh"
 #include "shared_kernels.cuh"

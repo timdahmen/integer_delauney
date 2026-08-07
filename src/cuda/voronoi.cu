@@ -6,8 +6,10 @@
 //   cell.distance = distance
 //
 // Double-buffer approach: kernel reads from `src`, writes to `dst`, then
-// the host swaps pointers. An `updated` device flag is OR-ed by any thread
+// the host swaps pointers. An `updated` flag is set by any thread
 // that changes a cell; the loop stops when no thread sets it.
+// The double buffering is applied to the flag, to avoid stalls from copying
+// and resetting it host side, when dispatching multiple iterations before checking the flag.
 
 #include "common.h"
 #include "shared_kernels.cuh"

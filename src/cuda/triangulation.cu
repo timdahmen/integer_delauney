@@ -2,8 +2,8 @@
 // Step 1 (CPU): prepare and upload data to the GPU
 // Step 2 (GPU): scan all 4 L-shape orientations; raw hits → device buffer.
 // Step 3 (GPU): thrust::sort_by_key + thrust::unique_by_key on the device buffer.
-// Step 4 (GPU): triangle rasterisation. 1 block per triangle, using multiple threads per
-//				 triangle so that consecutive threads access neighbouring memory.
+// Step 4 (GPU): triangle rasterisation. 1 block works on multiple triangles at once
+//				 and multiple threads per triangle, so that consecutive threads access neighbouring memory.
 //
 // Host copies:
 //   • voronoi grid (seed_id + distance, interleaved) → device  (input, once)
