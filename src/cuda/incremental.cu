@@ -437,11 +437,13 @@ void IncrementalDelaunay::triangulate_(float* det_ms,
 	int n_new = 0;
 	if (raw_count > 0) {
 		thrust::sort_by_key(thrust::cuda::par_nosync, det_key, det_key + raw_count, det_vals, KeyLess{});
+	}
 
 		// resize, while waiting for sort to be done
 		// this can affect the reported timings for dedup
 		tgrid_out.resize(N * 3);
 
+	if (raw_count > 0) {
 		auto det_end = thrust::unique_by_key(det_key, det_key + raw_count, det_vals, KeyEqual{});
 		n_new = static_cast<int>(det_end.first - det_key);
 	}
