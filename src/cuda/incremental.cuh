@@ -72,7 +72,10 @@ private:
 
 	// ---- private helpers ----
 	void run_bfs_(float* bfs_ms_out);
-	void triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms);
+	void triangulate_(float* det_ms,
+					  float* dedup_ms,
+					  float* asgn_ms,
+					  std::vector<int32_t>& tgrid_out);
 	void build_outputs_(std::vector<TriangleEntry>& tri_map_out, std::vector<int32_t>& tgrid_out) const;
 
 	static uint64_t pack_triplet_(const int32_t a, const int32_t b, const int32_t c) {

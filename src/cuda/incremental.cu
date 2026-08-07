@@ -97,11 +97,8 @@ __device__ __forceinline__ bool beats(const int32_t a_id, const int32_t a_d, con
 // Kernel: write new seeds into the interleaved grid
 // ---------------------------------------------------------------------------
 
-__global__ void write_seeds_kernel(int32_t* __restrict__ grid,
-								   const int W,
-								   const Vec2i* __restrict__ new_pos,
-								   int32_t base_id,
-								   const int k) {
+__global__ void write_seeds_kernel(
+	int32_t* __restrict__ grid, const int W, const Vec2i* __restrict__ new_pos, int32_t base_id, const int k) {
 	const int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= k) return;
 	const auto [x, y] = new_pos[i];
@@ -269,10 +266,10 @@ __global__ void rasterize_tri_kernel2(int32_t* __restrict__ canvas,
 // ---------------------------------------------------------------------------
 // TODO: same as triangulation, put in shared file
 __global__ void build_output_kernel2(int32_t* __restrict__ out,
-									const int32_t* __restrict__ voronoi_grid,
-									const int32_t* __restrict__ canvas,
-									const int N,
-									const int default_id) {
+									 const int32_t* __restrict__ voronoi_grid,
+									 const int32_t* __restrict__ canvas,
+									 const int N,
+									 const int default_id) {
 	const int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= N) return;
 	const int32_t tri_id = canvas[i];
@@ -283,9 +280,9 @@ __global__ void build_output_kernel2(int32_t* __restrict__ out,
 
 // TODO: same as triangulation, put in shared file
 __global__ void build_triangle_map_out2(TriangleEntry* __restrict__ out,
-									   const Vec2i* __restrict__ tri_xy,
-									   const Vec3i* __restrict__ tri_og_seeds,
-									   const int N) {
+										const Vec2i* __restrict__ tri_xy,
+										const Vec3i* __restrict__ tri_og_seeds,
+										const int N) {
 	const int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= N) return;
 	const auto [x, y] = tri_xy[i];
@@ -392,7 +389,10 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 // full_triangulate_: detect → dedup → assign
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms) {
+void IncrementalDelaunay::triangulate_(float* det_ms,
+									   float* dedup_ms,
+									   float* asgn_ms,
+									   std::vector<int32_t>& tgrid_out) {
 	const int N = W_ * H_;
 	dim3 block(16, 16);
 	dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
@@ -438,6 +438,11 @@ void IncrementalDelaunay::triangulate_(float* det_ms, float* dedup_ms, float* as
 	int n_new = 0;
 	if (raw_count > 0) {
 		thrust::sort_by_key(thrust::cuda::par_nosync, det_key, det_key + raw_count, det_vals, KeyLess{});
+
+		// resize, while waiting for sort to be done
+		// this can affect the reported timings for dedup
+		tgrid_out.resize(N * 3);
+
 		auto det_end = thrust::unique_by_key(det_key, det_key + raw_count, det_vals, KeyEqual{});
 		n_new = static_cast<int>(det_end.first - det_key);
 	}
@@ -493,8 +498,7 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
 	const int n_blocks = (N + threads_per_block - 1) / threads_per_block;
 	build_output_kernel2<<<n_blocks, threads_per_block>>>(d_out_grid_, d_grid_, d_t_grid_, N, default_id);
 
-	tgrid_out.resize(N * 3);
-
+	// tgrid_out resized already
 	if (N_tri_ > 0) cudaMemcpy(tri_map_out.data(), d_out_map_, N_tri_ * sizeof(TriangleEntry), cudaMemcpyDeviceToHost);
 	cudaMemcpy(tgrid_out.data(), d_out_grid_, N * 3 * sizeof(int32_t), cudaMemcpyDeviceToHost);
 }
@@ -543,7 +547,6 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 		batch[i] = {x, y};
 	}
 
-	const bool is_first = (N_ == 0);
 	const int base_id = N_;
 
 	for (int i = 0; i < k; ++i) {
@@ -563,7 +566,8 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 
 	// Triangulate
 	float det_ms = 0.f, dup_ms = 0.f, asgn_ms = 0.f;
-	triangulate_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr, timings ? &asgn_ms : nullptr);
+	// outputs buffer passed so it can be resized, while waiting for the gpu
+	triangulate_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr, timings ? &asgn_ms : nullptr, tgrid_out);
 
 	if (timings) {
 		timings->detect_ms = det_ms;
