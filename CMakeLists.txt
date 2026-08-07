@@ -18,6 +18,9 @@ if(WITH_CUDA)
         src/cuda/voronoi.cu
         src/cuda/triangulation.cu
         src/cuda/incremental.cu
+        src/cuda/common.h
+        src/cuda/shared_kernels.cu
+        src/cuda/shared_kernels.cuh
     )
 
     target_include_directories(_delauney_cuda PRIVATE src/cuda)
