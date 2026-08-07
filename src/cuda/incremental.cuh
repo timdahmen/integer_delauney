@@ -61,7 +61,7 @@ private:
 	// ---- Voronoi state ----
 	int32_t* d_grid_; // (H*W*2) interleaved (seed_id, distance)
 	int32_t* d_tmp_; // (H*W*2) BFS ping-pong
-	uint8_t* d_updated_flag_; // (2)     BFS convergence flags (ping-pong)
+	int32_t* d_updated_flag_; // (2)  BFS convergence flags (ping-pong)
 
 	// ---- seeds ----
 	Vec2i* d_seed_pos_; // (max_seeds)

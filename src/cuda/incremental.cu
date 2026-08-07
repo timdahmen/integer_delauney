@@ -55,7 +55,7 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds) :
 
 	cudaMalloc(&d_grid_, N * 2 * sizeof(int32_t));
 	cudaMalloc(&d_tmp_, N * 2 * sizeof(int32_t));
-	cudaMalloc(&d_updated_flag_, 2 * sizeof(uint8_t));
+	cudaMalloc(&d_updated_flag_, 2 * sizeof(int32_t));
 	cudaMalloc(&d_seed_pos_, max_seeds_ * sizeof(Vec2i));
 	cudaMalloc(&d_t_grid_, N * sizeof(int32_t));
 
@@ -69,7 +69,7 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds) :
 
 	cudaMemset(d_grid_, UNDEF, N * 2 * sizeof(int32_t));
 	cudaMemset(d_t_grid_, UNDEF, N * sizeof(int32_t));
-	cudaMemset(d_updated_flag_, 0, 2 * sizeof(uint8_t));
+	cudaMemset(d_updated_flag_, 0, 2 * sizeof(int32_t));
 
 	h_seed_set_.reserve(max_seeds_);
 }
@@ -103,21 +103,21 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 		cudaEventRecord(ev0);
 	}
 
-	cudaMemset(d_updated_flag_, 0, 2 * sizeof(uint8_t));
+	cudaMemset(d_updated_flag_, 0, 2 * sizeof(int32_t));
 
 	int cur_flag = 0;
 	while (true) {
 		for (int i = 0; i < AGGREGATE_ITERATIONS_BFS; ++i) {
-			uint8_t* flag_write = d_updated_flag_ + cur_flag;
-			uint8_t* flag_reset = d_updated_flag_ + (1 - cur_flag);
+			int32_t* flag_write = d_updated_flag_ + cur_flag;
+			int32_t* flag_reset = d_updated_flag_ + (1 - cur_flag);
 
 			voronoi_step_kernel<<<grid_dim, block>>>(d_grid_, d_tmp_, W_, H_, flag_write, flag_reset);
 			std::swap(d_grid_, d_tmp_);
 			cur_flag = 1 - cur_flag;
 		}
 
-		uint8_t h_flag = 0;
-		cudaMemcpy(&h_flag, d_updated_flag_ + (1 - cur_flag), sizeof(uint8_t), cudaMemcpyDeviceToHost);
+		int32_t h_flag = 0;
+		cudaMemcpy(&h_flag, d_updated_flag_ + (1 - cur_flag), sizeof(int32_t), cudaMemcpyDeviceToHost);
 		if (!h_flag) break;
 	}
 

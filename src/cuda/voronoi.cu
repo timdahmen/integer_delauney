@@ -43,9 +43,9 @@ void cuda_compute_voronoi(const int W,
 	}
 
 	// Allocate 2 flags on device, alternate each iteration
-	uint8_t* d_flags;
-	cudaMalloc(&d_flags, 2 * sizeof(uint8_t));
-	cudaMemset(d_flags, 0, 2 * sizeof(uint8_t));
+	int32_t* d_flags;
+	cudaMalloc(&d_flags, 2 * sizeof(int32_t));
+	cudaMemset(d_flags, 0, 2 * sizeof(int32_t));
 
 	// Allocate double buffers on device
 	int32_t *d_a = nullptr, *d_b = nullptr;
@@ -61,8 +61,8 @@ void cuda_compute_voronoi(const int W,
 	while (true) {
 		// Run kernel multiple times before checking flag, to reduce MemCopy and Sync fences
 		for (int i = 0; i < AGGREGATE_ITERATIONS_BFS; ++i) {
-			uint8_t* flag_write = d_flags + cur_flag;
-			uint8_t* flag_reset = d_flags + (1 - cur_flag);
+			int32_t* flag_write = d_flags + cur_flag;
+			int32_t* flag_reset = d_flags + (1 - cur_flag);
 
 			voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, flag_write, flag_reset);
 
@@ -71,7 +71,7 @@ void cuda_compute_voronoi(const int W,
 		}
 
 		int32_t h_flag = 0;
-		cudaMemcpy(&h_flag, d_flags + (1 - cur_flag), sizeof(uint8_t), cudaMemcpyDeviceToHost);
+		cudaMemcpy(&h_flag, d_flags + (1 - cur_flag), sizeof(int32_t), cudaMemcpyDeviceToHost);
 		if (!h_flag) break;
 	}
 

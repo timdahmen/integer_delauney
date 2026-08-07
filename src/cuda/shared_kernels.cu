@@ -174,8 +174,8 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 									int32_t* __restrict__ dst_raw,
 									const int W,
 									const int H,
-									uint8_t* __restrict__ flag_write,
-									uint8_t* __restrict__ flag_reset_for_next) {
+									int32_t* __restrict__ flag_write,
+									int32_t* __restrict__ flag_reset_for_next) {
 	if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
 		*flag_reset_for_next = 0;
 	}
@@ -190,6 +190,7 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 	const int tile_x = threadIdx.x + 1;
 	const int tile_y = threadIdx.y + 1;
 
+	// load own cell and potentially neighbour cell into shared mem
 	tile[tile_y][tile_x] = load_cell(x, y, W, H, src);
 	if (threadIdx.x == 0)
 		tile[tile_y][0] = load_cell(x - 1, y, W, H, src);
@@ -206,12 +207,13 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 	Cell cur = tile[tile_y][tile_x];
 	Cell best = cur;
 
-	const int dx[4] = {-1, 1, 0, 0};
-	const int dy[4] = {0, 0, -1, 1};
+	// find best neighbour
+	constexpr int dx[4] = {-1, 1, 0, 0};
+	constexpr int dy[4] = {0, 0, -1, 1};
 	for (int k = 0; k < 4; ++k) {
 		Cell neighbor = tile[tile_y + dy[k]][tile_x + dx[k]];
 		if (neighbor.id == UNDEF) continue;
-		int32_t n_d = neighbor.distance + 1;
+		const int32_t n_d = neighbor.distance + 1;
 		if (best.id == UNDEF || beats(best.id, best.distance, neighbor.id, n_d)) {
 			best.id = neighbor.id;
 			best.distance = n_d;
@@ -221,6 +223,6 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 	dst[y * W + x] = best;
 
 	if (best.id != cur.id || best.distance != cur.distance) {
-		*flag_write = 1;
+		atomicOr(flag_write, 1);
 	}
 }

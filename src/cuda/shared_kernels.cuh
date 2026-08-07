@@ -72,5 +72,5 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 									int32_t* __restrict__ dst_raw,
 									const int W,
 									const int H,
-									uint8_t* __restrict__ flag_write,
-									uint8_t* __restrict__ flag_reset_for_next);
+									int32_t* __restrict__ flag_write,
+									int32_t* __restrict__ flag_reset_for_next);
