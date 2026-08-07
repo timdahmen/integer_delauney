@@ -21,15 +21,13 @@
 #include <thrust/functional.h>
 #include <thrust/iterator/zip_iterator.h>
 #include <thrust/sort.h>
-#include <thrust/tuple.h>	
+#include <thrust/tuple.h>
 #include <thrust/unique.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
-
-using MergeKey = IncrementalDelaunay::MergeKey;
 
 // ---------------------------------------------------------------------------
 // Internal types (parallel to triangulation.cu and voronoi.cu internals)
@@ -62,36 +60,6 @@ struct KeyLess {
 struct KeyEqual {
 	__host__ __device__ bool operator()(const Vec3i& x, const Vec3i& y) const {
 		return x.a == y.a && x.b == y.b && x.c == y.c;
-	}
-};
-
-struct MergeLess {
-	__host__ __device__ bool operator()(const MergeKey& x, const MergeKey& y) const {
-		if (x.a != y.a) return x.a < y.a;
-		if (x.b != y.b) return x.b < y.b;
-		if (x.c != y.c) return x.c < y.c;
-		return x.is_new > y.is_new; // new tri first, if same a,b,c
-	}
-};
-
-struct MergeEqual {
-	__host__ __device__ bool operator()(const MergeKey& x, const MergeKey& y) const {
-		return x.a == y.a && x.b == y.b && x.c == y.c;
-	}
-};
-
-struct IsNew {
-	__host__ __device__ bool operator()(const MergeKey& k) const { return k.is_new != 0; }
-};
-
-struct IsDirty {
-	const int32_t* dirty_mask;
-	int W;
-	bool use;
-	__host__ __device__ bool operator()(const thrust::tuple<Vec2i, Vec3i>& t) const {
-		const Vec2i p = thrust::get<0>(t);
-		const bool inside = dirty_mask[p.y * W + p.x] != 0;
-		return use ? inside : !inside;
 	}
 };
 
@@ -130,7 +98,6 @@ __device__ __forceinline__ bool beats(const int32_t a_id, const int32_t a_d, con
 // ---------------------------------------------------------------------------
 
 __global__ void write_seeds_kernel(int32_t* __restrict__ grid,
-								   int32_t* __restrict__ changed_mask,
 								   const int W,
 								   const Vec2i* __restrict__ new_pos,
 								   int32_t base_id,
@@ -141,9 +108,6 @@ __global__ void write_seeds_kernel(int32_t* __restrict__ grid,
 	const int cell_idx = y * W + x;
 	grid[cell_idx * 2] = base_id + i;
 	grid[cell_idx * 2 + 1] = 0;
-	// Mark the seed cell as changed so the dirty mask expansion
-	// covers detection positions that touch the seed cell directly.
-	changed_mask[cell_idx] = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,8 +119,7 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 									const int W,
 									const int H,
 									uint8_t* __restrict__ flag_write,
-									uint8_t* __restrict__ flag_reset_for_next,
-									int32_t* __restrict__ changed_mask) {
+									uint8_t* __restrict__ flag_reset_for_next) {
 	if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
 		*flag_reset_for_next = 0;
 	}
@@ -203,34 +166,9 @@ __global__ void voronoi_step_kernel(const int32_t* __restrict__ src_raw,
 
 	if (best.id != cur.id || best.distance != cur.distance) {
 		*flag_write = 1;
-		// No atomicOr needed here: (y*W+x) is unique per thread, address never written multiple threads,
-		changed_mask[y * W + x] = 1;
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Kernel: dirty mask = changed mask dilated by 2 in each direction
-// ---------------------------------------------------------------------------
-
-__global__ void
-dilate_dirty_mask_kernel(const int32_t* __restrict__ changed, int32_t* __restrict__ dirty_mask, const int W, const int H) {
-	const int x = blockIdx.x * blockDim.x + threadIdx.x;
-	const int y = blockIdx.y * blockDim.y + threadIdx.y;
-	if (x >= W || y >= H) return;
-
-	const int x0 = max(0, x - 2), x1 = min(W - 1, x + 2);
-	const int y0 = max(0, y - 2), y1 = min(H - 1, y + 2);
-
-	int32_t hit = 0;
-	for (int sy = y0; sy <= y1 && !hit; ++sy)
-		for (int sx = x0; sx <= x1; ++sx)
-			if (changed[sy * W + sx]) {
-				hit = 1;
-				break;
-			}
-
-	dirty_mask[y * W + x] = hit; // only writes own pixel, this avoids need for atomic (can write 0 or 1)
-}
 
 // ---------------------------------------------------------------------------
 // Kernel: L-shape triangle detection with optional mask
@@ -244,13 +182,10 @@ __global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_g
 										   Vec3i* __restrict__ raw_key,
 										   Vec3i* __restrict__ raw_orig,
 										   int32_t* __restrict__ counter,
-										   const int cap,
-										   const int32_t* __restrict__ mask) // nullptr -> all pixels
-{
+										   const int cap) {
 	const int x = blockIdx.x * blockDim.x + threadIdx.x;
 	const int y = blockIdx.y * blockDim.y + threadIdx.y;
 	if (x >= W || y >= H) return;
-	if (mask && !mask[y * W + x]) return;
 
 	auto idx = [&](const int cx, const int cy) -> int32_t { return voronoi_grid[(cy * W + cx) * 2]; };
 
@@ -258,6 +193,7 @@ __global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_g
 		if (a == UNDEF || b == UNDEF || c == UNDEF) return;
 		if (a == b || a == c || b == c) return;
 		const int32_t pos = atomicAdd(counter, 1);
+		if (pos >= cap) return; // check for overflow
 		int32_t sa = a, sb = b, sc = c;
 		if (sa > sb) {
 			const int32_t t = sa;
@@ -292,44 +228,15 @@ __global__ void find_triangle_seeds_kernel(const int32_t* __restrict__ voronoi_g
 }
 
 // ---------------------------------------------------------------------------
-// Kernel: build MergeKeys (sorted triplet + tag) from orig array
-// ---------------------------------------------------------------------------
-
-__global__ void
-build_merge_keys_kernel(MergeKey* __restrict__ keys, const Vec3i* __restrict__ orig, int n, const bool is_new) {
-	const int i = blockIdx.x * blockDim.x + threadIdx.x;
-	if (i >= n) return;
-
-	const auto [a, b, c] = orig[i];
-	int32_t sa = a, sb = b, sc = c;
-	if (sa > sb) {
-		const int32_t t = sa;
-		sa = sb;
-		sb = t;
-	}
-	if (sb > sc) {
-		const int32_t t = sb;
-		sb = sc;
-		sc = t;
-	}
-	if (sa > sb) {
-		const int32_t t = sa;
-		sa = sb;
-		sb = t;
-	}
-	keys[i] = {sa, sb, sc, is_new};
-}
-
-// ---------------------------------------------------------------------------
 // Kernel: triangle-centric rasterisation (1 block per triangle)
 // ---------------------------------------------------------------------------
 
 __global__ void rasterize_tri_kernel2(int32_t* __restrict__ canvas,
-									 const int W,
-									 const Vec2i* __restrict__ seed_pos,
-									 const Vec3i* __restrict__ tri_seed_ids,
-									 const int n_tris) {
-	const int warp_id = threadIdx.x / 32;	// 32 = warp size
+									  const int W,
+									  const Vec2i* __restrict__ seed_pos,
+									  const Vec3i* __restrict__ tri_seed_ids,
+									  const int n_tris) {
+	const int warp_id = threadIdx.x / 32; // 32 = warp size
 	const int lane_id = threadIdx.x % 32;
 	const int tri_id = blockIdx.x * RASTER_TRIS_PER_BLOCK + warp_id;
 	if (tri_id >= n_tris) return;
@@ -362,11 +269,11 @@ __global__ void rasterize_tri_kernel2(int32_t* __restrict__ canvas,
 // ---------------------------------------------------------------------------
 // TODO: same as triangulation, put in shared file
 __global__ void build_output_kernel2(int32_t* __restrict__ out,
-									 const int32_t* __restrict__ voronoi_grid,
-									 const int32_t* __restrict__ canvas,
-									 const int N,
-									 const int default_id) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
+									const int32_t* __restrict__ voronoi_grid,
+									const int32_t* __restrict__ canvas,
+									const int N,
+									const int default_id) {
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= N) return;
 	const int32_t tri_id = canvas[i];
 	out[i * 3] = voronoi_grid[i * 2];
@@ -379,7 +286,7 @@ __global__ void build_triangle_map_out2(TriangleEntry* __restrict__ out,
 									   const Vec2i* __restrict__ tri_xy,
 									   const Vec3i* __restrict__ tri_og_seeds,
 									   const int N) {
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	const int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if (i >= N) return;
 	const auto [x, y] = tri_xy[i];
 	const auto [a, b, c] = tri_og_seeds[i];
@@ -391,45 +298,33 @@ __global__ void build_triangle_map_out2(TriangleEntry* __restrict__ out,
 // ---------------------------------------------------------------------------
 
 IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds) :
-	W_(width), H_(height), N_(0), max_seeds_(max_seeds), reg_cur_(0), N_tri_(0) {
+	W_(width), H_(height), N_(0), max_seeds_(max_seeds), N_tri_(0) {
 	if (width <= 0 || height <= 0 || max_seeds <= 0)
 		throw std::invalid_argument("dimensions and max_seeds must be positive");
 
 	const size_t N = W_ * H_;
 
-	reg_cap_ = 3 * max_seeds_; // theoretical max = 2*V - 5 faces, but triangle detection method has duplicates -> 3x
+	// theoretical max = 2*V - 5 faces, but this detection method produces
+	// more than a strict planar triangulation -> generous 3x margin
+	tri_cap_ = 3 * max_seeds_;
 	det_cap_ = 4 * N;
-	mrg_cap_ = 2 * reg_cap_;
 
 	cudaMalloc(&d_grid_, N * 2 * sizeof(int32_t));
 	cudaMalloc(&d_tmp_, N * 2 * sizeof(int32_t));
-	cudaMalloc(&d_changed_, N * sizeof(int32_t));
-	cudaMalloc(&d_dirty_, N * sizeof(int32_t));
 	cudaMalloc(&d_updated_flag_, 2 * sizeof(uint8_t));
 	cudaMalloc(&d_seed_pos_, max_seeds_ * sizeof(Vec2i));
 	cudaMalloc(&d_t_grid_, N * sizeof(int32_t));
-
-	cudaMalloc(&d_reg_xy_[0], reg_cap_ * sizeof(Vec2i));
-	cudaMalloc(&d_reg_orig_[0], reg_cap_ * sizeof(Vec3i));
-	cudaMalloc(&d_reg_xy_[1], reg_cap_ * sizeof(Vec2i));
-	cudaMalloc(&d_reg_orig_[1], reg_cap_ * sizeof(Vec3i));
 
 	cudaMalloc(&d_det_xy_, det_cap_ * sizeof(Vec2i));
 	cudaMalloc(&d_det_key_, det_cap_ * sizeof(Vec3i));
 	cudaMalloc(&d_det_orig_, det_cap_ * sizeof(Vec3i));
 	cudaMalloc(&d_counter_, sizeof(int32_t));
 
-	cudaMalloc(&d_mrg_key_, mrg_cap_ * sizeof(MergeKey));
-	cudaMalloc(&d_mrg_xy_, mrg_cap_ * sizeof(Vec2i));
-	cudaMalloc(&d_mrg_orig_, mrg_cap_ * sizeof(Vec3i));
-
-	cudaMalloc(&d_out_map_, reg_cap_ * sizeof(TriangleEntry));
+	cudaMalloc(&d_out_map_, tri_cap_ * sizeof(TriangleEntry));
 	cudaMalloc(&d_out_grid_, N * 3 * sizeof(int32_t));
 
 	cudaMemset(d_grid_, UNDEF, N * 2 * sizeof(int32_t));
 	cudaMemset(d_t_grid_, UNDEF, N * sizeof(int32_t));
-	cudaMemset(d_changed_, 0, N * sizeof(int32_t));
-	cudaMemset(d_dirty_, 0, N * sizeof(int32_t));
 	cudaMemset(d_updated_flag_, 0, 2 * sizeof(uint8_t));
 
 	h_seed_pos_.reserve(max_seeds_);
@@ -440,22 +335,13 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds) :
 IncrementalDelaunay::~IncrementalDelaunay() {
 	cudaFree(d_grid_);
 	cudaFree(d_tmp_);
-	cudaFree(d_changed_);
-	cudaFree(d_dirty_);
 	cudaFree(d_updated_flag_);
 	cudaFree(d_seed_pos_);
 	cudaFree(d_t_grid_);
-	cudaFree(d_reg_xy_[0]);
-	cudaFree(d_reg_orig_[0]);
-	cudaFree(d_reg_xy_[1]);
-	cudaFree(d_reg_orig_[1]);
 	cudaFree(d_det_xy_);
 	cudaFree(d_det_key_);
 	cudaFree(d_det_orig_);
 	cudaFree(d_counter_);
-	cudaFree(d_mrg_key_);
-	cudaFree(d_mrg_xy_);
-	cudaFree(d_mrg_orig_);
 	cudaFree(d_out_map_);
 	cudaFree(d_out_grid_);
 }
@@ -483,7 +369,7 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 			uint8_t* flag_write = d_updated_flag_ + cur_flag;
 			uint8_t* flag_reset = d_updated_flag_ + (1 - cur_flag);
 
-			voronoi_step_kernel<<<grid_dim, block>>>(d_grid_, d_tmp_, W_, H_, flag_write, flag_reset, d_changed_);
+			voronoi_step_kernel<<<grid_dim, block>>>(d_grid_, d_tmp_, W_, H_, flag_write, flag_reset);
 			std::swap(d_grid_, d_tmp_);
 			cur_flag = 1 - cur_flag;
 		}
@@ -506,7 +392,7 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out) {
 // full_triangulate_: detect → dedup → assign
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::triangulate_(const bool is_first, float* det_ms, float* dedup_ms, float* asgn_ms) {
+void IncrementalDelaunay::triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms) {
 	const int N = W_ * H_;
 	dim3 block(16, 16);
 	dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
@@ -535,7 +421,7 @@ void IncrementalDelaunay::triangulate_(const bool is_first, float* det_ms, float
 	if (det_ms) rc(e0);
 	cudaMemset(d_counter_, 0, sizeof(int32_t));
 	find_triangle_seeds_kernel<<<grid_dim, block>>>(d_grid_, W_, H_, d_det_xy_, d_det_key_, d_det_orig_, d_counter_,
-													det_cap_, is_first ? nullptr : d_dirty_);
+													det_cap_);
 	int32_t raw_count = 0;
 	cudaMemcpy(&raw_count, d_counter_, sizeof(int32_t), cudaMemcpyDeviceToHost);
 	if (raw_count > det_cap_) throw std::runtime_error("triangle detection overflowed the scratch buffer");
@@ -556,80 +442,10 @@ void IncrementalDelaunay::triangulate_(const bool is_first, float* det_ms, float
 		n_new = static_cast<int>(det_end.first - det_key);
 	}
 
-	// split the active triangle registry for tris in dirty mask or not
+	if (n_new > tri_cap_)
+		throw std::runtime_error("triangle count exceeded expected capacity (3 * max_seeds); raise max_seeds");
 
-	Vec2i* src_xy = d_reg_xy_[reg_cur_];
-	Vec3i* src_orig = d_reg_orig_[reg_cur_];
-	Vec2i* dst_xy = d_reg_xy_[1 - reg_cur_];
-	Vec3i* dst_orig = d_reg_orig_[1 - reg_cur_];
-
-	thrust::device_ptr<Vec2i> reg_xy(src_xy);
-	thrust::device_ptr<Vec3i> reg_orig(src_orig);
-	auto reg_begin = thrust::make_zip_iterator(thrust::make_tuple(reg_xy, reg_orig));
-
-	thrust::device_ptr<Vec2i> out_xy(dst_xy);
-	thrust::device_ptr<Vec3i> out_orig(dst_orig);
-	auto out_begin = thrust::make_zip_iterator(thrust::make_tuple(out_xy, out_orig));
-
-	thrust::device_ptr<Vec2i> mrg_xy(d_mrg_xy_);
-	thrust::device_ptr<Vec3i> mrg_orig(d_mrg_orig_);
-	auto mrg_begin = thrust::make_zip_iterator(thrust::make_tuple(mrg_xy, mrg_orig));
-
-	int n_kept = 0, n_masked = 0;
-	if (N_tri_ > 0) {
-		// copy every triangle whose corner is outside the dirty mask into dst
-		auto kept_end = thrust::copy_if(reg_begin, reg_begin + N_tri_, out_begin, IsDirty{d_dirty_, W_, false});
-		n_kept = static_cast<int>(kept_end - out_begin);
-
-		// copy every triangle whose corner is inside the dirty mask into merge buffer
-		auto masked_end =
-			thrust::copy_if(reg_begin, reg_begin + N_tri_, mrg_begin, IsDirty{d_dirty_, W_, true});
-		n_masked = static_cast<int>(masked_end - mrg_begin);
-	}
-
-	if (n_masked + n_new > mrg_cap_) throw std::runtime_error("triangle merge overflowed the temp buffer");
-
-	if (n_new > 0) {
-		// append new Tris, after the in dirty mask survivors
-		cudaMemcpy(d_mrg_xy_ + n_masked, d_det_xy_, n_new * sizeof(Vec2i), cudaMemcpyDeviceToDevice);
-		cudaMemcpy(d_mrg_orig_ + n_masked, d_det_orig_, n_new * sizeof(Vec3i), cudaMemcpyDeviceToDevice);
-	}
-
-	const int n_merge = n_masked + n_new;
-	int n_survivors = 0;
-
-	if (n_merge > 0) {
-		// build keys to sort on (add is new tag)
-		MergeKey* mrg_key = d_mrg_key_;
-		constexpr int n_threads = 256;
-		// TODO mby pass is_new as separate array?
-		if (n_masked > 0) {
-			const int n_blocks = (n_masked + n_threads - 1) / n_threads;
-			build_merge_keys_kernel<<<n_blocks, n_threads>>>(mrg_key, d_mrg_orig_, n_masked, false);
-		}
-		if (n_new > 0) {
-			const int n_blocks = (n_new + n_threads - 1) / n_threads;
-			build_merge_keys_kernel<<<n_blocks, n_threads>>>(mrg_key + n_masked, d_mrg_orig_ + n_masked, n_new, true);
-		}
-
-		thrust::device_ptr<MergeKey> key_ptr(mrg_key);
-		thrust::sort_by_key(thrust::cuda::par_nosync, key_ptr, key_ptr + n_merge, mrg_begin, MergeLess{});
-		auto uniq_end = thrust::unique_by_key(key_ptr, key_ptr + n_merge, mrg_begin, MergeEqual{});
-		const int n_groups = uniq_end.first - key_ptr;
-
-		// append valid tris
-		auto surv_end =
-			thrust::copy_if(mrg_begin, mrg_begin + n_groups, key_ptr, out_begin + n_kept, IsNew{});
-		n_survivors = surv_end - (out_begin + n_kept);
-	}
-
-	const int n_total = n_kept + n_survivors;
-	if (n_total > reg_cap_)
-		throw std::runtime_error("triangle count exceeded registry capacity (2 * max_seeds); "
-								 "raise max_seeds");
-
-	reg_cur_ = 1 - reg_cur_; // swap active tri registry
-	N_tri_ = n_total;
+	N_tri_ = n_new;
 	if (det_ms) rc(e3);
 
 	// rasterize
@@ -641,7 +457,7 @@ void IncrementalDelaunay::triangulate_(const bool is_first, float* det_ms, float
 		static constexpr int threads_per_block = RASTER_TRIS_PER_BLOCK * 32;
 		static_assert(threads_per_block <= 1024, "threads per block exceeds max");
 		const int n_blocks = (N_tri_ + RASTER_TRIS_PER_BLOCK - 1) / RASTER_TRIS_PER_BLOCK;
-		rasterize_tri_kernel2<<<n_blocks, threads_per_block>>>(d_t_grid_, W_, d_seed_pos_, d_reg_orig_[reg_cur_], N_tri_);
+		rasterize_tri_kernel2<<<n_blocks, threads_per_block>>>(d_t_grid_, W_, d_seed_pos_, d_det_orig_, N_tri_);
 	}
 	if (det_ms) rc(e5);
 
@@ -665,13 +481,12 @@ void IncrementalDelaunay::triangulate_(const bool is_first, float* det_ms, float
 void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
 										 std::vector<int32_t>& tgrid_out) const {
 	const int N = W_ * H_;
-	constexpr int threads_per_block = 1024;
+	constexpr int threads_per_block = 32;
 
 	tri_map_out.resize(N_tri_);
 	if (N_tri_ > 0) {
 		const int n_blocks = (N_tri_ + threads_per_block - 1) / threads_per_block;
-		build_triangle_map_out2<<<n_blocks, threads_per_block>>>(d_out_map_, d_reg_xy_[reg_cur_], d_reg_orig_[reg_cur_],
-																 N_tri_);
+		build_triangle_map_out2<<<n_blocks, threads_per_block>>>(d_out_map_, d_det_xy_, d_det_orig_, N_tri_);
 	}
 
 	const int32_t default_id = N_tri_ - 1;
@@ -724,6 +539,7 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 		if (!seen.insert(key).second) throw std::invalid_argument("duplicate seed positions within batch");
 		// Duplicate check within batch
 		if (h_seed_set_.count(key)) throw std::invalid_argument("seed position already exists");
+
 		batch[i] = {x, y};
 	}
 
@@ -735,50 +551,19 @@ void IncrementalDelaunay::insert(const std::vector<int32_t>& new_xs,
 		h_seed_set_.insert(pack_xy_(batch[i].x, batch[i].y));
 	}
 	N_ += k;
-
 	cudaMemcpy(d_seed_pos_ + base_id, batch.data(), k * sizeof(Vec2i), cudaMemcpyHostToDevice);
 
-	// Reset change accumulator before writing seeds (so seed positions
-	// are the first entries in d_changed_ — necessary for partial_triangulate_
-	// to cover detection positions that touch the seed cell directly).
-	const size_t N = W_ * H_;
-	cudaMemset(d_changed_, 0, N * sizeof(int32_t));
-
-	// Write seeds into grid (also marks seed cells in d_changed_)
-	write_seeds_kernel<<<(k + 255) / 256, 256>>>(d_grid_, d_changed_, W_, d_seed_pos_ + base_id, base_id, k);
+	// Write seeds into grid
+	write_seeds_kernel<<<(k + 255) / 256, 256>>>(d_grid_, W_, d_seed_pos_ + base_id, base_id, k);
 
 	// BFS
 	float bfs_ms = 0.f;
 	run_bfs_(timings ? &bfs_ms : nullptr);
-
-	if (!is_first) {
-		cudaEvent_t d0 = nullptr, d1 = nullptr;
-		if (timings) {
-			cudaEventCreate(&d0);
-			cudaEventCreate(&d1);
-			cudaEventRecord(d0);
-		}
-
-		dim3 block(16, 16);
-		dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
-		// only need mask dilation for non first insert
-		dilate_dirty_mask_kernel<<<grid_dim, block>>>(d_changed_, d_dirty_, W_, H_);
-
-		if (timings) {
-			cudaEventRecord(d1);
-			cudaEventSynchronize(d1);
-			float ms = 0.f;
-			cudaEventElapsedTime(&ms, d0, d1);
-			bfs_ms += ms; // dilation is charged to the BFS phase
-			cudaEventDestroy(d0);
-			cudaEventDestroy(d1);
-		}
-	}
 	if (timings) timings->bfs_ms = bfs_ms;
 
 	// Triangulate
 	float det_ms = 0.f, dup_ms = 0.f, asgn_ms = 0.f;
-	triangulate_(is_first, timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr, timings ? &asgn_ms : nullptr);
+	triangulate_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr, timings ? &asgn_ms : nullptr);
 
 	if (timings) {
 		timings->detect_ms = det_ms;
