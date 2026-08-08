@@ -139,37 +139,38 @@ baseline:
 --------------------------------------------------------------
     3. RegularDelaunay -- CUDA
 --------------------------------------------------------------
-    compute()  (warm-up excluded)                              43.1 ms
+    compute()  (warm-up excluded)                              42.0 ms
 
 --------------------------------------------------------------
     5. GridTriangulation -- CUDA (full pipeline incl. assignment)
 --------------------------------------------------------------
-    compute_timed()  (detection + dedup + assignment)         194.4 ms
+    compute_timed()  (detection + dedup + assignment)         212.7 ms
 
     GPU sub-phase breakdown:
-      detect (find_triangle_seeds kernel)                      1.0 ms
-      dedup  (thrust sort + unique)                            6.3 ms
-      assign (assign_triangles kernel)                        48.7 ms
+      detect (find_triangle_seeds kernel)                      1.3 ms
+      dedup  (thrust sort + unique)                            6.5 ms
+      assign (assign_triangles kernel)                        58.0 ms
 
 --------------------------------------------------------------
     6. IncrementalDelaunay -- CUDA
 --------------------------------------------------------------
-    insert_timed()  cold  (all seeds, full triangulate)      4906.0 ms
+    insert_timed()  cold  (all seeds, full triangulate)      5409.2 ms
 
     GPU sub-phase breakdown (cold):
-      bfs    (BFS until convergence)                           3.6 ms
-      detect (find_triangle_seeds kernel)                      0.3 ms
-      dedup  (thrust sort + unique)                            5.6 ms
-      assign (assign_triangles kernel)                        62.4 ms
+      bfs    (BFS until convergence)                          28.1 ms
+      detect (find_triangle_seeds kernel)                      0.9 ms
+      dedup  (thrust sort + unique)                           37.7 ms
+      assign (assign_triangles kernel)                       198.0 ms
 
-    insert_timed()  warm  (single seed, avg over 9)          306.6 ms
+    insert_timed()  warm  (single seed, avg over 9)          293.6 ms
 
     GPU sub-phase breakdown (warm, avg):
-      bfs                                                      7.5 ms
-      detect                                                   0.0 ms
-      dedup                                                    0.0 ms
-      assign                                                   0.0 ms
+      bfs                                                      0.9 ms
+      detect                                                   0.1 ms
+      dedup                                                    0.2 ms
+      assign                                                   1.6 ms
 ```
+> Timings don't contain all the CPU side compute
 
 after optimizations:
 ```
@@ -181,33 +182,31 @@ after optimizations:
 --------------------------------------------------------------
     5. GridTriangulation -- CUDA (full pipeline incl. assignment)
 --------------------------------------------------------------
-    compute_timed()  (detection + dedup + assignment)         141.7 ms
+    compute_timed()  (detection + dedup + assignment)         123.7 ms
 
     GPU sub-phase breakdown:
       detect (find_triangle_seeds kernel)                      0.2 ms
-      dedup  (thrust sort + unique)                           15.2 ms
+      dedup  (thrust sort + unique)                            8.7 ms
       assign (assign_triangles kernel)                         0.6 ms
 
 --------------------------------------------------------------
     6. IncrementalDelaunay -- CUDA
 --------------------------------------------------------------
-    insert_timed()  cold  (all seeds, full triangulate)       159.5 ms
-      Seeds inserted                                        100,000
-      Triangles found                                       240,261
+    insert_timed()  cold  (all seeds, full triangulate)       141.2 ms
 
     GPU sub-phase breakdown (cold):
-      bfs    (BFS until convergence)                           1.1 ms
-      detect (find_triangle_seeds kernel)                      0.2 ms
-      dedup  (thrust sort + unique)                           10.5 ms
+      bfs    (BFS until convergence)                           1.5 ms
+      detect (find_triangle_seeds kernel)                      0.3 ms
+      dedup  (thrust sort + unique)                            4.3 ms
       assign (assign_triangles kernel)                         0.6 ms
 
-    insert_timed()  warm  (single seed, avg over 5)           84.6 ms
+    insert_timed()  warm  (single seed, avg over 9)          133.6 ms
 
     GPU sub-phase breakdown (warm, avg):
-      bfs                                                      0.4 ms
-      detect                                                   0.2 ms
-      dedup                                                    3.1 ms
-      assign                                                   0.5 ms
+      bfs                                                      0.5 ms
+      detect                                                   0.3 ms
+      dedup                                                    3.8 ms
+      assign                                                   0.9 ms
 
 ```
 
