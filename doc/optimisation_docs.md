@@ -196,18 +196,18 @@ after optimizations:
       Triangles found                                       240,261
 
     GPU sub-phase breakdown (cold):
-      bfs    (BFS until convergence)                           0.0 ms
-      detect (find_triangle_seeds kernel)                      0.0 ms
-      dedup  (thrust sort + unique)                            0.0 ms
-      assign (assign_triangles kernel)                         0.0 ms
+      bfs    (BFS until convergence)                           1.1 ms
+      detect (find_triangle_seeds kernel)                      0.2 ms
+      dedup  (thrust sort + unique)                           10.5 ms
+      assign (assign_triangles kernel)                         0.6 ms
 
-    insert_timed()  warm  (single seed, avg over 9)          129.2 ms
+    insert_timed()  warm  (single seed, avg over 5)           84.6 ms
 
     GPU sub-phase breakdown (warm, avg):
-      bfs                                                      0.0 ms
-      detect                                                   0.0 ms
-      dedup                                                    0.0 ms
-      assign                                                   0.0 ms
+      bfs                                                      0.4 ms
+      detect                                                   0.2 ms
+      dedup                                                    3.1 ms
+      assign                                                   0.5 ms
 
 ```
 
