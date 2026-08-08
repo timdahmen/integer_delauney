@@ -78,6 +78,11 @@ optimization commit. HEAD is `e5f75ab`.
 The two untouched phases are listed deliberately: detection and dedup were
 already sub-7 ms and were correctly left alone.
 
+These figures, and the whole progression in §3, are measured at `e5f75ab`. The
+CSR capacity fix that followed it
+([`85834_review_notes.md`](85834_review_notes.md) finding 1) is correctness-only
+and costs ~0.9 ms on the cold insert; it does not move any other row.
+
 ---
 
 ## 3. Per-commit progression
@@ -237,10 +242,14 @@ Additionally verified during this session:
 - `GridTriangulation` matches the CPU reference triangle count (235 652) on every
   run.
 - `compute-sanitizer --tool memcheck` reports **0 errors** for the whole
-  incremental pipeline at a workload within the CSR capacity bound
-  (256 × 256, 5 000 seeds). At workloads that exceed it, it does not — see
-  [`85834_review_notes.md`](85834_review_notes.md) finding 1, which is the one
-  result in this document that needs action.
+  incremental pipeline, at the default workload and at the high-density
+  workloads that previously overran the CSR device buffers (128² / 12 000 seeds
+  went from 710 invalid writes to zero). That overrun is
+  [`85834_review_notes.md`](85834_review_notes.md) finding 1; it was found during
+  this documentation pass and has since been fixed. It never affected the
+  configuration measured here, so every number in this document stands — the fix
+  adds ~0.9 ms to `full: rebuild_csr` on the cold insert and nothing to the warm
+  path (§7).
 
 ---
 
@@ -248,23 +257,28 @@ Additionally verified during this session:
 
 Host wall-clock breakdown from the shipped build, representative run.
 
-### Cold insert (114 ms)
+### Cold insert (112 ms)
 
 | phase | ms | % |
 | --- | ---: | ---: |
-| `full: assign` | 33.68 | 30.6 |
-| `full: build registry` | 17.08 | 15.5 |
-| `outputs: D2H grids` | 15.33 | 13.9 |
-| `full: D2H dedup triangles` | 9.31 | 8.5 |
-| `insert: register seeds` | 6.05 | 5.5 |
-| `full: dedup` | 6.01 | 5.5 |
-| `insert: validate seeds` | 5.92 | 5.4 |
-| `full: rebuild_csr` | 5.50 | 5.0 |
-| `insert: bfs` | 3.84 | 3.5 |
-| `insert: write_seeds kernel` | 3.11 | 2.8 |
-| `outputs: interleave` | 2.50 | 2.3 |
-| everything else | 1.75 | 1.6 |
-| **accounted total** | **110.08** | |
+| `full: assign` | 33.16 | 29.7 |
+| `full: build registry` | 17.50 | 15.7 |
+| `outputs: D2H grids` | 15.33 | 13.8 |
+| `full: D2H dedup triangles` | 9.33 | 8.4 |
+| `full: rebuild_csr` | 6.39 | 5.7 |
+| `insert: register seeds` | 6.33 | 5.7 |
+| `full: dedup` | 6.21 | 5.6 |
+| `insert: validate seeds` | 6.07 | 5.4 |
+| `insert: bfs` | 3.83 | 3.4 |
+| `insert: write_seeds kernel` | 3.15 | 2.8 |
+| `outputs: interleave` | 2.41 | 2.2 |
+| everything else | 1.76 | 1.6 |
+| **accounted total** | **111.46** | |
+
+`full: rebuild_csr` carries the one-time `cudaMalloc` pair added by the CSR
+capacity fix ([`85834_review_notes.md`](85834_review_notes.md) finding 1); it was
+5.50 ms before that change. The warm path is unaffected — see the `partial:
+rebuild_csr` row below.
 
 ### Warm insert (58 ms)
 

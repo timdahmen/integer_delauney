@@ -319,7 +319,7 @@ void assign_triangles_kernel(
 // ---------------------------------------------------------------------------
 
 IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds)
-    : W_(width), H_(height), N_(0), max_seeds_(max_seeds)
+    : W_(width), H_(height), N_(0), max_seeds_(max_seeds), d_csr_idx_(nullptr), d_csr_verts_cache_(nullptr), csr_capacity_(0)
 {
     if (width <= 0 || height <= 0 || max_seeds <= 0)
         throw std::invalid_argument("dimensions and max_seeds must be positive");
@@ -333,15 +333,12 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds)
     cudaMalloc(&d_raw_buf_,      (size_t)N * 4          * sizeof(RawTriangle));
     cudaMalloc(&d_t_grid_,       (size_t)N              * sizeof(int32_t));
     cudaMalloc(&d_csr_ptr_,      (size_t)(max_seeds + 1)* sizeof(int32_t));
-    cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 8  * sizeof(int32_t));
     cudaMalloc(&d_updated_flag_, 1                      * sizeof(int32_t));
     cudaMalloc(&d_mask_,         (size_t)N              * sizeof(int32_t));
 
     cudaMemset(d_grid_,    -1, (size_t)N * 2 * sizeof(int32_t));  // UNDEF
     cudaMemset(d_t_grid_,  -1, (size_t)N     * sizeof(int32_t));
     cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t));
-
-    cudaMalloc(&d_csr_verts_cache_,  (size_t)max_seeds * 8  * sizeof(CsrEntryVertexCache));
 
     // Pinned host allocations. Warning, these are expensive 
     cudaHostAlloc(&p_changed_,  (size_t)N     * sizeof(int32_t), cudaHostAllocDefault);
@@ -450,6 +447,22 @@ void IncrementalDelaunay::rebuild_csr_and_upload_()
             fill[s]++;
         }
     }
+
+    // Courtesy of Claude
+    // It makes sense, I had underappreciated the amount possible (being 3 vertices per triangle)
+    if ((size_t)csr_size > csr_capacity_) {
+        if (csr_capacity_ > 0) {
+            cudaFree(d_csr_idx_);
+            cudaFree(d_csr_verts_cache_);
+        }
+
+        size_t want = (size_t)csr_size + csr_size / 2;   // 1.5x, so this stops firing
+        
+        cudaMalloc(&d_csr_idx_,         want * sizeof(int32_t));
+        cudaMalloc(&d_csr_verts_cache_, want * sizeof(CsrEntryVertexCache));
+        csr_capacity_ = want;
+    }
+
     cudaMemcpy(d_csr_ptr_, h_csr_ptr.data(), (N_+1)*sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_csr_idx_, h_csr_idx.data(),  csr_size*sizeof(int32_t), cudaMemcpyHostToDevice);
 

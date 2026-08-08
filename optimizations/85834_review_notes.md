@@ -13,15 +13,24 @@
 
 **Short version:** the branch is correct at the workload it is benchmarked and
 submitted against — `--verify` passes, `compute-sanitizer` is clean, triangle
-output is identical to baseline at every commit. There is one real latent bug
-(finding 1), one reporting gap that a grader is likely to notice (finding 2),
-and a handful of nits.
+output is identical to baseline at every commit. One real latent bug was found
+(finding 1); it has since been **fixed by the author** and the fix is verified
+below. What remains is one reporting gap that a grader is likely to notice
+(finding 2) and a handful of nits.
 
 ---
 
-## 1. CSR device buffers overflow at high seed density — **latent bug, partly new**
+## 1. CSR device buffers overflowed at high seed density — **fixed**
 
-`IncrementalDelaunay`'s constructor sizes two device buffers off `max_seeds`:
+> **Status: fixed.** Diagnosed by Claude during the documentation pass;
+> implemented by the author in the same commit that carries this file. The
+> analysis below is kept because it explains *why* the original bound was wrong,
+> which is the part that is easy to get wrong again. Verification of the fix is
+> at the end of the section.
+
+### The problem
+
+`IncrementalDelaunay`'s constructor sized two device buffers off `max_seeds`:
 
 ```cpp
 // incremental.cu
@@ -29,14 +38,24 @@ cudaMalloc(&d_csr_idx_,          (size_t)max_seeds * 8 * sizeof(int32_t));
 cudaMalloc(&d_csr_verts_cache_,  (size_t)max_seeds * 8 * sizeof(CsrEntryVertexCache));
 ```
 
-The size actually needed is `csr_size = 3 × T`, where `T` is the triangle count.
-So the code is assuming `T ≤ 8/3 × max_seeds ≈ 2.67 × max_seeds`. Nothing checks
-it, and there is no CUDA error checking to catch it after the fact.
+The size actually needed is `csr_size = 3 × T`, where `T` is the **triangle**
+count (`h_triangles_.size()`, the "Triangles found" line in the harness) — not
+the seed count. It is `3 × T` because the CSR maps *seed → triangles touching
+that seed*, and every triangle has exactly three vertices, so every triangle is
+inserted into exactly three seeds' lists. The counting loop in
+`rebuild_csr_and_upload_` says as much by incrementing three counters per
+triangle, and `triangulation.cu:389` spells it out: `// == 3 * N_triangles`.
+
+So `max_seeds * 8` was asserting `3T ≤ 8 × max_seeds`, i.e.
+**`T ≤ 2.67 × N_seeds`** — roughly "each seed touches at most 8 triangles".
+Nothing checked it, and there is no CUDA error checking to catch a violation
+after the fact.
 
 That assumption does not hold. `T/N_seeds` is not bounded by the planar-graph
 `2N` rule here, because these are grid-detected L-shape triangles rather than a
-true Delaunay triangulation — and the ratio rises as seeds get dense relative to
-the grid. Measured:
+true Delaunay triangulation. Detection emits up to four triangles per pixel, so
+as seeds get dense relative to the grid, `T` stops tracking seeds and starts
+tracking *pixels* — the ratio climbs toward 4:
 
 | grid | seeds | triangles | `T`/seeds | `csr_size` | capacity | |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
@@ -49,6 +68,19 @@ the grid. Measured:
 | 128² | 12 000 | 41 042 | 3.42 | 123 126 | 96 232 | **over** |
 
 (Capacity assumes the harness's own `cap = N + warm + 20`, i.e. `max_seeds ≈ N`.)
+
+Sweeping seed density on a fixed grid shows where the ceiling actually is:
+
+| grid | seeds | density | `T`/seeds |
+| --- | ---: | ---: | ---: |
+| 64² | 1 000 | 24 % | 2.55 |
+| 64² | 2 000 | 49 % | 2.90 |
+| 64² | 3 000 | 73 % | 3.35 |
+| 64² | 3 800 | 93 % | **3.73** |
+
+The true worst case is **4**, not 2.67 — four L-shape orientations per pixel,
+approached as density → 100 %. The 8× bound starts failing somewhere around
+25–30 % seed density. The submitted workload sits at 9.5 %.
 
 Confirmed with the sanitizer, which reports both halves of the failure:
 
@@ -79,19 +111,60 @@ Two distinct problems:
   cache slot is 12 bytes rather than 4, the overrun is 3× the size of the
   pre-existing one, and unlike a rejected `cudaMemcpy` it actually writes.
 
-Worth being clear about scope: **the submitted configuration is not affected.**
-At 1024² / 100 000 seeds the buffer is 89 % full, the sanitizer is clean, and
-every number in [`85834_measurements.md`](85834_measurements.md) is valid. But
-89 % is thin headroom for a bound nothing enforces, and the batch path in
-`triangulation.cu` does not share the problem — there `d_csr_idx` and
+Worth being clear about scope: **the submitted benchmark configuration was never
+affected.** At 1024² / 100 000 seeds the buffer was 89 % full, the sanitizer was
+clean, and every number in [`85834_measurements.md`](85834_measurements.md) was
+and remains valid. But 89 % is thin headroom for a bound nothing enforced. The
+batch path in `triangulation.cu` never had the problem — there `d_csr_idx` and
 `d_csr_verts_cache` are allocated at the exact `csr_size`, because it is known by
-then.
+the time they are needed.
 
-Options, in ascending order of effort: assert on `csr_size` against the capacity
-so the failure is loud rather than silent; raise the multiplier; or size the two
-buffers lazily from `csr_size` and grow them when it increases, matching what
-`triangulation.cu` already does. Your call which is worth it before hand-in — the
-one-line assert would at least make the limit visible.
+### The fix
+
+`rebuild_csr_and_upload_` already computes the exact `csr_size` before it uploads
+anything, so the guess was never necessary. Both buffers were dropped from the
+constructor and are now grown on demand from the real value, with 1.5× headroom
+so the reallocation stops firing after the first insert:
+
+```cpp
+if ((size_t)csr_size > csr_capacity_) {
+    if (csr_capacity_ > 0) {
+        cudaFree(d_csr_idx_);
+        cudaFree(d_csr_verts_cache_);
+    }
+    size_t want = (size_t)csr_size + csr_size / 2;   // 1.5x, so this stops firing
+    cudaMalloc(&d_csr_idx_,         want * sizeof(int32_t));
+    cudaMalloc(&d_csr_verts_cache_, want * sizeof(CsrEntryVertexCache));
+    csr_capacity_ = want;
+}
+```
+
+It sits after the `h_csr_idx` build loop and before both `cudaMemcpy` calls and
+the `build_csr_verts_kernel` launch, which is the only correct position for it.
+`d_csr_ptr_` is unchanged at `max_seeds + 1` — it is indexed by seed, and
+`N_ ≤ max_seeds_` is already enforced by the existing throw in `insert()`.
+
+### Verification of the fix
+
+| check | before | after |
+| --- | --- | --- |
+| `compute-sanitizer`, 128² / 12 000 seeds | 710 invalid writes + rejected `cudaMemcpy` | **0 errors** |
+| `compute-sanitizer`, 256² / 5 000 seeds (within old bound) | 0 errors | 0 errors |
+| 1024²/300k, 512²/150k, 256²/40k | silent corruption | run clean |
+| `--verify` at the default workload | pass | pass — triplet sets identical, 150 px (0.014 %) |
+| `GridTriangulation` full | 84.9 ms | 85.1 ms |
+| `Incremental cold` | 111.3 ms | 112.1 ms |
+| `Incremental warm` | 57.5 ms | 57.9 ms |
+| `full: rebuild_csr` (cold) | 5.50 ms | 6.39 ms |
+| `partial: rebuild_csr` (warm) | 5.35 ms | 5.35 ms |
+
+The cost is one `cudaMalloc` pair on the cold insert — about 0.9 ms on a 112 ms
+path. `partial: rebuild_csr` is unchanged, which is the load-bearing measurement:
+warm inserts add roughly three CSR slots each, so with 1.5× growth they never
+reallocate. Also checked: with fewer than three seeds `csr_size` is 0, the
+reallocation does not fire and both pointers stay null; `cudaMemcpy` with a zero
+byte count is a no-op and the kernel launch is already guarded by
+`if (csr_size > 0)`, so `n = 1, 2, 3, 5` run clean under the sanitizer.
 
 ## 2. The warm GPU sub-phase table always prints 0.0 — **reporting gap, pre-existing**
 
@@ -198,9 +271,10 @@ table. The protocol is written up in
 ## 6. Smaller things
 
 **No CUDA error checking anywhere.** Not one `cudaMalloc`, `cudaMemcpy` or kernel
-launch is checked, project-wide and pre-existing. This is why finding 1 produces
-a plausible-looking wrong answer instead of a crash. Out of scope for an
-optimization submission, but it is the reason a real failure is invisible.
+launch is checked, project-wide and pre-existing. This is why finding 1 produced
+a plausible-looking wrong answer instead of a crash, and why it took a sanitizer
+run to see it at all. Out of scope for an optimization submission, but it is the
+reason a real failure would be invisible.
 
 **`shared_utils.cuh` is listed in `DELAUNEY_CUDA_SOURCES`.** A header in a source
 list. CMake treats the unknown extension as header-only so it builds fine, and it

@@ -85,7 +85,8 @@ private:
     int32_t* d_csr_idx_;           // (max_seeds*8) CSR triangle IDs
     int32_t* d_updated_flag_;      // (1)     BFS convergence flag
     int32_t* d_mask_;              // (H*W)   reused for border / reassign masks
-    void*    d_csr_verts_cache_;   // (max_seeds*8 * sizeof(CsrEntryVertexCache)) vert for each CSR entry
+    void*    d_csr_verts_cache_;   // vert for each CSR entry
+    size_t   csr_capacity_;        // size for d_csr_verts_cache_
 
     // ---- persistent pinned host staging buffers ----
     int32_t* p_changed_  = nullptr;  // (N)    D2H  BFS change mask
