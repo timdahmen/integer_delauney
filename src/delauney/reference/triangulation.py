@@ -8,10 +8,25 @@ class GridTriangulation:
 
     Scans the grid for left+down L-shapes where all three Voronoi regions
     differ, deduplicates by sorted seed-ID triplet, then assigns each cell
-    to its containing triangle via a center-point test.
+    to its containing triangle by testing the pixel's integer coordinate.
 
-    Known limitation: 4-region meetings produce only 1 triangle (the one
-    detected by the left+down scan) instead of the geometrically complete 2.
+    Pixel convention: a pixel (x, y) is represented by the point (x, y), NOT by
+    its centre (x+0.5, y+0.5).  This matches the CUDA implementation
+    (``triangulation.cu``, ``assign_triangles_kernel``) and, critically, matches
+    where seeds live: a seed at (5, 7) means pixel (5, 7) was sampled, so
+    evaluating there reproduces the measured value exactly.  Under a centre
+    convention an interpolator evaluating at integer coordinates disagrees with
+    the measurement at the very pixels that were sampled.
+
+    Pixels that no triangle contains keep the sentinel -1 in the triangle_id
+    channel, so callers can tell "no containing triangle" from a real triangle.
+
+    Known limitations, both of which leave pixels with no containing triangle:
+      * 4-region meetings produce only 1 triangle (the one detected by the
+        left+down scan) instead of the geometrically complete 2;
+      * a triangle is only detected where three Voronoi regions meet, i.e. at
+        its circumcenter, so boundary triangles whose circumcenter falls outside
+        the image are missed entirely unless ``border_padding`` exposes them.
     """
 
     def compute(
@@ -78,10 +93,64 @@ class GridTriangulation:
         triangle_map: dict[int, tuple] = {}
         next_id = 0
 
+        # Step 2a: cocircular (4-region) meetings.
+        #
+        # A 2x2 block whose four cells belong to four *different* Voronoi
+        # regions is a degree-4 Voronoi vertex — i.e. four cocircular seeds.
+        # Such a quad has two equally valid Delaunay triangulations (one per
+        # diagonal), but the four L-shape orientations below would each report a
+        # different triple and register ALL FOUR, which is over-complete: it
+        # yields overlapping triangles and a pixel can then land in several at
+        # once.  Pick one diagonal and blacklist the other's two triples.
+        #
+        # Choice rule (deterministic, and matching the CUDA implementation):
+        # the shorter diagonal wins; on an exact tie — which is the usual case,
+        # since the points are cocircular — take the diagonal that does *not*
+        # contain the lowest seed id.  The lowest id lies in exactly one
+        # diagonal, so this is always well defined.
+        blocked: set[frozenset] = set()
+        _tl, _tr = n_grid[:-1, :-1], n_grid[:-1, 1:]
+        _bl, _br = n_grid[1:, :-1], n_grid[1:, 1:]
+        _quad = ((_tl != _tr) & (_tl != _bl) & (_tl != _br)
+                 & (_tr != _bl) & (_tr != _br) & (_bl != _br))
+
+        for ry, rx in zip(*np.where(_quad)):
+            ids = [int(_tl[ry, rx]), int(_tr[ry, rx]),
+                   int(_bl[ry, rx]), int(_br[ry, rx])]
+            pts = np.array([sorted_seeds[i] for i in ids], dtype=np.float64)
+
+            # Cyclic order around the centroid so that "diagonal" means
+            # opposite corners rather than adjacent ones.
+            centre = pts.mean(axis=0)
+            order = sorted(range(4), key=lambda k: np.arctan2(pts[k, 1] - centre[1],
+                                                             pts[k, 0] - centre[0]))
+            d0 = (order[0], order[2])
+            d1 = (order[1], order[3])
+
+            def _len2(pair):
+                p, q = pts[pair[0]], pts[pair[1]]
+                return float((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2)
+
+            if _len2(d0) < _len2(d1):
+                chosen = d0
+            elif _len2(d1) < _len2(d0):
+                chosen = d1
+            else:
+                lowest = min(range(4), key=lambda k: ids[k])
+                chosen = d1 if lowest in d0 else d0
+
+            # The rejected diagonal (r, s) spans the two triangles {r,s,p} and
+            # {r,s,q}, where (p, q) is the chosen diagonal — block exactly those.
+            rejected = d1 if chosen is d0 else d0
+            for k in chosen:
+                blocked.add(frozenset({ids[rejected[0]], ids[rejected[1]], ids[k]}))
+
         def _register(gx: int, gy: int, a: int, b: int, c: int) -> None:
             nonlocal next_id
             triplet = frozenset({a, b, c})
             if len(triplet) < 3:
+                return
+            if triplet in blocked:
                 return
             if triplet not in seen_triplets:
                 seen_triplets[triplet] = next_id
@@ -126,37 +195,35 @@ class GridTriangulation:
         for ry, rx in zip(*np.where(mask)):
             _register(rx + 1, ry + 1, int(s_left[ry, rx]), int(s_cell[ry, rx]), int(s_up[ry, rx]))
 
-        # Step 4: assign each cell to a triangle via center-point test.
+        # Step 4: assign each cell to a triangle by testing its integer
+        # coordinate (x, y) — not its centre.  See the class docstring: this
+        # matches the CUDA kernel and keeps seeds, assignment and downstream
+        # evaluation on one convention.
         #
         # We test ALL triangles for each pixel, not just those that share the
         # pixel's Voronoi seed_id.  Restricting to seed-id neighbours is an
-        # incorrect optimisation: a pixel in Manhattan Voronoi region A can
-        # geometrically lie inside a Euclidean triangle (B,C,D) where A is not
-        # a vertex, because Manhattan and Euclidean Voronoi boundaries differ.
+        # incorrect optimisation: a pixel in Voronoi region A can geometrically
+        # lie inside a triangle (B,C,D) where A is not a vertex.
         #
         # Tie between multiple containing triangles → highest id wins.
-        # Fallback for pixels outside the convex hull (no triangle contains the
-        # center): assign the triangle with the globally highest id so that
-        # every cell always has a valid assignment.
-
-        all_tids = list(triangle_map.keys())
-        max_tid_global = max(all_tids) if all_tids else -1
+        # Pixels no triangle contains keep -1.  There is deliberately no
+        # "fold into the highest id" fallback: that would make "outside the
+        # convex hull" indistinguishable from "inside the hull but its triangle
+        # was never detected" (see the limitations in the class docstring), and
+        # both need the same nearest-seed handling downstream anyway.
 
         tri_id_grid = np.full((H, W), -1, dtype=np.int32)
 
         for y in range(H):
             for x in range(W):
-                cx = x + 0.5
-                cy = y + 0.5
-
                 best_tid = -1
                 for tid, (_, _, a, b, c) in triangle_map.items():
-                    if _point_in_triangle(cx, cy, sorted_seeds[a],
+                    if _point_in_triangle(x, y, sorted_seeds[a],
                                           sorted_seeds[b], sorted_seeds[c]):
                         if best_tid == -1 or tid > best_tid:
                             best_tid = tid
 
-                tri_id_grid[y, x] = best_tid if best_tid != -1 else max_tid_global
+                tri_id_grid[y, x] = best_tid
 
         # Step 5: build output grid
         tgrid = np.empty((H, W, 3), dtype=np.int32)

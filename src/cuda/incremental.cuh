@@ -61,7 +61,16 @@ private:
     std::vector<int32_t>            h_sx_, h_sy_;
     std::unordered_set<uint64_t>    h_seed_set_;   // fast duplicate check
 
+    // Internal seed ids are assigned in INSERTION order, because previously
+    // inserted seeds must keep their ids for the incremental device state
+    // (d_grid_, d_t_grid_, the triangle registry and the CSR) to stay valid.
+    // The batch pipeline instead numbers seeds in sorted (x asc, y asc) order.
+    // h_sorted_rank_[internal_id] gives that sorted id, and outputs are
+    // translated through it so both pipelines expose the same numbering.
+    std::vector<int32_t>            h_sorted_rank_;
+
     // ---- private helpers ----
+    void rebuild_sorted_rank_();
     void run_bfs_(float* bfs_ms_out);
     void full_triangulate_(float* detect_ms, float* dedup_ms, float* assign_ms);
     void partial_triangulate_(float* detect_ms, float* dedup_ms, float* assign_ms);

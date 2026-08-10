@@ -30,6 +30,12 @@ static constexpr int32_t UNDEFINED = -1;
 
 // Compare two (seed_id, distance) candidates; return true if b beats a.
 // Winner criterion: lower distance wins; on tie, higher seed_id wins.
+//
+// NOTE: "higher seed_id wins" only applies among candidates this cell actually
+// sees, i.e. seeds owned by its four neighbours.  A tied seed that never
+// propagates adjacent to the cell cannot win it, so an individual tie may
+// resolve differently here than in the NumPy reference, which sweeps in a
+// different order.  Both results are correct Voronoi assignments.
 __device__ __forceinline__
 bool beats(int32_t a_id, int32_t a_d, int32_t b_id, int32_t b_d)
 {

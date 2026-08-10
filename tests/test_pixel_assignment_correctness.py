@@ -1,12 +1,11 @@
 """Correctness test: every pixel must be assigned to the triangle that
-geometrically contains its center point (x+0.5, y+0.5).
+geometrically contains its integer coordinate (x, y).
 
-Ground truth is computed by testing each pixel center against EVERY triangle
+Ground truth is computed by testing each pixel against EVERY triangle
 (brute-force, O(H*W*T)) rather than restricting to triangles that share the
-pixel's Voronoi seed_id.  When a pixel center lies inside multiple triangles
+pixel's Voronoi seed_id.  When a pixel lies inside multiple triangles
 (on a shared edge) the one with the highest triangle_id wins, matching the
-algorithm spec.  Pixels outside the convex hull of all seeds (no triangle
-contains them) are exempt from the assertion.
+algorithm spec.  Pixels no triangle contains are exempt from the assertion.
 """
 import numpy as np
 import pytest
@@ -17,17 +16,16 @@ from delauney.reference.triangulation import GridTriangulation, _point_in_triang
 def _ground_truth(W, H, tri_map, sorted_seeds):
     """Return an (H, W) int32 array of correct triangle_ids.
 
-    -1 means the pixel center lies outside all triangles (no expectation).
+    -1 means the pixel lies outside all triangles (no expectation).
     """
     gt = np.full((H, W), -1, dtype=np.int32)
     seed_arr = np.array(sorted_seeds, dtype=np.float64)
 
     for y in range(H):
         for x in range(W):
-            cx, cy = x + 0.5, y + 0.5
             best = -1
             for tid, (_, _, a, b, c) in tri_map.items():
-                if _point_in_triangle(cx, cy, seed_arr[a], seed_arr[b], seed_arr[c]):
+                if _point_in_triangle(x, y, seed_arr[a], seed_arr[b], seed_arr[c]):
                     if best == -1 or tid > best:
                         best = tid
             gt[y, x] = best

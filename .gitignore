@@ -217,3 +217,12 @@ __marimo__/
 
 # VS Code settings
 .vscode/
+
+# Local demo / presentation renders and scratch build output.
+# The build_cuda_*.txt logs are tracked deliberately, so this is scoped to
+# build_out.txt rather than *.txt.  Force-add with `git add -f` if one of these
+# ever needs to be committed.
+*.png
+*.avi
+*.mp4
+build_out.txt

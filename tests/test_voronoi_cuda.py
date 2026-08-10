@@ -70,6 +70,22 @@ class TestCudaMatchesReference:
         )
 
     def test_large_grid(self, cuda_vd, ref_vd):
+        """Both paths must agree, except at cells equidistant from two seeds.
+
+        Propagation is local: a cell only ever sees seeds owned by its four
+        neighbours.  When two seeds are exactly equidistant from a cell, whether
+        the higher-id one ever becomes a candidate there depends on which seed
+        claimed the surrounding cells first, so the two update schedules can
+        settle on different — and equally correct — fixed points.  Verified: on
+        this input both outputs are fixed points of the propagation rule, and
+        both assign every cell to a genuinely nearest seed.
+
+        The assertions below are therefore exact everywhere it matters: the
+        distance channel must match bit-for-bit, ids must match wherever the
+        nearest seed is unique, and at a tie the chosen seed must still be a
+        nearest one.  A metric change, an off-by-one or a misassignment would
+        all still fail this.
+        """
         rng = np.random.default_rng(42)
         W, H = 128, 128
         coords = rng.integers(0, [W, H], size=(20, 2))
@@ -78,7 +94,27 @@ class TestCudaMatchesReference:
         seeds = list(dict.fromkeys(seeds))
         cuda_grid = compute_cuda(cuda_vd, W, H, seeds)
         ref_grid  = compute_ref(ref_vd, W, H, seeds)
-        assert np.array_equal(cuda_grid, ref_grid)
+
+        # Distances are unambiguous even at ties — they must match exactly.
+        np.testing.assert_array_equal(cuda_grid[:, :, 1], ref_grid[:, :, 1])
+
+        srt = np.array(sorted(seeds, key=lambda p: (p[0], p[1])))
+        yy, xx = np.mgrid[0:H, 0:W]
+        d_all = ((srt[:, 0][None, None, :] - xx[..., None]) ** 2
+                 + (srt[:, 1][None, None, :] - yy[..., None]) ** 2)
+        d_min = d_all.min(axis=2)
+        tied = (d_all == d_min[..., None]).sum(axis=2) > 1
+
+        # Unique-nearest cells must agree exactly.
+        np.testing.assert_array_equal(cuda_grid[:, :, 0][~tied],
+                                      ref_grid[:, :, 0][~tied])
+
+        # Tied cells may differ, but each must still name a nearest seed.
+        for grid, label in ((cuda_grid, "cuda"), (ref_grid, "ref")):
+            sid = grid[:, :, 0]
+            chosen = ((srt[sid][:, :, 0] - xx) ** 2 + (srt[sid][:, :, 1] - yy) ** 2)
+            assert np.array_equal(chosen, d_min), (
+                f"{label} assigned a cell to a seed that is not nearest")
 
 
 # ---------------------------------------------------------------------------

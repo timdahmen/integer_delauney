@@ -9,7 +9,16 @@ class RegularDelaunay:
     """Computes an L2-distance (Euclidean) Voronoi diagram on an integer grid.
 
     Seed IDs are assigned in ascending X order, tiebroken by ascending Y.
-    At equidistant cells the higher seed ID wins.
+
+    At equidistant cells the propagation *prefers* the higher seed ID, but this
+    is not guaranteed: propagation is local, so a cell only ever sees seeds
+    owned by its four neighbours.  If the lower-id seed claims the surrounding
+    cells first, the higher-id one never becomes a candidate there.  Both
+    outcomes are correct Voronoi assignments (the cell still gets a nearest
+    seed) and both are fixed points of the rule, but it means the CUDA
+    implementation, which uses a different update schedule, may resolve an
+    individual tie differently.  Do not assume bit-equality between the two at
+    equidistant cells; see tests/test_voronoi_cuda.py::test_large_grid.
 
     The distance channel stores squared L2 distance (avoids sqrt; int32 safe
     for grids up to ~46000x46000).

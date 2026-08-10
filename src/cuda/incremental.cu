@@ -111,7 +111,9 @@ void voronoi_step_kernel(
     int32_t* __restrict__       dst,
     int W, int H,
     int32_t* __restrict__ updated_flag,
-    int32_t* __restrict__ changed_mask)
+    int32_t* __restrict__ changed_mask,
+    const int32_t* __restrict__ seed_xs,
+    const int32_t* __restrict__ seed_ys)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -127,8 +129,16 @@ void voronoi_step_kernel(
         int nx = x + dx[k], ny = y + dy[k];
         if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
         int nb = (ny * W + nx) * 2;
-        int32_t n_id = src[nb], n_d = src[nb + 1] + 1;
+        int32_t n_id = src[nb];
         if (n_id == UNDEF_SEED) continue;
+        // Squared L2 measured DIRECTLY from the neighbour's owning seed to this
+        // pixel — never accumulated along the BFS path.  Accumulating (+1 per
+        // step) yields a Manhattan diagram, which is what this kernel used to
+        // do; it was missed when the rest of the library moved to L2, leaving
+        // the incremental path computing a different metric from the batch one.
+        int32_t sdx = x - seed_xs[n_id];
+        int32_t sdy = y - seed_ys[n_id];
+        int32_t n_d = sdx * sdx + sdy * sdy;
         if (best_id == UNDEF_SEED || beats(best_id, best_d, n_id, n_d)) {
             best_id = n_id; best_d = n_d;
         }
@@ -226,9 +236,13 @@ void assign_triangles_kernel(
     if (x >= W || y >= H) return;
     if (mask && !mask[y * W + x]) return;
 
-    float px = x + 0.5f, py = y + 0.5f;
+    // Integer pixel convention, matching triangulation.cu and the NumPy
+    // reference: pixel (x, y) IS the point (x, y), not its centre.
+    float px = (float)x, py = (float)y;
+    // The distance channel holds SQUARED L2, so take a root to get back a
+    // linear search radius in pixels.
     int dist = grid[(y * W + x) * 2 + 1];
-    int R    = min(dist + WINDOW_SLACK, WINDOW_CAP);
+    int R    = min((int)sqrtf((float)max(dist, 0)) + WINDOW_SLACK, WINDOW_CAP);
 
     int32_t nearby[MAX_NEARBY];
     int n_nearby = 0;
@@ -318,7 +332,8 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out)
     for (;;) {
         cudaMemcpy(d_updated_flag_, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
         voronoi_step_kernel<<<grid_dim, block>>>(
-            d_grid_, d_tmp_, W_, H_, d_updated_flag_, d_changed_);
+            d_grid_, d_tmp_, W_, H_, d_updated_flag_, d_changed_,
+            d_sx_, d_sy_);
         cudaDeviceSynchronize();
         std::swap(d_grid_, d_tmp_);
 
@@ -581,6 +596,24 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
 }
 
 // ---------------------------------------------------------------------------
+// rebuild_sorted_rank_: internal (insertion) id → batch (sorted x,y) id
+// ---------------------------------------------------------------------------
+
+void IncrementalDelaunay::rebuild_sorted_rank_()
+{
+    std::vector<int32_t> order(N_);
+    for (int i = 0; i < N_; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [this](int32_t p, int32_t q) {
+        if (h_sx_[p] != h_sx_[q]) return h_sx_[p] < h_sx_[q];
+        return h_sy_[p] < h_sy_[q];
+    });
+
+    h_sorted_rank_.assign(N_, 0);
+    for (int rank = 0; rank < N_; ++rank)
+        h_sorted_rank_[order[rank]] = rank;
+}
+
+// ---------------------------------------------------------------------------
 // build_outputs_
 // ---------------------------------------------------------------------------
 
@@ -590,10 +623,17 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
     const int N = W_ * H_;
     int N_tri = (int)h_triangles_.size();
 
+    // Translate internal insertion-order ids to the batch pipeline's sorted
+    // numbering (see h_sorted_rank_).
+    auto ext = [this](int32_t internal) -> int32_t {
+        return (internal >= 0 && internal < (int32_t)h_sorted_rank_.size())
+             ? h_sorted_rank_[internal] : internal;
+    };
+
     tri_map_out.resize(N_tri);
     for (int tid = 0; tid < N_tri; ++tid) {
         const auto& t = h_triangles_[tid];
-        tri_map_out[tid] = {t.x, t.y, t.orig_a, t.orig_b, t.orig_c};
+        tri_map_out[tid] = {t.x, t.y, ext(t.orig_a), ext(t.orig_b), ext(t.orig_c)};
     }
 
     std::vector<int32_t> h_t(N), h_grid(N * 2);
@@ -602,7 +642,7 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
 
     tgrid_out.resize(N * 3);
     for (int i = 0; i < N; ++i) {
-        tgrid_out[i*3]   = h_grid[i*2];
+        tgrid_out[i*3]   = ext(h_grid[i*2]);
         tgrid_out[i*3+1] = h_grid[i*2+1];
         tgrid_out[i*3+2] = h_t[i];
     }
@@ -616,7 +656,16 @@ void IncrementalDelaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 {
     const int N = W_ * H_;
     out.resize(N * 2);
-    cudaMemcpy(out.data(), d_grid_, N * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    std::vector<int32_t> h_grid(N * 2);
+    cudaMemcpy(h_grid.data(), d_grid_, N * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+    // Same insertion→sorted id translation as build_outputs_.
+    for (int i = 0; i < N; ++i) {
+        int32_t sid = h_grid[i*2];
+        out[i*2]   = (sid >= 0 && sid < (int32_t)h_sorted_rank_.size())
+                   ? h_sorted_rank_[sid] : sid;
+        out[i*2+1] = h_grid[i*2+1];
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +712,7 @@ void IncrementalDelaunay::insert(
         h_seed_set_.insert(pack_xy_(new_xs[i], new_ys[i]));
     }
     N_ += k;
+    rebuild_sorted_rank_();
 
     // Upload new seed positions to persistent device arrays
     cudaMemcpy(d_sx_ + N_ - k, new_xs.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);

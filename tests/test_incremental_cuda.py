@@ -123,15 +123,19 @@ class TestSingleSeed:
         vg = inc.get_voronoi_grid()
         assert np.all(vg[:, :, 0] == 0), "All cells should belong to seed 0"
 
-    def test_voronoi_distances_manhattan(self):
+    def test_voronoi_distances_are_squared_l2(self):
+        """The distance channel stores squared Euclidean distance.
+
+        (Renamed from test_voronoi_distances_manhattan: this kernel accumulated
+        +1 per BFS step, which produces a Manhattan diagram, and was missed when
+        the rest of the library moved to L2.)
+        """
         inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
         inc.insert(self.SEED)
         vg = inc.get_voronoi_grid()
         sx, sy = self.SEED[0]
-        xs = np.arange(W)
-        ys = np.arange(H)
-        xx, yy = np.meshgrid(xs, ys)
-        expected = np.abs(xx - sx) + np.abs(yy - sy)
+        xx, yy = np.meshgrid(np.arange(W), np.arange(H))
+        expected = (xx - sx) ** 2 + (yy - sy) ** 2
         np.testing.assert_array_equal(vg[:, :, 1], expected.astype(np.int32))
 
     def test_no_triangles_single_seed(self):
@@ -194,11 +198,18 @@ class TestThreeSeeds:
         assert len(inc_set) == 1
         assert len(batch_set) == 1
 
-    def test_all_pixels_assigned(self):
+    def test_every_pixel_has_a_valid_id_or_the_sentinel(self):
+        """Ids are a real triangle index or -1 ("no triangle contains it").
+
+        Three seeds cannot cover the whole image, so -1 must occur.  This
+        replaces an assertion that every id was >= 0, which the CUDA kernel has
+        never satisfied — it writes -1 for unconfined pixels.
+        """
         inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
         tri_map, tgrid = inc.insert(self.SEEDS)
-        # Every pixel should have a valid triangle_id (0 here)
-        assert np.all(tgrid[:, :, 2] >= 0)
+        t = tgrid[:, :, 2]
+        assert np.all((t == -1) | ((t >= 0) & (t < len(tri_map))))
+        assert np.any(t >= 0)
 
     def test_tgrid_shape(self):
         inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)

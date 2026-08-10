@@ -151,10 +151,20 @@ class TestCudaTriangulationContract:
             assert t not in triplets, "duplicate triangle found"
             triplets.add(t)
 
-    def test_all_cells_assigned(self, cuda_vd, cuda_tri):
+    def test_every_cell_has_a_valid_id_or_the_sentinel(self, cuda_vd, cuda_tri):
+        """Ids are a real triangle index or -1 ("no triangle contains it").
+
+        Three seeds cannot cover a 10x10 image, so -1 must occur.  This replaces
+        an assertion that every id was >= 0, which the CUDA kernel has never
+        satisfied — it writes -1 for unconfined pixels
+        (``triangulation.cu``, ``assign_triangles_kernel``).
+        """
         seeds = [(1, 1), (8, 1), (4, 8)]
-        _, tgrid = run_cuda(cuda_vd, cuda_tri, 10, 10, seeds)
-        assert np.all(tgrid[:, :, 2] >= 0)
+        tri_map, tgrid = run_cuda(cuda_vd, cuda_tri, 10, 10, seeds)
+        t = tgrid[:, :, 2]
+        assert np.all((t == -1) | ((t >= 0) & (t < len(tri_map))))
+        assert np.any(t == -1)
+        assert np.any(t >= 0)
 
     def test_voronoi_channels_preserved(self, cuda_vd, cuda_tri):
         seeds = [(1, 1), (8, 1), (4, 8)]

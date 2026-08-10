@@ -31,11 +31,16 @@ class TestSingleSeed:
         g = compute(5, 5, [(2, 2)])
         assert np.all(grid_n(g) == 0)
 
-    def test_distances_are_manhattan(self):
+    def test_distances_are_squared_l2(self):
+        """The distance channel stores squared Euclidean distance, not Manhattan.
+
+        (Renamed from test_distances_are_manhattan: the metric changed to L2 but
+        the expectations here were never updated.)
+        """
         g = compute(5, 5, [(2, 2)])
         for y in range(5):
             for x in range(5):
-                expected = abs(x - 2) + abs(y - 2)
+                expected = (x - 2) ** 2 + (y - 2) ** 2
                 assert grid_d(g)[y, x] == expected, f"cell ({x},{y})"
 
     def test_seed_cell_has_distance_zero(self):
@@ -45,7 +50,7 @@ class TestSingleSeed:
     def test_single_seed_corner(self):
         g = compute(4, 4, [(0, 0)])
         assert grid_d(g)[0, 0] == 0
-        assert grid_d(g)[3, 3] == 6  # Manhattan distance from (0,0) to (3,3)
+        assert grid_d(g)[3, 3] == 18  # squared L2 from (0,0) to (3,3): 9 + 9
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +91,12 @@ class TestTwoSeeds:
         assert n[2] == 1
 
     def test_distances_from_respective_seeds(self):
+        """Distances are squared L2; on a single row that is dx**2."""
         g = compute(5, 1, [(0, 0), (4, 0)])
         d = grid_d(g)[0]
         assert d[0] == 0   # seed 0
         assert d[1] == 1
-        assert d[2] == 2   # equidistant: dist to winning seed (id=1 at x=4) is 2
+        assert d[2] == 4   # equidistant: dist to winning seed (id=1 at x=4) is 2**2
         assert d[3] == 1
         assert d[4] == 0   # seed 1
 

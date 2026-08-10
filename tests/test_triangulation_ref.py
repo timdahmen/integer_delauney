@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 from delauney.reference.voronoi import RegularDelaunay
-from delauney.reference.triangulation import GridTriangulation
+from delauney.reference.triangulation import GridTriangulation, _point_in_triangle
 
 _vd = RegularDelaunay()
 _tri = GridTriangulation()
@@ -43,9 +43,16 @@ class TestThreeSeeds:
         (_, (x, y, id_a, id_b, id_c)) = next(iter(tri_map.items()))
         assert {id_a, id_b, id_c} == {0, 1, 2}
 
-    def test_all_cells_assigned_to_triangle(self):
-        _, tgrid = make_voronoi_and_tri(10, 10, self.SEEDS)
-        assert np.all(tgrid[:, :, 2] >= 0)
+    def test_every_cell_has_a_valid_id_or_the_sentinel(self):
+        """Ids are either a real triangle index or -1 ("no triangle contains it").
+
+        Three seeds cannot cover a 10x10 image, so -1 must actually occur here.
+        """
+        tri_map, tgrid = make_voronoi_and_tri(10, 10, self.SEEDS)
+        t = tgrid[:, :, 2]
+        assert np.all((t == -1) | ((t >= 0) & (t < len(tri_map))))
+        assert np.any(t == -1)
+        assert np.any(t >= 0)
 
     def test_output_grid_preserves_n_and_d(self):
         vgrid = voronoi(10, 10, self.SEEDS)
@@ -116,12 +123,12 @@ class TestTriangleMapStructure:
 
 
 # ---------------------------------------------------------------------------
-# Center-point containment
+# Pixel containment (integer convention — see GridTriangulation docstring)
 # ---------------------------------------------------------------------------
 
-class TestCenterPointContainment:
+class TestPixelContainment:
     def test_seed_cells_assigned_to_triangle_containing_seed(self):
-        """Each seed cell center must lie within the triangle that uses its seed id."""
+        """Each seed pixel must lie within the triangle that uses its seed id."""
         seeds = [(1, 1), (8, 1), (4, 8)]
         tri_map, tgrid = make_voronoi_and_tri(10, 10, seeds)
         # All seed positions should have a valid triangle assigned
@@ -161,7 +168,124 @@ class TestOutputContract:
         _, tgrid = make_voronoi_and_tri(10, 10, seeds)
         assert tgrid.dtype == np.int32
 
-    def test_triangle_ids_non_negative(self):
+    def test_triangle_ids_are_valid_or_sentinel(self):
         seeds = [(1, 1), (8, 1), (4, 8)]
-        _, tgrid = make_voronoi_and_tri(10, 10, seeds)
-        assert np.all(tgrid[:, :, 2] >= 0)
+        tri_map, tgrid = make_voronoi_and_tri(10, 10, seeds)
+        t = tgrid[:, :, 2]
+        assert np.all((t == -1) | ((t >= 0) & (t < len(tri_map))))
+
+
+# ---------------------------------------------------------------------------
+# Outside-hull sentinel and the integer pixel convention
+# ---------------------------------------------------------------------------
+
+class TestOutsideHullSentinel:
+    """Pixels that no triangle contains carry -1, and only those pixels do.
+
+    There is deliberately no "fold into the highest triangle id" fallback: it
+    would make "outside the convex hull" indistinguishable from "inside the hull
+    but its triangle was never detected", and both need the same nearest-seed
+    handling downstream anyway.
+    """
+
+    SEEDS = [(1, 1), (8, 1), (4, 8)]
+
+    def _grids(self):
+        vgrid = _vd.compute(10, 10, self.SEEDS)
+        return _tri.compute(vgrid, self.SEEDS)
+
+    def test_sentinel_appears_where_no_triangle_covers(self):
+        _, tgrid = self._grids()
+        # One triangle cannot cover a 10x10 image.
+        assert np.any(tgrid[:, :, 2] == -1)
+
+    def test_sentinel_exactly_where_no_triangle_contains_the_pixel(self):
+        tri_map, tgrid = self._grids()
+        seeds = np.array(sorted(self.SEEDS), dtype=float)
+        t = tgrid[:, :, 2]
+        tris = [(a, b, c) for (_, _, a, b, c) in tri_map.values()]
+
+        for y in range(10):
+            for x in range(10):
+                covered = any(
+                    _point_in_triangle(x, y, seeds[a], seeds[b], seeds[c])
+                    for (a, b, c) in tris)
+                if t[y, x] == -1:
+                    assert not covered, f"({x},{y}) is -1 but lies in a triangle"
+                else:
+                    assert covered, f"({x},{y}) has an id but lies in no triangle"
+
+    def test_assigned_pixels_lie_in_their_own_triangle(self):
+        """Assignment uses the integer coordinate, so containment holds there."""
+        tri_map, tgrid = self._grids()
+        seeds = np.array(sorted(self.SEEDS), dtype=float)
+        t = tgrid[:, :, 2]
+
+        ys, xs = np.where(t >= 0)
+        for y, x in zip(ys, xs):
+            _, _, a, b, c = tri_map[int(t[y, x])]
+            assert _point_in_triangle(x, y, seeds[a], seeds[b], seeds[c]), (
+                f"({x},{y}) assigned a triangle that does not contain it")
+
+    def test_other_channels_untouched(self):
+        vgrid = _vd.compute(10, 10, self.SEEDS)
+        _, tgrid = _tri.compute(vgrid, self.SEEDS)
+        assert np.array_equal(vgrid[:, :, 0], tgrid[:, :, 0])
+        assert np.array_equal(vgrid[:, :, 1], tgrid[:, :, 1])
+
+
+# ---------------------------------------------------------------------------
+# Cocircular (degree-4 Voronoi vertex) quads
+# ---------------------------------------------------------------------------
+
+class TestCocircularQuad:
+    """Four cocircular seeds must yield ONE triangulation, not both diagonals.
+
+    The four L-shape orientations each report a different triple at a degree-4
+    Voronoi vertex.  Registering all four is over-complete: it produces
+    overlapping triangles, so a pixel can lie inside several at once and the
+    "highest id wins" tie-break silently picks between them.
+    """
+
+    @pytest.mark.parametrize("seeds,W,H", [
+        ([(1, 1), (8, 1), (1, 8), (8, 8)], 10, 10),
+        ([(0, 0), (4, 0), (0, 4), (4, 4)], 5, 5),
+        ([(2, 2), (12, 2), (2, 12), (12, 12)], 15, 15),
+    ])
+    def test_exactly_two_triangles(self, seeds, W, H):
+        vgrid = _vd.compute(W, H, seeds)
+        tri_map, _ = _tri.compute(vgrid, seeds)
+        assert len(tri_map) == 2, (
+            f"expected 2 triangles for a cocircular quad, got {len(tri_map)}: "
+            f"{[ (v[2],v[3],v[4]) for v in tri_map.values() ]}")
+
+    @pytest.mark.parametrize("seeds,W,H", [
+        ([(1, 1), (8, 1), (1, 8), (8, 8)], 10, 10),
+        ([(0, 0), (4, 0), (0, 4), (4, 4)], 5, 5),
+    ])
+    def test_triangles_share_exactly_one_edge(self, seeds, W, H):
+        """Two triangles of a quad must meet along a diagonal, not overlap."""
+        vgrid = _vd.compute(W, H, seeds)
+        tri_map, _ = _tri.compute(vgrid, seeds)
+        tris = [frozenset((v[2], v[3], v[4])) for v in tri_map.values()]
+        assert len(tris) == 2
+        shared = tris[0] & tris[1]
+        assert len(shared) == 2, f"triangles share {len(shared)} vertices, expected 2"
+        # Together they must use all four seeds exactly once as a quad.
+        assert tris[0] | tris[1] == {0, 1, 2, 3}
+
+    def test_no_pixel_lies_in_both_triangles(self):
+        """Over-registration showed up as pixels inside more than one triangle."""
+        seeds = [(1, 1), (8, 1), (1, 8), (8, 8)]
+        vgrid = _vd.compute(10, 10, seeds)
+        tri_map, _ = _tri.compute(vgrid, seeds)
+        pos = np.array(sorted(seeds), dtype=float)
+
+        for y in range(10):
+            for x in range(10):
+                n_containing = sum(
+                    _point_in_triangle(x, y, pos[a], pos[b], pos[c])
+                    for (_, _, a, b, c) in tri_map.values())
+                # 2 is legal only on the shared diagonal itself.
+                assert n_containing <= 2, (
+                    f"({x},{y}) lies inside {n_containing} triangles")
