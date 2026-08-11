@@ -33,7 +33,7 @@ class GridTriangulation:
         self,
         voronoi_grid: np.ndarray,
         seed_positions: list[tuple[int, int]],
-        border_padding: int = 0,
+        border_padding: int | None = None,
     ) -> tuple[dict, np.ndarray]:
         """Return (triangle_map, triangulation_grid).
 
@@ -51,6 +51,12 @@ class GridTriangulation:
             triangle detection so that border triangles whose Voronoi vertex
             lies outside the original image are not missed.  The output grid
             is always the original (H, W, 3) resolution.
+
+            None (the default) selects a value scaled to seed density via
+            ``delauney.auto_border_padding``.  Pass 0 to disable padding
+            explicitly — note that 0 means boundary triangles whose
+            circumcenter falls outside the image are never detected, and their
+            pixels degrade to nearest-seed with no error raised.
 
         Returns
         -------
@@ -70,7 +76,10 @@ class GridTriangulation:
         # outside the original image become visible and border triangles are
         # detected.  Shifting all seeds by (P, P) preserves lexicographic
         # order, so seed IDs stay consistent with sorted_seeds.
-        P = border_padding
+        if border_padding is None:
+            from delauney import auto_border_padding
+            border_padding = auto_border_padding(W, H, len(sorted_seeds))
+        P = max(0, int(border_padding))
         if P > 0:
             shifted = [(int(x) + P, int(y) + P) for x, y in sorted_seeds]
             pad_vgrid = _RefVoronoi().compute(W + 2 * P, H + 2 * P, shifted)
