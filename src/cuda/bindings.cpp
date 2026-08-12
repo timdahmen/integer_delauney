@@ -19,6 +19,7 @@
 #include "incremental.cuh"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -82,16 +83,27 @@ public:
 // GridTriangulation wrapper
 // ---------------------------------------------------------------------------
 
+// A negative border_padding means "pick one scaled to seed density", keeping
+// this path's default in step with the NumPy reference, where the same request
+// is spelled border_padding=None. Must match delauney.auto_border_padding:
+// sqrt(area / n_seeds). Leaving the default at a hard 0 made the missing
+// border-triangle limitation the automatic behaviour for every direct caller.
+static int resolve_border_padding(int border_padding, int W, int H, int N_seeds)
+{
+    if (border_padding >= 0) return border_padding;
+    if (N_seeds <= 0) return 0;
+    return static_cast<int>(std::lround(
+        std::sqrt(static_cast<double>(W) * static_cast<double>(H)
+                  / static_cast<double>(N_seeds))));
+}
+
 class PyGridTriangulation {
 public:
     py::tuple compute(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
         const py::object& seeds_obj,
-        int border_padding = 0)
+        int border_padding = -1)
     {
-        if (border_padding < 0)
-            throw std::invalid_argument("border_padding must be >= 0");
-
         auto info = vgrid.request();
         if (info.ndim != 3 || info.shape[2] != 2)
             throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
@@ -101,6 +113,7 @@ public:
 
         auto seeds = sort_seeds(seeds_obj, W, H);
         int N_seeds = static_cast<int>(seeds.size());
+        border_padding = resolve_border_padding(border_padding, W, H, N_seeds);
 
         std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
         for (int i = 0; i < N_seeds; ++i) {
@@ -123,11 +136,8 @@ public:
     py::tuple compute_timed(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
         const py::object& seeds_obj,
-        int border_padding = 0)
+        int border_padding = -1)
     {
-        if (border_padding < 0)
-            throw std::invalid_argument("border_padding must be >= 0");
-
         auto info = vgrid.request();
         if (info.ndim != 3 || info.shape[2] != 2)
             throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
@@ -137,6 +147,7 @@ public:
 
         auto seeds = sort_seeds(seeds_obj, W, H);
         int N_seeds = static_cast<int>(seeds.size());
+        border_padding = resolve_border_padding(border_padding, W, H, N_seeds);
         std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
         for (int i = 0; i < N_seeds; ++i) {
             seed_xs[i] = seeds[i].x;
@@ -167,11 +178,8 @@ public:
     py::tuple compute_debug(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
         const py::object& seeds_obj,
-        int border_padding = 0)
+        int border_padding = -1)
     {
-        if (border_padding < 0)
-            throw std::invalid_argument("border_padding must be >= 0");
-
         auto info = vgrid.request();
         if (info.ndim != 3 || info.shape[2] != 2)
             throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
@@ -181,6 +189,7 @@ public:
 
         auto seeds = sort_seeds(seeds_obj, W, H);
         int N_seeds = static_cast<int>(seeds.size());
+        border_padding = resolve_border_padding(border_padding, W, H, N_seeds);
         std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
         for (int i = 0; i < N_seeds; ++i) {
             seed_xs[i] = seeds[i].x;
@@ -327,24 +336,30 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def(py::init<>())
         .def("compute", &PyGridTriangulation::compute,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
-             py::arg("border_padding") = 0,
+             py::arg("border_padding") = -1,
              "Extract Delaunay triangulation from Voronoi grid.\n\n"
              "border_padding: extend the Voronoi by this many pixels in each\n"
              "direction before triangle detection so that border triangles whose\n"
              "Voronoi vertex lies outside the original image are not missed.\n"
+             "Negative (the default) picks a value scaled to seed density,\n"
+             "matching delauney.auto_border_padding and the NumPy reference's\n"
+             "border_padding=None. Pass 0 to disable padding explicitly - note\n"
+             "that 0 means border triangles whose circumcenter falls outside the\n"
+             "image are never detected, and their pixels degrade to nearest-seed\n"
+             "with no error raised.\n"
              "The output grid is always the original (H, W, 3) resolution.\n\n"
              "Returns (triangle_map, triangulation_grid) where "
              "triangle_map is {int: (x,y,id_a,id_b,id_c)} and "
              "triangulation_grid has shape (H, W, 3).")
         .def("compute_timed", &PyGridTriangulation::compute_timed,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
-             py::arg("border_padding") = 0,
+             py::arg("border_padding") = -1,
              "Same as compute() but also returns a timings dict.\n\n"
              "Returns (triangle_map, triangulation_grid, timings) where "
              "timings has keys detect_ms, dedup_ms, assign_ms (float, ms).")
         .def("compute_debug", &PyGridTriangulation::compute_debug,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
-             py::arg("border_padding") = 0,
+             py::arg("border_padding") = -1,
              "Same as compute() but also returns the padded Voronoi grid.\n\n"
              "Returns (triangle_map, triangulation_grid, padded_voronoi_grid) where "
              "padded_voronoi_grid has shape (H+2*P, W+2*P, 2).");

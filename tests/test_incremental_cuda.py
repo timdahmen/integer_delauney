@@ -39,12 +39,21 @@ MAX_SEEDS = 256
 # ---------------------------------------------------------------------------
 
 def batch_triangulate(seeds):
-    """Run the stateless batch pipeline and return (tri_set, tgrid, vgrid)."""
+    """Run the stateless batch pipeline and return (tri_set, tgrid, vgrid).
+
+    border_padding is pinned to 0 rather than left at the default. The batch
+    path defaults to a density-scaled padding, which recovers border triangles
+    whose circumcenter lies outside the image; IncrementalDelaunay has no
+    padding support at all, so with the default the batch side legitimately
+    finds triangles the incremental side cannot, and these equivalence tests
+    would be comparing two different feature sets rather than two
+    implementations of the same one.
+    """
     rd = _cu.RegularDelaunay()
     vgrid = rd.compute(W, H, seeds)
 
     gt = _cu.GridTriangulation()
-    tri_map, tgrid = gt.compute(vgrid, seeds)
+    tri_map, tgrid = gt.compute(vgrid, seeds, 0)
 
     tri_set = frozenset(
         tuple(sorted([v[2], v[3], v[4]])) for v in tri_map.values()

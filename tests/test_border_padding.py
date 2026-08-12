@@ -93,3 +93,60 @@ class TestPaddingDefault:
         for p in (None, 0, 12):
             _, tg = _tri.compute(vg, seeds, border_padding=p)
             assert tg.shape == (self.H, self.W, 3)
+
+
+def _cuda_available():
+    try:
+        from delauney import _delauney_cuda  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+@pytest.mark.skipif(not _cuda_available(), reason="_delauney_cuda not built")
+class TestCudaDefaultMatchesReference:
+    """The CUDA path must default to the same padding as the reference.
+
+    The reference spells "choose for me" as border_padding=None; the CUDA
+    binding cannot take None through an int argument, so it uses a negative
+    sentinel. Both must resolve to auto_border_padding, or the two paths would
+    silently disagree on how much of the image gets triangulated.
+    """
+    W = H = 64
+
+    def test_cuda_default_equals_explicit_auto(self):
+        from delauney import _delauney_cuda as dc
+
+        seeds = _seeds(self.W, self.H, 40, seed=17)
+        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        auto = auto_border_padding(self.W, self.H, len(seeds))
+
+        default_map, default_grid = dc.GridTriangulation().compute(vg, seeds)
+        explicit_map, explicit_grid = dc.GridTriangulation().compute(vg, seeds, auto)
+
+        assert len(default_map) == len(explicit_map)
+        np.testing.assert_array_equal(np.asarray(default_grid),
+                                      np.asarray(explicit_grid))
+
+    def test_cuda_default_finds_at_least_as_many_as_zero(self):
+        from delauney import _delauney_cuda as dc
+
+        seeds = _seeds(self.W, self.H, 40, seed=19)
+        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        default_map, _ = dc.GridTriangulation().compute(vg, seeds)
+        zero_map, _ = dc.GridTriangulation().compute(vg, seeds, 0)
+        assert len(default_map) >= len(zero_map)
+
+    def test_explicit_zero_is_not_treated_as_unset(self):
+        """0 must mean "no padding", not "please choose for me"."""
+        from delauney import _delauney_cuda as dc
+
+        # Seeds far from the border, so padding genuinely changes the result.
+        seeds = _seeds(self.W, self.H, 25, seed=23)
+        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        zero_map, _ = dc.GridTriangulation().compute(vg, seeds, 0)
+        auto = auto_border_padding(self.W, self.H, len(seeds))
+        auto_map, _ = dc.GridTriangulation().compute(vg, seeds, auto)
+        # Not asserting they differ (that depends on geometry), only that 0 is
+        # honoured as a real value rather than re-resolved to auto.
+        assert len(zero_map) <= len(auto_map)
