@@ -102,7 +102,8 @@ public:
     py::tuple compute(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
         const py::object& seeds_obj,
-        int border_padding = -1)
+        int border_padding = -1,
+        bool as_arrays = false)
     {
         auto info = vgrid.request();
         if (info.ndim != 3 || info.shape[2] != 2)
@@ -128,7 +129,7 @@ public:
             static_cast<const int32_t*>(info.ptr),
             seed_xs, seed_ys, tri_map, flat_out, nullptr, border_padding);
 
-        return _build_output(tri_map, flat_out, H, W);
+        return _build_output(tri_map, flat_out, H, W, as_arrays);
     }
 
     // compute_timed() — same as compute() but also returns a timings dict.
@@ -167,7 +168,8 @@ public:
         py_timings["dedup_ms"]  = timings.dedup_ms;
         py_timings["assign_ms"] = timings.assign_ms;
 
-        auto result = _build_output(tri_map, flat_out, H, W);
+        // Timing/debug variants keep the dict form; they are not on a hot path.
+        auto result = _build_output(tri_map, flat_out, H, W, /*as_arrays=*/false);
         return py::make_tuple(result[0], result[1], py_timings);
     }
 
@@ -212,23 +214,43 @@ public:
             std::memcpy(padded_arr.mutable_data(), padded_flat.data(),
                         padded_flat.size() * sizeof(int32_t));
 
-        auto result = _build_output(tri_map, flat_out, H, W);
+        // Timing/debug variants keep the dict form; they are not on a hot path.
+        auto result = _build_output(tri_map, flat_out, H, W, /*as_arrays=*/false);
         return py::make_tuple(result[0], result[1], padded_arr);
     }
 
 private:
+    // Triangles are held C++-side as a contiguous std::vector<TriangleEntry>
+    // whose index IS the triangle id. The dict form rebuilds that as one Python
+    // int plus one 5-tuple per triangle -- tens of thousands of objects per call
+    // -- and every consumer immediately converts it straight back into an array.
+    // as_arrays skips that entirely and hands back the (N_tri, 3) vertex indices.
     static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
                                    const std::vector<int32_t>& flat_out,
-                                   int H, int W)
+                                   int H, int W, bool as_arrays)
     {
+        py::array_t<int32_t> out_arr({H, W, 3});
+        std::memcpy(out_arr.mutable_data(), flat_out.data(),
+                    flat_out.size() * sizeof(int32_t));
+
+        if (as_arrays) {
+            const int32_t n_tri = (int32_t)tri_map.size();
+            py::array_t<int32_t> verts({(int)n_tri, 3});
+            auto v = verts.mutable_unchecked<2>();
+            for (int32_t tid = 0; tid < n_tri; ++tid) {
+                const auto& e = tri_map[tid];
+                v(tid, 0) = e.id_a;
+                v(tid, 1) = e.id_b;
+                v(tid, 2) = e.id_c;
+            }
+            return py::make_tuple(verts, out_arr);
+        }
+
         py::dict py_map;
         for (int32_t tid = 0; tid < (int32_t)tri_map.size(); ++tid) {
             const auto& e = tri_map[tid];
             py_map[py::int_(tid)] = py::make_tuple(e.x, e.y, e.id_a, e.id_b, e.id_c);
         }
-        py::array_t<int32_t> out_arr({H, W, 3});
-        std::memcpy(out_arr.mutable_data(), flat_out.data(),
-                    flat_out.size() * sizeof(int32_t));
         return py::make_tuple(py_map, out_arr);
     }
 };
@@ -337,7 +359,14 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def("compute", &PyGridTriangulation::compute,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
              py::arg("border_padding") = -1,
+             py::arg("as_arrays") = false,
              "Extract Delaunay triangulation from Voronoi grid.\n\n"
+             "as_arrays: return the triangle vertex indices as an (N_tri, 3)\n"
+             "int32 array instead of a {tid: (x, y, id_a, id_b, id_c)} dict.\n"
+             "The dict costs one Python int and one 5-tuple per triangle, and\n"
+             "consumers convert it straight back to an array; the array form\n"
+             "skips that. The (x, y) detection pixel is not included -- ask for\n"
+             "the dict if you need it.\n\n"
              "border_padding: extend the Voronoi by this many pixels in each\n"
              "direction before triangle detection so that border triangles whose\n"
              "Voronoi vertex lies outside the original image are not missed.\n"

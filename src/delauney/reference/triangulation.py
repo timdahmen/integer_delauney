@@ -34,6 +34,7 @@ class GridTriangulation:
         voronoi_grid: np.ndarray,
         seed_positions: list[tuple[int, int]],
         border_padding: int | None = None,
+        as_arrays: bool = False,
     ) -> tuple[dict, np.ndarray]:
         """Return (triangle_map, triangulation_grid).
 
@@ -57,11 +58,19 @@ class GridTriangulation:
             explicitly — note that 0 means boundary triangles whose
             circumcenter falls outside the image are never detected, and their
             pixels degrade to nearest-seed with no error raised.
+        as_arrays:
+            Return the triangle vertex indices as an (N_tri, 3) int32 array
+            instead of a {tid: (x, y, id_a, id_b, id_c)} dict.  Consumers doing
+            array work convert the dict straight back into this form, so the
+            dict is pure overhead for them.  The (x, y) detection pixel is not
+            included in the array form; ask for the dict if you need it.
+            Mirrors the CUDA path's as_arrays option.
 
         Returns
         -------
         triangle_map:
-            dict mapping triangle_id (int) → (x, y, id_a, id_b, id_c).
+            dict mapping triangle_id (int) → (x, y, id_a, id_b, id_c), or an
+            (N_tri, 3) int32 array of vertex indices when as_arrays is set.
         triangulation_grid:
             int32 array of shape (H, W, 3): channels (seed_id, distance, triangle_id).
         """
@@ -239,6 +248,15 @@ class GridTriangulation:
         tgrid[:, :, 0] = voronoi_grid[:, :, 0]
         tgrid[:, :, 1] = voronoi_grid[:, :, 1]
         tgrid[:, :, 2] = tri_id_grid
+
+        if as_arrays:
+            # triangle_map keys are a dense 0..N-1 range by construction
+            # (assigned by next_id in _register), so ordering by key reproduces
+            # the same tid -> row correspondence the grid channel refers to.
+            verts = np.empty((len(triangle_map), 3), dtype=np.int32)
+            for tid, (_x, _y, a, b, c) in triangle_map.items():
+                verts[tid] = (a, b, c)
+            return verts, tgrid
 
         return triangle_map, tgrid
 
