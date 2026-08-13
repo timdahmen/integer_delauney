@@ -1,31 +1,17 @@
 // CUDA kernels for GridTriangulation.
 //
-// Step 2 (GPU): 2x2-block scan for triangle detection.
+// Detect (GPU): 2x2-block scan on the (optionally padded) detection grid.
 //   Each pixel (x,y) is the top-left corner of a 2x2 block covering pixels
 //   (x,y)=a, (x+1,y)=b, (x,y+1)=c, (x+1,y+1)=d.
 //   - 3 distinct seed IDs → one triangle from the 3 distinct seeds.
 //   - 4 distinct seed IDs → two triangles: (a,b,c) and (b,c,d), splitting
 //     the quad along the (b,c) anti-diagonal.  Both triangles are valid since
 //     4 Voronoi cells sharing a corner implies the 4 seeds are in convex
-//     position.
-//   Max output: 2*(W-1)*(H-1) raw entries (at most 2 per block).
-// Step 3 (GPU): thrust::sort + thrust::unique on the device buffer.
-// Step 4 (GPU): seed-position-scan triangle assignment.
-//   For each pixel, iterate all seeds; skip any whose Chebyshev distance to
-//   the pixel exceeds window_cap (= max_l2_side + SLACK).  For seeds
-//   that pass the guard, iterate their CSR triangle list and run the
-//   containment test.  window_cap is derived from the longest detected
-//   triangle side, so the window always covers at least one vertex of the
-//   containing triangle regardless of Voronoi ownership.
-//   Expected cost: O(N_seeds_in_window × tris/seed) ≈ O(16) seeds for
-//   uniform distributions; scales with local seed density, not total N.
-//
-// Host copies:
-//   - voronoi seed_id channel              -> device  (input, once)
-//   - seed positions                       -> device  (input, once)
-//   - deduplicated triangles               <- device  (output, ~7 MB)
-//   - CSR adjacency list                   -> device  (built host-side, ~3 MB)
-//   - triangle_id grid                     <- device  (output, W*H ints)
+//     position.  The NumPy reference instead picks the shorter diagonal, so
+//     the two can cut a cocircular quad differently.
+//   Max output: 2*(W_det-1)*(H_det-1) raw entries (at most 2 per block).
+// Dedup  (GPU): thrust::sort + thrust::unique on the device buffer.
+// Assign (GPU): seed-position scan; see the kernel 2 header below.
 
 #include "triangulation.cuh"
 #include "voronoi.cuh"
@@ -147,16 +133,18 @@ bool point_in_triangle(float px, float py,
 //
 // For each pixel:
 //   1. Iterate all seeds; skip any whose Chebyshev distance to the pixel
-//      exceeds window_cap.  window_cap = max_manhattan_side + SLACK, so it
-//      always covers at least one vertex of the containing triangle.
-//   2. For each nearby seed, iterate its CSR triangle list and run the
+//      exceeds window_cap.
+//   2. For each surviving seed, iterate its CSR triangle list and run the
 //      containment test.  A triangle is reachable via any of its 3 vertices,
 //      so duplicate tests are possible but idempotent.
 //
-// Correctness argument: for any pixel P inside triangle (A,B,C), at least one
-// vertex V satisfies Chebyshev_dist(P,V) <= L2_dist(A,B) (longest side).
-// Because window_cap >= max_side + SLACK, every vertex of the containing
-// triangle falls within the window.
+// window_cap (computed host-side) is the longest L2 side over ALL detected
+// triangles, plus WINDOW_SLACK, floored at 20.  Every vertex of a containing
+// triangle is within its own longest side of the pixel, so that bound covers
+// them regardless of which Voronoi region the pixel belongs to.
+//
+// Expected cost: O(seeds in window × tris/seed); scales with local seed
+// density, not total N.
 // ---------------------------------------------------------------------------
 
 static constexpr int WINDOW_SLACK = 3;    // extra radius beyond max_side
@@ -285,7 +273,7 @@ void cuda_compute_triangulation(
     dim3 grid_out((W     + 15) / 16, (H     + 15) / 16);
 
     // -----------------------------------------------------------------------
-    // Step 2: detect raw triangle seeds on the (possibly padded) grid
+    // Detect: raw triangle seeds on the (possibly padded) grid
     // -----------------------------------------------------------------------
 
     const int max_raw = 2 * (W_det - 1) * (H_det - 1);
@@ -308,7 +296,7 @@ void cuda_compute_triangulation(
     if (timings) record(ev1);
 
     // -----------------------------------------------------------------------
-    // Step 3: deduplicate on device with Thrust sort + unique
+    // Dedup: on device with Thrust sort + unique
     // -----------------------------------------------------------------------
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
@@ -369,7 +357,7 @@ void cuda_compute_triangulation(
     cudaMemcpy(d_csr_idx, h_csr_idx.data(),  csr_size     * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     // -----------------------------------------------------------------------
-    // Step 4: assign pixels to triangles (seed-position-scan)
+    // Assign: pixels to triangles (seed-position scan)
     //
     // Always runs on the original W×H with original seed coordinates.
     // Border triangles (detected via padding) cover pixels near the image edge
@@ -410,7 +398,7 @@ void cuda_compute_triangulation(
     if (timings) record(ev5);
 
     // -----------------------------------------------------------------------
-    // Step 5: build output grid (H * W * 3) and fill timings
+    // Output: build the (H * W * 3) grid and fill timings
     // -----------------------------------------------------------------------
 
     std::vector<int32_t> h_t(N);

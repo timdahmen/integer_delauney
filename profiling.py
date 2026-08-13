@@ -9,8 +9,8 @@ Sections
 2. RegularDelaunay   -- NumPy reference  (BFS only)
 3. RegularDelaunay   -- CUDA
 4. GridTriangulation -- NumPy reference  (detection + dedup; assignment skipped
-                        because ~237 k triangles x 1 M pixels = ~248 G containment
-                        tests, which would take hours in a Python loop)
+                        because T triangles x W*H pixels is billions of
+                        containment tests, i.e. hours in a Python loop)
 5. GridTriangulation -- CUDA             (full pipeline)
 6. IncrementalDelaunay -- CUDA           (cold insert + warm single-seed insert)
 7. Summary table
@@ -63,12 +63,17 @@ def cuda_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Reference triangle detection (steps 2-3 only, without the O(H*W*T) loop)
+# Reference triangle detection, without the O(H*W*T) assignment loop
 # ---------------------------------------------------------------------------
 
 def _ref_detect_triangles(voronoi_grid: np.ndarray,
                            seeds: list[tuple[int, int]]) -> dict:
-    """Run GridTriangulation steps 2-3 (detection + dedup) without assignment."""
+    """Detect + deduplicate triangles only, skipping pixel assignment.
+
+    Timing-only stand-in for the reference: it omits the cocircular-quad
+    blocking, so at a degree-4 Voronoi vertex it registers all four triples
+    where GridTriangulation keeps two.  Counts are an upper bound, not a match.
+    """
     seeds_arr = np.array(seeds, dtype=np.int32)
     n_grid = voronoi_grid[:, :, 0]
 
@@ -194,7 +199,7 @@ section("2. RegularDelaunay -- NumPy reference")
 with timer("compute()  (full BFS)"):
     ref_vgrid, n_iter = _ref_voronoi_timed(W, H, seeds)
 print(f"    {'BFS convergence iterations':<52} {n_iter:>10}")
-print(f"    {'Max distance in grid (pixels)':<52} {int(ref_vgrid[:,:,1].max()):>10}")
+print(f"    {'Max squared L2 distance in grid':<52} {int(ref_vgrid[:,:,1].max()):>10}")
 
 # -- 3. RegularDelaunay -- CUDA ----------------------------------------------
 section("3. RegularDelaunay -- CUDA")
@@ -222,7 +227,7 @@ with timer("Triangle detection + deduplication"):
 T = len(ref_tri_map)
 ops = W * H * T
 hours_est = ops / 1e7 / 3600
-print(f"    {'Unique triangles found':<52} {T:>10,}")
+print(f"    {'Unique triangles found (upper bound)':<52} {T:>10,}")
 print(f"    {'Assignment ops  W x H x T  (skipped)':<52} {ops/1e9:>9.1f} G")
 print(f"    ('-> ~{hours_est:.1f} h in Python; GPU required for this scale)")
 
@@ -233,9 +238,10 @@ if cuda_available():
     cuda_tri = CudaTri()
     with timer("compute_timed()  (detection + dedup + assignment)"):
         cuda_tri_map, cuda_tgrid, gpu_timings = cuda_tri.compute_timed(cuda_vgrid, seeds)
-    tri_match = "YES (%d)" % len(cuda_tri_map) if len(cuda_tri_map) == T \
-                else "NO (%d vs %d)" % (len(cuda_tri_map), T)
-    print(f"    {'Triangle count matches reference':<52} {tri_match:>10}")
+    # T is an upper bound (see _ref_detect_triangles), so this is a sanity
+    # check on the order of magnitude, not an equality assertion.
+    print(f"    {'Triangles found (vs detect-only upper bound)':<52} "
+          f"{'%d / %d' % (len(cuda_tri_map), T):>10}")
     print()
     print(f"    GPU sub-phase breakdown:")
     print(f"    {'  detect (find_triangle_seeds kernel)':<52} {gpu_timings['detect_ms']:>9.1f} ms")
@@ -329,7 +335,7 @@ for display, key in labels:
 print(f"\n    Complexity note:")
 print(f"      Voronoi BFS:      O(W x H x iters)  -- iters = {n_iter} here")
 print(f"      Tri. detection:   O(W x H x 4)      -- vectorised NumPy")
-print(f"      Tri. assignment:  O(W x H x T)      -- T = {T:,} triangles")
+print(f"      Tri. assignment:  O(W x H x T)      -- T <= {T:,} triangles")
 print(f"        Reference Python: ~{hours_est:.1f} h")
 if cuda_available() and gpu_timings is not None:
     print(f"        CUDA kernel breakdown:")

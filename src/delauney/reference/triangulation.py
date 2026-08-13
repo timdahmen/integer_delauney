@@ -6,27 +6,21 @@ from delauney.reference.voronoi import RegularDelaunay as _RefVoronoi
 class GridTriangulation:
     """Extracts an approximate Delaunay triangulation from a Voronoi grid.
 
-    Scans the grid for left+down L-shapes where all three Voronoi regions
-    differ, deduplicates by sorted seed-ID triplet, then assigns each cell
-    to its containing triangle by testing the pixel's integer coordinate.
+    Scans the grid for L-shapes of three differing Voronoi regions in all four
+    orientations, deduplicates by sorted seed-ID triplet, then assigns each
+    cell to its containing triangle by testing the pixel's integer coordinate.
 
-    Pixel convention: a pixel (x, y) is represented by the point (x, y), NOT by
-    its centre (x+0.5, y+0.5).  This matches the CUDA implementation
-    (``triangulation.cu``, ``assign_triangles_kernel``) and, critically, matches
-    where seeds live: a seed at (5, 7) means pixel (5, 7) was sampled, so
-    evaluating there reproduces the measured value exactly.  Under a centre
-    convention an interpolator evaluating at integer coordinates disagrees with
-    the measurement at the very pixels that were sampled.
+    Pixel convention: pixel (x, y) is the point (x, y), not its centre
+    (x+0.5, y+0.5).  This matches the CUDA kernel and where seeds live, so
+    evaluating at a seed's coordinate reproduces the measured value exactly.
 
     Pixels that no triangle contains keep the sentinel -1 in the triangle_id
     channel, so callers can tell "no containing triangle" from a real triangle.
 
-    Known limitations, both of which leave pixels with no containing triangle:
-      * 4-region meetings produce only 1 triangle (the one detected by the
-        left+down scan) instead of the geometrically complete 2;
-      * a triangle is only detected where three Voronoi regions meet, i.e. at
-        its circumcenter, so boundary triangles whose circumcenter falls outside
-        the image are missed entirely unless ``border_padding`` exposes them.
+    Known limitation: a triangle is only detected where three Voronoi regions
+    meet, i.e. at its circumcenter, so a triangle whose circumcenter falls
+    outside the (optionally padded) canvas is missed and its pixels stay -1.
+    See ``border_padding``.
     """
 
     def compute(
@@ -48,23 +42,17 @@ class GridTriangulation:
             by RegularDelaunay).  Pass the *original* seed list; this method
             re-applies the same sort so that index == seed_id.
         border_padding:
-            Extend the Voronoi by this many pixels in each direction before
-            triangle detection so that border triangles whose Voronoi vertex
-            lies outside the original image are not missed.  The output grid
-            is always the original (H, W, 3) resolution.
-
-            None (the default) selects a value scaled to seed density via
-            ``delauney.auto_border_padding``.  Pass 0 to disable padding
-            explicitly — note that 0 means boundary triangles whose
-            circumcenter falls outside the image are never detected, and their
-            pixels degrade to nearest-seed with no error raised.
+            Pixels of Voronoi canvas to add on each side before triangle
+            detection, exposing border triangles whose circumcenter lies
+            outside the image.  None (the default) scales it to seed density
+            via ``delauney.auto_border_padding``, which documents the
+            trade-off; 0 disables padding.  The output grid is always the
+            original (H, W, 3) resolution.
         as_arrays:
-            Return the triangle vertex indices as an (N_tri, 3) int32 array
-            instead of a {tid: (x, y, id_a, id_b, id_c)} dict.  Consumers doing
-            array work convert the dict straight back into this form, so the
-            dict is pure overhead for them.  The (x, y) detection pixel is not
-            included in the array form; ask for the dict if you need it.
-            Mirrors the CUDA path's as_arrays option.
+            Return the vertex indices as an (N_tri, 3) int32 array instead of
+            a {tid: (x, y, id_a, id_b, id_c)} dict, skipping the per-triangle
+            Python objects.  The (x, y) detection pixel is not included; ask
+            for the dict if you need it.
 
         Returns
         -------
@@ -80,11 +68,9 @@ class GridTriangulation:
 
         H, W = voronoi_grid.shape[:2]
 
-        # Build the grid used for triangle detection.  With border_padding > 0
-        # we run a fresh Voronoi on a larger canvas so that Voronoi vertices
-        # outside the original image become visible and border triangles are
-        # detected.  Shifting all seeds by (P, P) preserves lexicographic
-        # order, so seed IDs stay consistent with sorted_seeds.
+        # Detection grid.  With padding we rerun the Voronoi on a larger canvas
+        # so that vertices outside the image become visible.  Shifting seeds by
+        # (P, P) preserves lexicographic order, so IDs match sorted_seeds.
         if border_padding is None:
             from delauney import auto_border_padding
             border_padding = auto_border_padding(W, H, len(sorted_seeds))
@@ -94,38 +80,32 @@ class GridTriangulation:
             pad_vgrid = _RefVoronoi().compute(W + 2 * P, H + 2 * P, shifted)
             n_grid = pad_vgrid[:, :, 0]
         else:
-            n_grid = voronoi_grid[:, :, 0]  # seed_id per cell
+            n_grid = voronoi_grid[:, :, 0]
 
-        # Step 2: scan all 4 L-shape orientations so that every triple-region
-        # meeting is found regardless of which diagonal it sits on.
-        # Deduplication by sorted seed-ID triplet keeps exactly one entry per
-        # geometric triangle.
-        #
-        # The four L-shapes at the corner of a 2×2 block (TL,TR,BL,BR):
-        #   left+down  at TR → (TL, TR, BR)
-        #   right+down at TL → (TL, TR, BL)
-        #   right+up   at BL → (TL, BL, BR)
-        #   left+up    at BR → (TR, BL, BR)
+        # Scan all 4 L-shape orientations so that every triple-region meeting
+        # is found regardless of which diagonal it sits on.  Deduplication by
+        # sorted seed-ID triplet keeps exactly one entry per geometric triangle.
         seen_triplets: dict[frozenset, int] = {}
 
         triangle_map: dict[int, tuple] = {}
         next_id = 0
 
-        # Step 2a: cocircular (4-region) meetings.
+        # Cocircular (4-region) meetings.
         #
-        # A 2x2 block whose four cells belong to four *different* Voronoi
-        # regions is a degree-4 Voronoi vertex — i.e. four cocircular seeds.
-        # Such a quad has two equally valid Delaunay triangulations (one per
-        # diagonal), but the four L-shape orientations below would each report a
-        # different triple and register ALL FOUR, which is over-complete: it
-        # yields overlapping triangles and a pixel can then land in several at
-        # once.  Pick one diagonal and blacklist the other's two triples.
+        # A 2x2 block of four *different* Voronoi regions is a degree-4 Voronoi
+        # vertex: four cocircular seeds, with two equally valid triangulations
+        # (one per diagonal).  The four L-shape scans below would each report a
+        # different triple and register all four, which overlaps — a pixel then
+        # lands in several triangles at once.  Pick one diagonal and blacklist
+        # the other's two triples.
         #
-        # Choice rule (deterministic, and matching the CUDA implementation):
-        # the shorter diagonal wins; on an exact tie — which is the usual case,
+        # Rule: the shorter diagonal wins; on an exact tie — the usual case,
         # since the points are cocircular — take the diagonal that does *not*
-        # contain the lowest seed id.  The lowest id lies in exactly one
-        # diagonal, so this is always well defined.
+        # contain the lowest seed id, which is always well defined.
+        #
+        # The CUDA path chooses differently (triangulation.cu splits every quad
+        # along the 2x2 block's anti-diagonal), so the two implementations can
+        # disagree about which diagonal a cocircular quad is cut along.
         blocked: set[frozenset] = set()
         _tl, _tr = n_grid[:-1, :-1], n_grid[:-1, 1:]
         _bl, _br = n_grid[1:, :-1], n_grid[1:, 1:]
@@ -178,7 +158,6 @@ class GridTriangulation:
                 next_id += 1
 
         # left+down: cell=(x,y), left=(x-1,y), down=(x,y+1)
-        # slice: cell=n_grid[:-1,1:], left=n_grid[:-1,:-1], down=n_grid[1:,1:]
         s_cell = n_grid[:-1, 1:]
         s_left = n_grid[:-1, :-1]
         s_down = n_grid[1:, 1:]
@@ -187,7 +166,6 @@ class GridTriangulation:
             _register(rx + 1, ry, int(s_left[ry, rx]), int(s_cell[ry, rx]), int(s_down[ry, rx]))
 
         # right+down: cell=(x,y), right=(x+1,y), down=(x,y+1)
-        # slice: cell=n_grid[:-1,:-1], right=n_grid[:-1,1:], down=n_grid[1:,:-1]
         s_cell = n_grid[:-1, :-1]
         s_right = n_grid[:-1, 1:]
         s_down = n_grid[1:, :-1]
@@ -196,7 +174,6 @@ class GridTriangulation:
             _register(rx, ry, int(s_cell[ry, rx]), int(s_right[ry, rx]), int(s_down[ry, rx]))
 
         # right+up: cell=(x,y), right=(x+1,y), up=(x,y-1)
-        # slice: cell=n_grid[1:,:-1], right=n_grid[1:,1:], up=n_grid[:-1,:-1]
         s_cell = n_grid[1:, :-1]
         s_right = n_grid[1:, 1:]
         s_up = n_grid[:-1, :-1]
@@ -205,7 +182,6 @@ class GridTriangulation:
             _register(rx, ry + 1, int(s_cell[ry, rx]), int(s_right[ry, rx]), int(s_up[ry, rx]))
 
         # left+up: cell=(x,y), left=(x-1,y), up=(x,y-1)
-        # slice: cell=n_grid[1:,1:], left=n_grid[1:,:-1], up=n_grid[:-1,1:]
         s_cell = n_grid[1:, 1:]
         s_left = n_grid[1:, :-1]
         s_up = n_grid[:-1, 1:]
@@ -213,22 +189,13 @@ class GridTriangulation:
         for ry, rx in zip(*np.where(mask)):
             _register(rx + 1, ry + 1, int(s_left[ry, rx]), int(s_cell[ry, rx]), int(s_up[ry, rx]))
 
-        # Step 4: assign each cell to a triangle by testing its integer
-        # coordinate (x, y) — not its centre.  See the class docstring: this
-        # matches the CUDA kernel and keeps seeds, assignment and downstream
-        # evaluation on one convention.
+        # Assign each cell by testing its integer coordinate (see class
+        # docstring).  Every triangle is tested, not just those sharing the
+        # pixel's Voronoi seed_id: a pixel in region A can lie inside a
+        # triangle (B,C,D) that A is not a vertex of.
         #
-        # We test ALL triangles for each pixel, not just those that share the
-        # pixel's Voronoi seed_id.  Restricting to seed-id neighbours is an
-        # incorrect optimisation: a pixel in Voronoi region A can geometrically
-        # lie inside a triangle (B,C,D) where A is not a vertex.
-        #
-        # Tie between multiple containing triangles → highest id wins.
-        # Pixels no triangle contains keep -1.  There is deliberately no
-        # "fold into the highest id" fallback: that would make "outside the
-        # convex hull" indistinguishable from "inside the hull but its triangle
-        # was never detected" (see the limitations in the class docstring), and
-        # both need the same nearest-seed handling downstream anyway.
+        # Ties go to the highest id; uncontained pixels keep -1 rather than
+        # folding into some nearest triangle, so callers can distinguish them.
 
         tri_id_grid = np.full((H, W), -1, dtype=np.int32)
 
@@ -243,16 +210,14 @@ class GridTriangulation:
 
                 tri_id_grid[y, x] = best_tid
 
-        # Step 5: build output grid
         tgrid = np.empty((H, W, 3), dtype=np.int32)
         tgrid[:, :, 0] = voronoi_grid[:, :, 0]
         tgrid[:, :, 1] = voronoi_grid[:, :, 1]
         tgrid[:, :, 2] = tri_id_grid
 
         if as_arrays:
-            # triangle_map keys are a dense 0..N-1 range by construction
-            # (assigned by next_id in _register), so ordering by key reproduces
-            # the same tid -> row correspondence the grid channel refers to.
+            # Keys are a dense 0..N-1 range by construction, so row index == tid
+            # == the value in the grid's triangle_id channel.
             verts = np.empty((len(triangle_map), 3), dtype=np.int32)
             for tid, (_x, _y, a, b, c) in triangle_map.items():
                 verts[tid] = (a, b, c)

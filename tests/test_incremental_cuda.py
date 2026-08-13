@@ -41,13 +41,9 @@ MAX_SEEDS = 256
 def batch_triangulate(seeds):
     """Run the stateless batch pipeline and return (tri_set, tgrid, vgrid).
 
-    border_padding is pinned to 0 rather than left at the default. The batch
-    path defaults to a density-scaled padding, which recovers border triangles
-    whose circumcenter lies outside the image; IncrementalDelaunay has no
-    padding support at all, so with the default the batch side legitimately
-    finds triangles the incremental side cannot, and these equivalence tests
-    would be comparing two different feature sets rather than two
-    implementations of the same one.
+    border_padding is pinned to 0: IncrementalDelaunay has no padding support,
+    so at the batch default these equivalence tests would compare two different
+    feature sets rather than two implementations of the same one.
     """
     rd = _cu.RegularDelaunay()
     vgrid = rd.compute(W, H, seeds)
@@ -133,12 +129,7 @@ class TestSingleSeed:
         assert np.all(vg[:, :, 0] == 0), "All cells should belong to seed 0"
 
     def test_voronoi_distances_are_squared_l2(self):
-        """The distance channel stores squared Euclidean distance.
-
-        (Renamed from test_voronoi_distances_manhattan: this kernel accumulated
-        +1 per BFS step, which produces a Manhattan diagram, and was missed when
-        the rest of the library moved to L2.)
-        """
+        """The distance channel stores squared Euclidean distance, not Manhattan."""
         inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
         inc.insert(self.SEED)
         vg = inc.get_voronoi_grid()

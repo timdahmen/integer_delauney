@@ -1,9 +1,4 @@
-"""as_arrays returns the triangle vertex indices without building a dict.
-
-The triangles are held C++-side as a contiguous vector whose index is the
-triangle id, and every array-oriented consumer converted the dict straight back
-into this form, so the dict was pure overhead on that path.
-"""
+"""as_arrays returns the triangle vertex indices without building a dict."""
 import numpy as np
 import pytest
 

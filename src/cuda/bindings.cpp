@@ -1,10 +1,8 @@
 // pybind11 bindings for the CUDA Voronoi + triangulation kernels.
 //
-// Exposed module: _delauney_cuda
-//   RegularDelaunay:
-//     .compute(width, height, seeds) -> np.ndarray shape (H, W, 2) int32
-//   GridTriangulation:
-//     .compute(voronoi_grid, seed_positions) -> (dict, np.ndarray shape (H,W,3) int32)
+// Exposed module: _delauney_cuda -- RegularDelaunay, GridTriangulation and
+// IncrementalDelaunay.  Per-method signatures live in the docstrings below;
+// API_REFERENCE.md documents the Python-facing contract.
 //
 // `seeds` / `seed_positions` must be a sequence of (x, y) pairs.
 // Seed ordering (ascending x, tiebreak ascending y) is applied here so that
@@ -49,7 +47,6 @@ static std::vector<Seed> sort_seeds(const py::object& seeds_obj, int W, int H)
         return (a.x != b.x) ? (a.x < b.x) : (a.y < b.y);
     });
 
-    // Check for duplicates
     for (size_t i = 1; i < seeds.size(); ++i) {
         if (seeds[i].x == seeds[i-1].x && seeds[i].y == seeds[i-1].y)
             throw std::invalid_argument("duplicate seed positions are not allowed");
@@ -83,11 +80,9 @@ public:
 // GridTriangulation wrapper
 // ---------------------------------------------------------------------------
 
-// A negative border_padding means "pick one scaled to seed density", keeping
-// this path's default in step with the NumPy reference, where the same request
-// is spelled border_padding=None. Must match delauney.auto_border_padding:
-// sqrt(area / n_seeds). Leaving the default at a hard 0 made the missing
-// border-triangle limitation the automatic behaviour for every direct caller.
+// A negative border_padding means "pick one scaled to seed density" -- the
+// int-typed spelling of the reference's border_padding=None.  Must stay in
+// step with delauney.auto_border_padding: sqrt(area / n_seeds).
 static int resolve_border_padding(int border_padding, int W, int H, int N_seeds)
 {
     if (border_padding >= 0) return border_padding;
@@ -132,8 +127,6 @@ public:
         return _build_output(tri_map, flat_out, H, W, as_arrays);
     }
 
-    // compute_timed() — same as compute() but also returns a timings dict.
-    // Signature: (voronoi_grid, seed_positions, border_padding=0) -> (tri_map, grid, timings)
     py::tuple compute_timed(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
         const py::object& seeds_obj,
@@ -168,15 +161,11 @@ public:
         py_timings["dedup_ms"]  = timings.dedup_ms;
         py_timings["assign_ms"] = timings.assign_ms;
 
-        // Timing/debug variants keep the dict form; they are not on a hot path.
+        // Timing/debug variants keep the dict form; not a hot path.
         auto result = _build_output(tri_map, flat_out, H, W, /*as_arrays=*/false);
         return py::make_tuple(result[0], result[1], py_timings);
     }
 
-    // compute_debug() — same as compute() but also returns the padded Voronoi
-    // grid used internally for triangle detection.
-    // Returns (triangle_map, triangulation_grid, padded_voronoi_grid) where
-    // padded_voronoi_grid has shape (H+2*P, W+2*P, 2).
     py::tuple compute_debug(
         const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
         const py::object& seeds_obj,
@@ -214,17 +203,15 @@ public:
             std::memcpy(padded_arr.mutable_data(), padded_flat.data(),
                         padded_flat.size() * sizeof(int32_t));
 
-        // Timing/debug variants keep the dict form; they are not on a hot path.
+        // Timing/debug variants keep the dict form; not a hot path.
         auto result = _build_output(tri_map, flat_out, H, W, /*as_arrays=*/false);
         return py::make_tuple(result[0], result[1], padded_arr);
     }
 
 private:
-    // Triangles are held C++-side as a contiguous std::vector<TriangleEntry>
-    // whose index IS the triangle id. The dict form rebuilds that as one Python
-    // int plus one 5-tuple per triangle -- tens of thousands of objects per call
-    // -- and every consumer immediately converts it straight back into an array.
-    // as_arrays skips that entirely and hands back the (N_tri, 3) vertex indices.
+    // Triangles are held C++-side as a contiguous vector whose index IS the
+    // triangle id.  The dict form rebuilds that as one Python int plus one
+    // 5-tuple per triangle; as_arrays hands back the (N_tri, 3) indices instead.
     static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
                                    const std::vector<int32_t>& flat_out,
                                    int H, int W, bool as_arrays)
@@ -264,8 +251,6 @@ public:
     PyIncrementalDelaunay(int width, int height, int max_seeds)
         : impl_(width, height, max_seeds) {}
 
-    // insert(seeds) -> (triangle_map, triangulation_grid)  or
-    // insert_timed(seeds) -> (triangle_map, triangulation_grid, timings_dict)
     py::tuple insert(const py::object& seeds_obj)
     {
         std::vector<int32_t> xs, ys;
@@ -350,9 +335,9 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def(py::init<>())
         .def("compute", &PyRegularDelaunay::compute,
              py::arg("width"), py::arg("height"), py::arg("seeds"),
-             "Compute Manhattan-distance Voronoi diagram.\n\n"
+             "Compute an L2-distance (Euclidean) Voronoi diagram.\n\n"
              "Returns int32 array of shape (height, width, 2): "
-             "(seed_id, distance) per cell.");
+             "(seed_id, squared L2 distance) per cell.");
 
     py::class_<PyGridTriangulation>(m, "GridTriangulation")
         .def(py::init<>())
@@ -360,26 +345,19 @@ PYBIND11_MODULE(_delauney_cuda, m)
              py::arg("voronoi_grid"), py::arg("seed_positions"),
              py::arg("border_padding") = -1,
              py::arg("as_arrays") = false,
-             "Extract Delaunay triangulation from Voronoi grid.\n\n"
-             "as_arrays: return the triangle vertex indices as an (N_tri, 3)\n"
-             "int32 array instead of a {tid: (x, y, id_a, id_b, id_c)} dict.\n"
-             "The dict costs one Python int and one 5-tuple per triangle, and\n"
-             "consumers convert it straight back to an array; the array form\n"
-             "skips that. The (x, y) detection pixel is not included -- ask for\n"
-             "the dict if you need it.\n\n"
-             "border_padding: extend the Voronoi by this many pixels in each\n"
-             "direction before triangle detection so that border triangles whose\n"
-             "Voronoi vertex lies outside the original image are not missed.\n"
-             "Negative (the default) picks a value scaled to seed density,\n"
-             "matching delauney.auto_border_padding and the NumPy reference's\n"
-             "border_padding=None. Pass 0 to disable padding explicitly - note\n"
-             "that 0 means border triangles whose circumcenter falls outside the\n"
-             "image are never detected, and their pixels degrade to nearest-seed\n"
-             "with no error raised.\n"
+             "Extract a Delaunay triangulation from a Voronoi grid.\n\n"
+             "border_padding: pixels of Voronoi canvas to add on each side\n"
+             "before triangle detection, exposing border triangles whose\n"
+             "circumcenter lies outside the image. Negative (the default)\n"
+             "scales it to seed density, matching delauney.auto_border_padding\n"
+             "and the reference's border_padding=None; 0 disables padding.\n"
              "The output grid is always the original (H, W, 3) resolution.\n\n"
-             "Returns (triangle_map, triangulation_grid) where "
-             "triangle_map is {int: (x,y,id_a,id_b,id_c)} and "
-             "triangulation_grid has shape (H, W, 3).")
+             "as_arrays: return the vertex indices as an (N_tri, 3) int32 array\n"
+             "instead of a {tid: (x, y, id_a, id_b, id_c)} dict, skipping the\n"
+             "per-triangle Python objects. The (x, y) detection pixel is not\n"
+             "included; ask for the dict if you need it.\n\n"
+             "Returns (triangle_map, triangulation_grid). Pixels no triangle\n"
+             "contains carry -1 in channel 2 of the grid.")
         .def("compute_timed", &PyGridTriangulation::compute_timed,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
              py::arg("border_padding") = -1,

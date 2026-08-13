@@ -3,9 +3,9 @@ geometrically contains its integer coordinate (x, y).
 
 Ground truth is computed by testing each pixel against EVERY triangle
 (brute-force, O(H*W*T)) rather than restricting to triangles that share the
-pixel's Voronoi seed_id.  When a pixel lies inside multiple triangles
-(on a shared edge) the one with the highest triangle_id wins, matching the
-algorithm spec.  Pixels no triangle contains are exempt from the assertion.
+pixel's Voronoi seed_id.  When a pixel lies inside multiple triangles (on a
+shared edge) the highest triangle_id wins, matching the implementation.
+Pixels no triangle contains are exempt from the assertion.
 """
 import numpy as np
 import pytest

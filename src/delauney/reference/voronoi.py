@@ -10,15 +10,22 @@ class RegularDelaunay:
 
     Seed IDs are assigned in ascending X order, tiebroken by ascending Y.
 
-    At equidistant cells the propagation *prefers* the higher seed ID, but this
-    is not guaranteed: propagation is local, so a cell only ever sees seeds
-    owned by its four neighbours.  If the lower-id seed claims the surrounding
-    cells first, the higher-id one never becomes a candidate there.  Both
-    outcomes are correct Voronoi assignments (the cell still gets a nearest
-    seed) and both are fixed points of the rule, but it means the CUDA
-    implementation, which uses a different update schedule, may resolve an
-    individual tie differently.  Do not assume bit-equality between the two at
-    equidistant cells; see tests/test_voronoi_cuda.py::test_large_grid.
+    At equidistant cells propagation *prefers* the higher seed ID, but does not
+    guarantee it: propagation is local, so a cell only sees seeds owned by its
+    four neighbours, and a tied seed that never reaches the cell cannot win it.
+    Both outcomes are correct nearest-seed assignments, so the CUDA path -- a
+    different update schedule -- may resolve an individual tie differently.
+    Do not assume bit-equality at equidistant cells; see
+    tests/test_voronoi_cuda.py::test_large_grid.
+
+    Locality has a sharper consequence for the CUDA path.  This sweep updates
+    in place, four directions per pass, so a better seed can travel several
+    cells per iteration and in practice it settles on the exact nearest seed.
+    The CUDA kernel double-buffers and moves one cell per iteration, and can
+    come to rest at a fixed point that is *not* nearest-seed: measured at
+    128x128 with 400 seeds, 2 of 16384 pixels, off by 1-3 in squared distance.
+    It is rare and grows with seed density.  Use this reference, not the CUDA
+    path, when exactness matters.
 
     The distance channel stores squared L2 distance (avoids sqrt; int32 safe
     for grids up to ~46000x46000).

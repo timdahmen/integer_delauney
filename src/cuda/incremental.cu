@@ -131,11 +131,8 @@ void voronoi_step_kernel(
         int nb = (ny * W + nx) * 2;
         int32_t n_id = src[nb];
         if (n_id == UNDEF_SEED) continue;
-        // Squared L2 measured DIRECTLY from the neighbour's owning seed to this
-        // pixel — never accumulated along the BFS path.  Accumulating (+1 per
-        // step) yields a Manhattan diagram, which is what this kernel used to
-        // do; it was missed when the rest of the library moved to L2, leaving
-        // the incremental path computing a different metric from the batch one.
+        // Recomputed from the neighbour's owning seed, never accumulated along
+        // the BFS path -- that would give a Manhattan metric.
         int32_t sdx = x - seed_xs[n_id];
         int32_t sdy = y - seed_ys[n_id];
         int32_t n_d = sdx * sdx + sdy * sdy;
@@ -487,7 +484,6 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     cudaEvent_t e0,e1,e2,e3,e4,e5;
     if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3);mk(&e4);mk(&e5); }
 
-    // Download change mask
     std::vector<int32_t> h_changed(N);
     cudaMemcpy(h_changed.data(), d_changed_, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
 
@@ -518,7 +514,6 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
             if (h_border[t.y * W_ + t.x]) is_stale[tid] = true;
     }
 
-    // Detect new triangles in border
     cudaMemcpy(d_mask_, h_border.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_raw_buf_);

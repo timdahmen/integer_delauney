@@ -1,23 +1,21 @@
 # %% [markdown]
-# ## Voronoi + Delaunay — parameterized reproduction script
+# ## Voronoi + Delaunay — parameterized exploration script
 #
 # Edit the PARAMETERS cell below to switch between scenarios:
 #
-#   SCENARIO 1 — baseline (works correctly)
-#       W, H, N = 256, 256, 256   ALLOW_DUPLICATES = False
+#   Baseline     W, H, N = 256, 256, 256
+#   Sparse seeds W, H, N = 1024, 512, 32   (large Voronoi cells, few triangles)
+#   Dense seeds  W, H, N = 256, 256, 4096  (many small triangles)
 #
-#   SCENARIO 2 — sparse seeds (previously triggered WINDOW_CAP bug)
-#       W, H, N = 1024, 512, 32   ALLOW_DUPLICATES = False
-#
-#   SCENARIO 3 — duplicate seeds (triggers silent-overwrite bug)
-#       W, H, N = 256, 256, 256   ALLOW_DUPLICATES = True
-#       Expected: some seeds missing from Voronoi; unexpected -1 regions.
+# ALLOW_DUPLICATES = True skips deduplication; both the CUDA and reference paths
+# reject duplicate seed positions with a ValueError, so this is a way to check
+# that the guard fires, not a way to see degraded output.
 
 # %% — PARAMETERS
 W, H = 512, 512           # grid width, height in pixels
 N    = 512                # number of seeds requested
-ALLOW_DUPLICATES  = False  # True: skip deduplication to expose overwrite bug
-CREATE_NEIGHBOURS = False  # 
+ALLOW_DUPLICATES  = False  # True: keep duplicates, expect a ValueError
+CREATE_NEIGHBOURS = False  # True: pair up seeds as horizontal neighbours
 N_NEIGHBOURS      = 64
 RNG_SEED          = 42
 

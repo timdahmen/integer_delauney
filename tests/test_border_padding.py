@@ -1,10 +1,6 @@
 """Tests for auto_border_padding and the border_padding=None default.
 
-A triangle is only detected where three Voronoi regions meet -- its
-circumcenter. Boundary triangles frequently have circumcenters outside the
-image, so at padding 0 they are never registered and the pixels they should
-cover degrade to nearest-seed with no error raised. The default now scales
-padding to seed density instead of leaving it at 0.
+See delauney.auto_border_padding for why the default scales with seed density.
 """
 import numpy as np
 import pytest

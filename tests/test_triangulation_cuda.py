@@ -154,10 +154,7 @@ class TestCudaTriangulationContract:
     def test_every_cell_has_a_valid_id_or_the_sentinel(self, cuda_vd, cuda_tri):
         """Ids are a real triangle index or -1 ("no triangle contains it").
 
-        Three seeds cannot cover a 10x10 image, so -1 must occur.  This replaces
-        an assertion that every id was >= 0, which the CUDA kernel has never
-        satisfied — it writes -1 for unconfined pixels
-        (``triangulation.cu``, ``assign_triangles_kernel``).
+        Three seeds cannot cover a 10x10 image, so -1 must occur.
         """
         seeds = [(1, 1), (8, 1), (4, 8)]
         tri_map, tgrid = run_cuda(cuda_vd, cuda_tri, 10, 10, seeds)

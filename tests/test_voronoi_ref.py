@@ -32,11 +32,7 @@ class TestSingleSeed:
         assert np.all(grid_n(g) == 0)
 
     def test_distances_are_squared_l2(self):
-        """The distance channel stores squared Euclidean distance, not Manhattan.
-
-        (Renamed from test_distances_are_manhattan: the metric changed to L2 but
-        the expectations here were never updated.)
-        """
+        """The distance channel stores squared Euclidean distance, not Manhattan."""
         g = compute(5, 5, [(2, 2)])
         for y in range(5):
             for x in range(5):

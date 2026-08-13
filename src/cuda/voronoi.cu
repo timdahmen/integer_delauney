@@ -29,13 +29,13 @@
 static constexpr int32_t UNDEFINED = -1;
 
 // Compare two (seed_id, distance) candidates; return true if b beats a.
-// Winner criterion: lower distance wins; on tie, higher seed_id wins.
+// Lower distance wins; on tie, higher seed_id wins.
 //
-// NOTE: "higher seed_id wins" only applies among candidates this cell actually
-// sees, i.e. seeds owned by its four neighbours.  A tied seed that never
-// propagates adjacent to the cell cannot win it, so an individual tie may
-// resolve differently here than in the NumPy reference, which sweeps in a
-// different order.  Both results are correct Voronoi assignments.
+// Only among the candidates this cell actually sees: propagation is local and
+// this kernel advances one cell per iteration, so it can settle at a fixed
+// point that is not nearest-seed (rare, grows with seed density -- measured
+// 2/16384 pixels at 128x128 with 400 seeds, off by 1-3 in squared distance).
+// See RegularDelaunay's docstring in reference/voronoi.py.
 __device__ __forceinline__
 bool beats(int32_t a_id, int32_t a_d, int32_t b_id, int32_t b_d)
 {
@@ -80,8 +80,8 @@ void voronoi_step_kernel(
         int32_t n_id = src[nb];
         if (n_id == UNDEFINED) continue;
 
-        // Direct squared L2 distance from seed n_id to current pixel (x, y).
-        // Never accumulate through neighbours — recompute from the seed position.
+        // Recomputed from the seed position, never accumulated through
+        // neighbours -- that would give a Manhattan metric.
         int32_t ddx = x - seed_xs[n_id];
         int32_t ddy = y - seed_ys[n_id];
         int32_t n_d = ddx * ddx + ddy * ddy;
@@ -95,7 +95,6 @@ void voronoi_step_kernel(
     dst[base]     = best_id;
     dst[base + 1] = best_d;
 
-    // Mark update if the cell changed (includes first-time fills)
     if (best_id != cur_id || best_d != cur_d) {
         atomicOr(updated_flag, 1);
     }
@@ -152,7 +151,6 @@ void cuda_compute_voronoi(
         voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, d_sx, d_sy, d_flag);
         cudaDeviceSynchronize();
 
-        // Swap buffers
         int32_t* tmp = d_a; d_a = d_b; d_b = tmp;
 
         int32_t flag = 0;

@@ -83,26 +83,6 @@ class TestDeduplication:
 
 
 # ---------------------------------------------------------------------------
-# Four-region meeting (documented known limitation)
-# ---------------------------------------------------------------------------
-
-class TestFourRegionMeeting:
-    """When 4 seeds meet equidistantly, only 1 triangle is expected (known limitation)."""
-
-    def test_four_symmetric_seeds_produce_at_least_one_triangle(self):
-        # Seeds at corners of a small square; they will all meet in the centre.
-        seeds = [(0, 0), (4, 0), (0, 4), (4, 4)]
-        tri_map, _ = make_voronoi_and_tri(5, 5, seeds)
-        assert len(tri_map) >= 1
-
-    def test_four_region_at_most_three_triangles(self):
-        seeds = [(0, 0), (4, 0), (0, 4), (4, 4)]
-        tri_map, _ = make_voronoi_and_tri(5, 5, seeds)
-        # We document the known limitation: max triangles ≤ N-2 for N seeds
-        assert len(tri_map) <= 4
-
-
-# ---------------------------------------------------------------------------
 # Triangle map entry structure
 # ---------------------------------------------------------------------------
 
@@ -180,13 +160,7 @@ class TestOutputContract:
 # ---------------------------------------------------------------------------
 
 class TestOutsideHullSentinel:
-    """Pixels that no triangle contains carry -1, and only those pixels do.
-
-    There is deliberately no "fold into the highest triangle id" fallback: it
-    would make "outside the convex hull" indistinguishable from "inside the hull
-    but its triangle was never detected", and both need the same nearest-seed
-    handling downstream anyway.
-    """
+    """Pixels that no triangle contains carry -1, and only those pixels do."""
 
     SEEDS = [(1, 1), (8, 1), (4, 8)]
 
@@ -241,10 +215,7 @@ class TestOutsideHullSentinel:
 class TestCocircularQuad:
     """Four cocircular seeds must yield ONE triangulation, not both diagonals.
 
-    The four L-shape orientations each report a different triple at a degree-4
-    Voronoi vertex.  Registering all four is over-complete: it produces
-    overlapping triangles, so a pixel can lie inside several at once and the
-    "highest id wins" tie-break silently picks between them.
+    See the cocircular block in reference/triangulation.py for the rule.
     """
 
     @pytest.mark.parametrize("seeds,W,H", [
@@ -275,7 +246,7 @@ class TestCocircularQuad:
         assert tris[0] | tris[1] == {0, 1, 2, 3}
 
     def test_no_pixel_lies_in_both_triangles(self):
-        """Over-registration showed up as pixels inside more than one triangle."""
+        """Overlapping triangles would put a pixel inside more than one."""
         seeds = [(1, 1), (8, 1), (1, 8), (8, 8)]
         vgrid = _vd.compute(10, 10, seeds)
         tri_map, _ = _tri.compute(vgrid, seeds)
