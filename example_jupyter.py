@@ -49,8 +49,10 @@ if CREATE_NEIGHBOURS:
 # Compute Voronoi diagram
 vgrid = RegularDelaunay().compute(W, H, seeds)   # int32 (H, W, 2)
 
-# Compute Delaunay triangulation
-tri_map, tgrid = GridTriangulation().compute(vgrid, seeds)  # int32 (H, W, 3)
+BORDER_PADDING = 128
+
+# Compute Delaunay triangulation (debug: also returns padded Voronoi)
+tri_map, tgrid, padded_vgrid = GridTriangulation().compute_debug(vgrid, seeds, border_padding=BORDER_PADDING)
 
 # Sorted seed positions: index == seed_id assigned by the library
 sorted_seeds = sorted(seeds, key=lambda s: (s[0], s[1]))
@@ -88,16 +90,22 @@ fig.patch.set_facecolor('#1a1a2e')
 for ax in axes:
     ax.set_facecolor('#1a1a2e')
 
-# ── left: Voronoi diagram ──────────────────────────────────────────────────
+# ── left: padded Voronoi diagram (debug) ──────────────────────────────────
 ax = axes[0]
+P = BORDER_PADDING
 ax.imshow(
-    vgrid[:, :, 0],
+    padded_vgrid[:, :, 0],
     cmap=region_cmap, vmin=0, vmax=N - 1,
     origin='upper', interpolation='nearest', aspect='equal',
     alpha=0.85,
 )
-ax.scatter(sx, sy, s=6, c='white', linewidths=0, zorder=5)
-ax.set_title('Voronoi diagram', color='white', fontsize=13, pad=8)
+ax.scatter(sx + P, sy + P, s=6, c='white', linewidths=0, zorder=5)
+# Draw rectangle showing the original image boundary
+import matplotlib.patches as mpatches
+rect = mpatches.Rectangle((P - 0.5, P - 0.5), W, H,
+                           linewidth=1, edgecolor='yellow', facecolor='none')
+ax.add_patch(rect)
+ax.set_title(f'Padded Voronoi (padding={P})', color='white', fontsize=13, pad=8)
 ax.axis('off')
 
 # ── right: Delaunay triangulation ─────────────────────────────────────────
