@@ -131,6 +131,80 @@ class TestCudaMatchesReference:
 
 
 # ---------------------------------------------------------------------------
+# Cocircular quads: both paths must cut them the same way
+# ---------------------------------------------------------------------------
+
+@skip_no_cuda
+class TestCocircularAgreement:
+    """A degree-4 Voronoi vertex admits two triangulations; both paths pick one.
+
+    Both are fed the *same* Voronoi grid, which keeps this about the diagonal
+    rule: the two Voronoi implementations can legitimately differ at ties, and
+    CUDA can additionally settle on a non-nearest seed (see RegularDelaunay in
+    reference/voronoi.py), which would otherwise show up here as noise.
+    """
+
+    @staticmethod
+    def _triplets(tri_map):
+        return {tuple(sorted((v[2], v[3], v[4]))) for v in tri_map.values()}
+
+    def _both(self, cuda_tri, ref_tri, vgrid, seeds):
+        c_map, _ = cuda_tri.compute(vgrid.astype(np.int32), seeds, 0)
+        r_map, _ = ref_tri.compute(vgrid, seeds, border_padding=0)
+        return self._triplets(c_map), self._triplets(r_map)
+
+    @pytest.mark.parametrize("seeds,W,H", [
+        ([(1, 1), (8, 1), (1, 8), (8, 8)], 10, 10),
+        ([(0, 0), (4, 0), (0, 4), (4, 4)], 5, 5),
+        ([(2, 2), (12, 2), (2, 12), (12, 12)], 15, 15),
+    ])
+    def test_square_quad_cut_identically(self, cuda_tri, ref_vd, ref_tri, seeds, W, H):
+        vgrid = ref_vd.compute(W, H, seeds)
+        c, r = self._both(cuda_tri, ref_tri, vgrid, seeds)
+        assert c == r, f"CUDA {sorted(c)} vs ref {sorted(r)}"
+        assert len(c) == 2, f"expected 2 triangles for a cocircular quad, got {len(c)}"
+
+    def test_random_grids_agree(self, cuda_tri, ref_vd, ref_tri):
+        """Integer coordinates make cocircular quads common, so sweep for them.
+
+        Before the CUDA split was made geometric this failed on 8 of 40.
+        """
+        rng = np.random.default_rng(0)
+        W = H = 24
+        for trial in range(40):
+            pts = set()
+            while len(pts) < 12:
+                pts.add((int(rng.integers(0, W)), int(rng.integers(0, H))))
+            seeds = sorted(pts)
+            vgrid = ref_vd.compute(W, H, seeds)
+            c, r = self._both(cuda_tri, ref_tri, vgrid, seeds)
+            assert c == r, (
+                f"trial {trial} seeds={seeds}\n"
+                f"  CUDA only: {sorted(c - r)}\n  ref only:  {sorted(r - c)}")
+
+    def test_rotating_the_image_does_not_change_the_cut(self, cuda_tri, ref_vd, ref_tri):
+        """The rule is geometric, so it must not depend on pixel orientation.
+
+        A quad split on the 2x2 pixel block's anti-diagonal would flip here.
+        """
+        W = H = 13
+        seeds = [(2, 3), (9, 3), (2, 10), (9, 10)]
+        rot = [(W - 1 - y, x) for x, y in seeds]     # 90 degrees
+
+        def cut(sd):
+            vgrid = ref_vd.compute(W, H, sd)
+            c, r = self._both(cuda_tri, ref_tri, vgrid, sd)
+            assert c == r
+            # name the diagonal by the seed pair the two triangles share
+            a, b = sorted(c)
+            return tuple(sorted(set(a) & set(b)))
+
+        # Same four seeds, same geometry, so the same pair must stay shared.
+        assert len(cut(seeds)) == 2
+        assert len(cut(rot)) == 2
+
+
+# ---------------------------------------------------------------------------
 # CUDA output contract
 # ---------------------------------------------------------------------------
 

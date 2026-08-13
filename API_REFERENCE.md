@@ -259,7 +259,7 @@ CPU-only reference implementations with matching signatures. Useful for testing 
 
 The one deliberate signature difference: the reference spells the auto padding default as `border_padding=None`, the CUDA path as a negative `int`. There is no `compute_timed` or `compute_debug` on the reference.
 
-**Known divergence:** at a *cocircular* (degree-4) Voronoi vertex a quad has two equally valid triangulations. The reference picks the shorter diagonal, tiebreaking away from the lowest seed id; the CUDA path always splits along the 2×2 pixel block's anti-diagonal. Both are valid Delaunay triangulations, but the two can cut the same quad differently, so do not expect identical triangle sets on inputs containing cocircular seeds.
+**Cocircular quads:** at a degree-4 Voronoi vertex a quad has two equally valid triangulations. Both paths resolve it the same way — shorter diagonal, tiebreaking away from the lowest seed id — so given the same Voronoi grid they produce identical triangle sets. Note that they may still differ *end to end*, because the two Voronoi implementations can disagree first (see the accuracy note under `RegularDelaunay`).
 
 ---
 

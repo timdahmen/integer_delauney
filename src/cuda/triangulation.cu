@@ -4,11 +4,10 @@
 //   Each pixel (x,y) is the top-left corner of a 2x2 block covering pixels
 //   (x,y)=a, (x+1,y)=b, (x,y+1)=c, (x+1,y+1)=d.
 //   - 3 distinct seed IDs → one triangle from the 3 distinct seeds.
-//   - 4 distinct seed IDs → two triangles: (a,b,c) and (b,c,d), splitting
-//     the quad along the (b,c) anti-diagonal.  Both triangles are valid since
-//     4 Voronoi cells sharing a corner implies the 4 seeds are in convex
-//     position.  The NumPy reference instead picks the shorter diagonal, so
-//     the two can cut a cocircular quad differently.
+//   - 4 distinct seed IDs → a degree-4 Voronoi vertex (four cocircular seeds):
+//     two triangles sharing one diagonal of the quad, chosen by the shorter
+//     diagonal and, on a tie, the one avoiding the lowest seed id.  Same rule
+//     as reference/triangulation.py, so both paths cut the quad identically.
 //   Max output: 2*(W_det-1)*(H_det-1) raw entries (at most 2 per block).
 // Dedup  (GPU): thrust::sort + thrust::unique on the device buffer.
 // Assign (GPU): seed-position scan; see the kernel 2 header below.
@@ -61,6 +60,8 @@ __global__
 void find_triangle_seeds_kernel(
     const int32_t* __restrict__ n_grid,
     int W, int H,
+    const int32_t* __restrict__ seed_xs,
+    const int32_t* __restrict__ seed_ys,
     RawTriangle* __restrict__ raw_buf,
     int32_t* __restrict__ counter)
 {
@@ -96,12 +97,70 @@ void find_triangle_seeds_kernel(
     if (n == 3) {
         // Three cells meet at this corner: one Delaunay triangle.
         register_tri(s[0], s[1], s[2]);
-    } else if (n == 4) {
-        // Four cells meet: split the convex quad along the (b,c) anti-diagonal.
-        register_tri(a, b, c);
-        register_tri(b, c, d);
+        return;
     }
-    // n <= 2: at most two distinct cells, no triangle.
+    if (n != 4) return;   // at most two distinct cells, no triangle
+
+    // Four cells meet: a degree-4 Voronoi vertex, i.e. four cocircular seeds.
+    // The quad has two equally valid Delaunay triangulations, one per diagonal,
+    // and registering both would overlap.  This mirrors the rule in
+    // reference/triangulation.py exactly, so the two paths agree; splitting on
+    // the pixel block's anti-diagonal instead would make the result depend on
+    // image orientation rather than on the seed geometry.
+    const int32_t q[4] = {a, b, c, d};   // order matches the reference's ids[]
+
+    // Cyclic order around the centroid, so "diagonal" means opposite corners
+    // rather than adjacent ones.  Double precision, and a stable sort, to match
+    // the reference's np.arctan2 + sorted().
+    double cx = 0.0, cy = 0.0;
+    for (int i = 0; i < 4; ++i) { cx += seed_xs[q[i]]; cy += seed_ys[q[i]]; }
+    cx *= 0.25; cy *= 0.25;
+
+    double ang[4];
+    for (int i = 0; i < 4; ++i)
+        ang[i] = atan2((double)seed_ys[q[i]] - cy, (double)seed_xs[q[i]] - cx);
+
+    int ord[4] = {0, 1, 2, 3};
+    for (int i = 1; i < 4; ++i) {                 // insertion sort, stable
+        int k = ord[i];
+        int j = i - 1;
+        while (j >= 0 && ang[ord[j]] > ang[k]) { ord[j + 1] = ord[j]; --j; }
+        ord[j + 1] = k;
+    }
+
+    // Exact integer lengths: seed coordinates are integral, so this reproduces
+    // the reference's float comparison without any rounding risk.
+    auto len2 = [&](int i, int j) -> long long {
+        long long dx = (long long)seed_xs[q[i]] - seed_xs[q[j]];
+        long long dy = (long long)seed_ys[q[i]] - seed_ys[q[j]];
+        return dx * dx + dy * dy;
+    };
+
+    const int d0a = ord[0], d0b = ord[2];
+    const int d1a = ord[1], d1b = ord[3];
+    const long long l0 = len2(d0a, d0b), l1 = len2(d1a, d1b);
+
+    int pa, pb;                                    // the chosen diagonal
+    if (l0 < l1)      { pa = d0a; pb = d0b; }
+    else if (l1 < l0) { pa = d1a; pb = d1b; }
+    else {
+        // Exact tie, the usual case for cocircular points: take the diagonal
+        // that does NOT contain the lowest seed id.
+        int lowest = 0;
+        for (int i = 1; i < 4; ++i) if (q[i] < q[lowest]) lowest = i;
+        if (lowest == d0a || lowest == d0b) { pa = d1a; pb = d1b; }
+        else                                { pa = d0a; pb = d0b; }
+    }
+
+    // The two triangles sharing that diagonal.
+    int ra = -1, rb = -1;
+    for (int i = 0; i < 4; ++i) {
+        if (i == pa || i == pb) continue;
+        if (ra < 0) ra = i; else rb = i;
+    }
+
+    register_tri(q[pa], q[pb], q[ra]);
+    register_tri(q[pa], q[pb], q[rb]);
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +345,8 @@ void cuda_compute_triangulation(
 
     if (timings) record(ev0);
 
-    find_triangle_seeds_kernel<<<grid_det, block>>>(d_n, W_det, H_det, d_raw, d_counter);
+    find_triangle_seeds_kernel<<<grid_det, block>>>(
+        d_n, W_det, H_det, d_sx, d_sy, d_raw, d_counter);
     cudaDeviceSynchronize();
 
     int32_t raw_count = 0;

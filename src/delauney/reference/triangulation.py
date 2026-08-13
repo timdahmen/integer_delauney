@@ -103,9 +103,8 @@ class GridTriangulation:
         # since the points are cocircular — take the diagonal that does *not*
         # contain the lowest seed id, which is always well defined.
         #
-        # The CUDA path chooses differently (triangulation.cu splits every quad
-        # along the 2x2 block's anti-diagonal), so the two implementations can
-        # disagree about which diagonal a cocircular quad is cut along.
+        # triangulation.cu implements the same rule, so given the same Voronoi
+        # grid both paths cut a quad identically; keep them in step.
         blocked: set[frozenset] = set()
         _tl, _tr = n_grid[:-1, :-1], n_grid[:-1, 1:]
         _bl, _br = n_grid[1:, :-1], n_grid[1:, 1:]
