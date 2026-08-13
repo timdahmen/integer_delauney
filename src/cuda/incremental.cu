@@ -478,6 +478,15 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     dim3 block(16, 16);
     dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
 
+    auto mk = [](cudaEvent_t* e){ cudaEventCreate(e); };
+    auto rc = [](cudaEvent_t  e){ cudaEventRecord(e); };
+    auto el = [](cudaEvent_t a, cudaEvent_t b) -> float {
+        cudaEventSynchronize(b); float ms=0; cudaEventElapsedTime(&ms,a,b); return ms;
+    };
+
+    cudaEvent_t e0,e1,e2,e3,e4,e5;
+    if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3);mk(&e4);mk(&e5); }
+
     // Download change mask
     std::vector<int32_t> h_changed(N);
     cudaMemcpy(h_changed.data(), d_changed_, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -516,18 +525,20 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
-    if (det_ms) { cudaEvent_t e; cudaEventCreate(&e); cudaEventRecord(e); }
-
+    if (det_ms) rc(e0);
     find_triangle_seeds_kernel<<<grid_dim, block>>>(d_grid_, W_, H_, d_raw, d_counter, d_mask_);
     cudaDeviceSynchronize();
     int32_t raw_count = 0;
     cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
     cudaFree(d_counter);
+    if (det_ms) rc(e1);
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
+    if (dedup_ms) rc(e2);
     thrust::sort(d_ptr, d_ptr + raw_count, RawLess{});
     auto new_end = thrust::unique(d_ptr, d_ptr + raw_count, RawEqual{});
     int n_new = (int)(new_end - d_ptr);
+    if (dedup_ms) rc(e3);
 
     std::vector<RawTriangle> h_new(n_new);
     if (n_new > 0)
@@ -586,12 +597,22 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     cudaMemcpy(d_mask_, h_reassign.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     int N_tri = (int)h_triangles_.size();
+    if (asgn_ms) rc(e4);
     if (N_tri > 0) {
         assign_triangles_kernel<<<grid_dim, block>>>(
             d_t_grid_, W_, H_, d_grid_,
             static_cast<RawTriangle*>(d_raw_buf_),
             d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri, d_mask_);
         cudaDeviceSynchronize();
+    }
+    if (asgn_ms) rc(e5);
+
+    if (det_ms) {
+        *det_ms   = el(e0,e1);
+        *dedup_ms = el(e2,e3);
+        *asgn_ms  = el(e4,e5);
+        cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
+        cudaEventDestroy(e3); cudaEventDestroy(e4); cudaEventDestroy(e5);
     }
 }
 

@@ -12,9 +12,11 @@ struct TriTimings {
     float detect_ms = 0.f;   // find_triangle_seeds kernel
     float dedup_ms  = 0.f;   // thrust::sort + thrust::unique
     float assign_ms = 0.f;   // assign_triangles kernel
-    float sort_ms   = 0.f;   // (internal gap, not meaningful to caller)
 };
 
+// border_padding is a real pixel count here -- resolve the "pick one for me"
+// sentinel (see bindings.cpp) before calling.  Deliberately no default: 0 is a
+// valid but lossy choice, so callers must make it explicitly.
 void cuda_compute_triangulation(
     int W, int H,
     const int32_t* voronoi_grid,
@@ -22,6 +24,6 @@ void cuda_compute_triangulation(
     const std::vector<int32_t>& seed_ys,
     std::vector<TriangleEntry>& triangle_map_out,
     std::vector<int32_t>& out_grid,
-    TriTimings* timings = nullptr,
-    int border_padding = 0,
+    TriTimings* timings,
+    int border_padding,
     std::vector<int32_t>* padded_voronoi_out = nullptr);

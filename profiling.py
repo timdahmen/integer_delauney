@@ -105,7 +105,11 @@ def _ref_detect_triangles(voronoi_grid: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def _ref_voronoi_timed(W: int, H: int, seeds: list) -> tuple[np.ndarray, int]:
-    """Return (voronoi_grid, n_bfs_iterations)."""
+    """Return (voronoi_grid, n_bfs_iterations).
+
+    Mirrors reference.voronoi._flood_fill -- squared L2 recomputed from the
+    owning seed, never accumulated along the path -- plus an iteration counter.
+    """
     from delauney.reference.voronoi import _UNDEFINED
 
     seeds_arr = np.array(seeds, dtype=np.int32)
@@ -113,42 +117,50 @@ def _ref_voronoi_timed(W: int, H: int, seeds: list) -> tuple[np.ndarray, int]:
     sorted_seeds = seeds_arr[order]
 
     grid = np.full((H, W, 2), _UNDEFINED, dtype=np.int32)
+    seed_x = np.zeros((H, W), dtype=np.int32)
+    seed_y = np.zeros((H, W), dtype=np.int32)
     for seed_id, (sx, sy) in enumerate(sorted_seeds):
         grid[sy, sx, 0] = seed_id
         grid[sy, sx, 1] = 0
+        seed_x[sy, sx] = sx
+        seed_y[sy, sx] = sy
 
     sid = grid[:, :, 0]
     dst = grid[:, :, 1]
+    px = np.arange(W, dtype=np.int32)[np.newaxis, :]
+    py = np.arange(H, dtype=np.int32)[:, np.newaxis]
     iters = 0
-
-    SHIFTS = [
-        # (n_id array, n_d_raw array)
-        lambda: (np.pad(sid[:, :-1], ((0,0),(1,0)), constant_values=_UNDEFINED),
-                 np.pad(dst[:, :-1], ((0,0),(1,0)))),
-        lambda: (np.pad(sid[:, 1:],  ((0,0),(0,1)), constant_values=_UNDEFINED),
-                 np.pad(dst[:, 1:],  ((0,0),(0,1)))),
-        lambda: (np.pad(sid[:-1, :], ((1,0),(0,0)), constant_values=_UNDEFINED),
-                 np.pad(dst[:-1, :], ((1,0),(0,0)))),
-        lambda: (np.pad(sid[1:,  :], ((0,1),(0,0)), constant_values=_UNDEFINED),
-                 np.pad(dst[1:,  :], ((0,1),(0,0)))),
-    ]
 
     while True:
         iters += 1
         changed = False
-        for shift_fn in SHIFTS:
-            n_id, n_d_raw = shift_fn()
-            n_d   = n_d_raw + 1
+        for dy, dx in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            n_id = np.full((H, W), _UNDEFINED, dtype=np.int32)
+            n_sx = np.zeros((H, W), dtype=np.int32)
+            n_sy = np.zeros((H, W), dtype=np.int32)
+
+            if dx == -1:
+                n_id[:, 1:],  n_sx[:, 1:],  n_sy[:, 1:]  = sid[:, :-1], seed_x[:, :-1], seed_y[:, :-1]
+            elif dx == 1:
+                n_id[:, :-1], n_sx[:, :-1], n_sy[:, :-1] = sid[:, 1:],  seed_x[:, 1:],  seed_y[:, 1:]
+            elif dy == -1:
+                n_id[1:, :],  n_sx[1:, :],  n_sy[1:, :]  = sid[:-1, :], seed_x[:-1, :], seed_y[:-1, :]
+            else:
+                n_id[:-1, :], n_sx[:-1, :], n_sy[:-1, :] = sid[1:, :],  seed_x[1:, :],  seed_y[1:, :]
+
             valid = n_id >= 0
+            cand  = (px - n_sx) ** 2 + (py - n_sy) ** 2
             undef = sid == _UNDEFINED
-            lower = valid & ~undef & (n_d < dst)
-            tie   = valid & ~undef & (n_d == dst) & (n_id > sid)
+            lower = valid & ~undef & (cand < dst)
+            tie   = valid & ~undef & (cand == dst) & (n_id > sid)
             new   = valid & undef
             mask  = new | lower | tie
             if np.any(mask):
                 changed = True
-                sid[mask] = n_id[mask]
-                dst[mask] = n_d[mask]
+                sid[mask]    = n_id[mask]
+                dst[mask]    = cand[mask]
+                seed_x[mask] = n_sx[mask]
+                seed_y[mask] = n_sy[mask]
 
         if not changed:
             break
@@ -192,8 +204,12 @@ if cuda_available():
     _ = cuda_vd.compute(32, 32, [(0, 0), (31, 31)])   # warm-up
     with timer("compute()  (warm-up excluded)"):
         cuda_vgrid = cuda_vd.compute(W, H, seeds)
-    match = np.array_equal(cuda_vgrid, ref_vgrid)
-    print(f"    {'Result matches NumPy reference':<52} {'YES' if match else 'NO':>10}")
+    # Seed ids may legitimately differ at ties, so only distances are compared.
+    # A nonzero count is the known CUDA local-propagation shortfall, not noise
+    # -- see RegularDelaunay in reference/voronoi.py.
+    n_diff = int((cuda_vgrid[:, :, 1] != ref_vgrid[:, :, 1]).sum())
+    print(f"    {'Distance cells differing from NumPy reference':<52} "
+          f"{'%d (%.4f%%)' % (n_diff, 100.0 * n_diff / (W * H)):>10}")
 else:
     print("    [CUDA extension not available -- skipped]")
     cuda_vgrid = ref_vgrid

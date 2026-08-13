@@ -425,7 +425,6 @@ void cuda_compute_triangulation(
 
     if (timings) {
         timings->detect_ms = elapsed_ms(ev0, ev1);
-        timings->sort_ms   = elapsed_ms(ev1, ev2);
         timings->dedup_ms  = elapsed_ms(ev2, ev3);
         timings->assign_ms = elapsed_ms(ev4, ev5);
         cudaEventDestroy(ev0); cudaEventDestroy(ev1); cudaEventDestroy(ev2);
