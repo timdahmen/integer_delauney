@@ -192,7 +192,8 @@ tri = IncrementalDelaunay(
 ```python
 triangle_map, triangulation_grid = tri.insert(
     seeds: Seeds,
-) -> tuple[TriangleMap, TriangulationGrid]
+    as_arrays: bool = False,
+) -> tuple[TriangleMap | TriangleArray, TriangulationGrid]
 ```
 
 Inserts a batch of new seeds into the running triangulation. Seeds are appended to the existing set; do not re-pass previously inserted seeds.
@@ -224,6 +225,79 @@ Same as `insert()` with an additional `Timings` dict:
 
 ---
 
+### `insert_deferred` / `finalise`
+
+```python
+tri.insert_deferred(seeds: Seeds) -> None
+triangle_map, triangulation_grid = tri.finalise(as_arrays: bool = False)
+```
+
+Splits `insert()` into its two halves. `insert_deferred` updates the Voronoi
+diagram and the triangle topology but skips the per-pixel assignment and returns
+nothing; `finalise` assigns everything deferred since the last call in one pass
+and materialises the outputs. `insert(seeds)` is exactly the two in sequence.
+
+Pixel assignment is the expensive stage — measured at ~95% of on-device time —
+and the only one whose dirty region saturates once a batch is large and
+scattered. A caller inserting repeatedly before it needs a raster should defer:
+
+```python
+tri = IncrementalDelaunay(W, H, max_seeds)
+tri.insert_deferred(initial_seeds)
+for _ in range(rounds):
+    tris = tri.get_triangles()        # topology only, no raster
+    tri.insert_deferred(pick_new_seeds(tris))
+verts, tgrid = tri.finalise(as_arrays=True)
+```
+
+Measured on 1240×1240 with 22k initial seeds and five scattered batches of 1800:
+
+| | time |
+|---|---|
+| `insert()` per round (assign ×6) | 181 ms |
+| `insert_deferred()` + one `finalise()` | 76 ms |
+| single stateless batch rebuild of the final set | 103 ms |
+
+`finalise` chooses a masked or a full assignment by whichever covers less work,
+so a small accumulated change stays cheap and a large one does not pay to build
+a mask it cannot benefit from. Calling it with nothing pending only rebuilds the
+outputs.
+
+Between deferred inserts, `get_triangles()` is valid; the triangulation grid is
+not, and neither is the triangle content of `get_voronoi_grid()`.
+
+`insert_deferred_timed` and `finalise_timed` return the same `Timings` dict.
+`assign_ms` is always 0 from the former — it is reported by the latter.
+
+---
+
+### `get_triangles`
+
+```python
+verts = tri.get_triangles() -> np.ndarray  # shape (N_tri, 3), int32
+```
+
+Triangle topology alone, with no raster copied back.
+
+> **Seed ids are insertion-order**, not the sorted (x asc, y asc) numbering that
+> `insert()` and `finalise()` report. A caller appending seeds across several
+> inserts keeps its own per-seed arrays (values, flags) aligned by appending,
+> which sorted ids would invalidate on every call. Translate through
+> `sorted_rank` when handing results to the batch API.
+
+---
+
+### `sorted_rank`
+
+```python
+rank = tri.sorted_rank -> np.ndarray  # shape (seed_count,), int32
+```
+
+Maps insertion-order seed id to the sorted id used by `insert()` / `finalise()`
+outputs, so `rank[get_triangles()]` gives triangles in the batch numbering.
+
+---
+
 ### `get_voronoi_grid`
 
 ```python
@@ -241,6 +315,7 @@ Returns the current Voronoi state as a `VoronoiGrid` without running a triangula
 | `tri.width` | `int` | Grid width. |
 | `tri.height` | `int` | Grid height. |
 | `tri.seed_count` | `int` | Number of seeds inserted so far. |
+| `tri.has_pending` | `bool` | True when deferred inserts await a `finalise()`. |
 
 ---
 

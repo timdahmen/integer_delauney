@@ -1,21 +1,38 @@
 // CUDA implementation of IncrementalDelaunay.
 //
-// insert(batch) pipeline:
+// The work splits into topology (cheap, scoped to the changed region) and pixel
+// assignment (expensive, and the only stage whose dirty region saturates once a
+// batch is large and scattered). They are separate calls so that a caller
+// inserting repeatedly pays assignment once rather than per insert:
+//
+//   insert_deferred(batch)  →  topology only, changes accumulate
+//   finalise()              →  one assignment pass + outputs
+//   insert(batch)           →  the two together, unchanged behaviour
+//
+// insert_deferred(batch):
 //   1. Write new seeds into d_grid_ at distance 0.
-//   2. BFS until convergence; d_changed_ accumulates every cell that moved.
-//   3. First insert → full triangulation.
-//      Subsequent inserts → partial triangulation:
-//        a. Expand d_changed_ by 2 px → border mask (re-detect here).
-//        b. Remove triangles whose canonical pixel is in border.
-//        c. Re-detect in border, merge new triplets.
-//        d. Remap d_t_grid_ through old→new ID table.
-//        e. Expand d_changed_ by WINDOW_CAP → reassign mask.
-//        f. Re-assign only pixels in reassign mask.
+//   2. BFS until convergence; d_changed_ collects every cell that moved, and is
+//      OR-ed into d_dirty_accum_, the union awaiting assignment.
+//   3. First insert → full topology (detect over the whole grid).
+//      Subsequent inserts → partial topology:
+//        a. Dilate d_changed_ by 2 px → border mask (re-detect here).
+//        b. Flag triangles whose canonical pixel is in border, by sampling the
+//           mask on the device at those positions.
+//        c. Re-detect in border, merge new triplets, compact the registry.
+//        d. Remap d_t_grid_ through old→new; deleted triangles leave -1.
+//
+// finalise():
+//   5. Build the reassign mask from d_dirty_accum_: per-pixel radius
+//      R = min(sqrt(dist)+SLACK, CAP) via a tile prefilter, plus every pixel
+//      left at -1 by the remap.
+//   6. Assign, masked or full according to how much of the image is dirty.
+//   7. Materialise tri_map and the (H,W,3) grid.
 
 #include "incremental.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
+#include <thrust/reduce.h>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 
@@ -151,7 +168,20 @@ void voronoi_step_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Kernel: L-shape triangle detection with optional mask
+// Kernel: 2x2-block triangle detection with optional mask
+//
+// Ported from triangulation.cu so the two pipelines detect the same triangles.
+// This file used to scan four L-shaped stencils per pixel and register one
+// triangle per stencil with three distinct seed ids. Where four Voronoi regions
+// meet all four stencils qualify, so it emitted four overlapping triangles at a
+// cocircular vertex where the quad admits only two -- 5.2% more triangles than
+// the batch path at 1.4% seed density, all of them distinct triples, so nothing
+// downstream deduplicated them away.
+//
+// The batch path grew the geometric tie-break in 0f79a7d and this copy did not.
+// Rather than fix the L-shape variant, it now uses the same 2x2 block scan and
+// the same diagonal rule, which is the only way the two stay in agreement.
+//
 // Grid is interleaved (seed_id, distance); only channel 0 is read.
 // ---------------------------------------------------------------------------
 
@@ -159,34 +189,100 @@ __global__
 void find_triangle_seeds_kernel(
     const int32_t* __restrict__ grid,   // interleaved (seed_id, dist)
     int W, int H,
+    const int32_t* __restrict__ seed_xs,
+    const int32_t* __restrict__ seed_ys,
     RawTriangle* __restrict__ raw_buf,
     int32_t* __restrict__ counter,
     const int32_t* __restrict__ mask)   // nullptr → all pixels
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= W || y >= H) return;
+    if (x >= W - 1 || y >= H - 1) return;   // 2x2 block must be in bounds
     if (mask && !mask[y * W + x]) return;
 
-    auto sid = [&](int cx, int cy) -> int32_t {
-        return grid[(cy * W + cx) * 2];
-    };
+    auto sid = [&](int cx, int cy) -> int32_t { return grid[(cy * W + cx) * 2]; };
 
-    auto try_reg = [&](int gx, int gy, int32_t a, int32_t b, int32_t c) {
-        if (a == UNDEF_SEED || b == UNDEF_SEED || c == UNDEF_SEED) return;
-        if (a == b || a == c || b == c) return;
-        int32_t pos = atomicAdd(counter, 1);
-        int32_t sa = a, sb = b, sc = c;
+    int32_t a = sid(x,     y    );   // top-left
+    int32_t b = sid(x + 1, y    );   // top-right
+    int32_t c = sid(x,     y + 1);   // bottom-left
+    int32_t d = sid(x + 1, y + 1);   // bottom-right
+
+    auto register_tri = [&](int32_t oa, int32_t ob, int32_t oc) {
+        int32_t sa = oa, sb = ob, sc = oc;
         if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
         if (sb > sc) { int32_t t = sb; sb = sc; sc = t; }
         if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
-        raw_buf[pos] = {gx, gy, sa, sb, sc, a, b, c};
+        int32_t pos = atomicAdd(counter, 1);
+        raw_buf[pos] = {x, y, sa, sb, sc, oa, ob, oc};
     };
 
-    if (x >= 1   && y <= H-2) try_reg(x, y, sid(x-1,y), sid(x,y),   sid(x,  y+1));
-    if (x <= W-2 && y <= H-2) try_reg(x, y, sid(x,  y), sid(x+1,y), sid(x,  y+1));
-    if (x <= W-2 && y >= 1  ) try_reg(x, y, sid(x,  y), sid(x+1,y), sid(x,  y-1));
-    if (x >= 1   && y >= 1  ) try_reg(x, y, sid(x-1,y), sid(x,  y), sid(x,  y-1));
+    // Distinct seed ids in the block. UNDEF cells cannot form a triangle, and
+    // the incremental grid can still hold them before the BFS has reached
+    // everywhere, which the batch path never sees.
+    int32_t quad[4] = {a, b, c, d};
+    int32_t s[4];
+    int n = 0;
+    for (int i = 0; i < 4; ++i) {
+        if (quad[i] == UNDEF_SEED) return;
+        bool dup = false;
+        for (int j = 0; j < n; ++j) if (s[j] == quad[i]) { dup = true; break; }
+        if (!dup) s[n++] = quad[i];
+    }
+
+    if (n == 3) { register_tri(s[0], s[1], s[2]); return; }
+    if (n != 4) return;   // at most two distinct cells, no triangle
+
+    // Four cells meet: a degree-4 Voronoi vertex, i.e. four cocircular seeds.
+    // The quad has two equally valid Delaunay triangulations, one per diagonal,
+    // and registering both would overlap. Mirrors reference/triangulation.py.
+    const int32_t q[4] = {a, b, c, d};
+
+    double cx = 0.0, cy = 0.0;
+    for (int i = 0; i < 4; ++i) { cx += seed_xs[q[i]]; cy += seed_ys[q[i]]; }
+    cx *= 0.25; cy *= 0.25;
+
+    double ang[4];
+    for (int i = 0; i < 4; ++i)
+        ang[i] = atan2((double)seed_ys[q[i]] - cy, (double)seed_xs[q[i]] - cx);
+
+    int ord[4] = {0, 1, 2, 3};
+    for (int i = 1; i < 4; ++i) {                 // insertion sort, stable
+        int k = ord[i];
+        int j = i - 1;
+        while (j >= 0 && ang[ord[j]] > ang[k]) { ord[j + 1] = ord[j]; --j; }
+        ord[j + 1] = k;
+    }
+
+    auto len2 = [&](int i, int j) -> long long {
+        long long dx = (long long)seed_xs[q[i]] - seed_xs[q[j]];
+        long long dy = (long long)seed_ys[q[i]] - seed_ys[q[j]];
+        return dx * dx + dy * dy;
+    };
+
+    const int d0a = ord[0], d0b = ord[2];
+    const int d1a = ord[1], d1b = ord[3];
+    const long long l0 = len2(d0a, d0b), l1 = len2(d1a, d1b);
+
+    int pa, pb;                                    // the chosen diagonal
+    if (l0 < l1)      { pa = d0a; pb = d0b; }
+    else if (l1 < l0) { pa = d1a; pb = d1b; }
+    else {
+        // Exact tie, the usual case for cocircular points: take the diagonal
+        // that does NOT contain the lowest seed id.
+        int lowest = 0;
+        for (int i = 1; i < 4; ++i) if (q[i] < q[lowest]) lowest = i;
+        if (lowest == d0a || lowest == d0b) { pa = d1a; pb = d1b; }
+        else                                { pa = d0a; pb = d0b; }
+    }
+
+    int ra = -1, rb = -1;
+    for (int i = 0; i < 4; ++i) {
+        if (i == pa || i == pb) continue;
+        if (ra < 0) ra = i; else rb = i;
+    }
+
+    register_tri(q[pa], q[pb], q[ra]);
+    register_tri(q[pa], q[pb], q[rb]);
 }
 
 // ---------------------------------------------------------------------------
@@ -275,16 +371,135 @@ void assign_triangles_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Kernels: mask construction
+//
+// These replace a serial host double loop over all W*H pixels that copied
+// d_changed_ down, dilated it on the CPU, and copied two masks back -- 18 MB of
+// traffic and a megapixel scan per insert, whatever the batch size.
+// ---------------------------------------------------------------------------
+
+//: Tile edge for the dirty prefilter below. Small enough that a tile rarely
+//: covers unchanged ground, large enough that a WINDOW_CAP-sized window spans
+//: only a handful of tiles.
+static constexpr int MASK_TILE = 8;
+
+//: Above this share of the image a masked assignment costs more than an
+//: unmasked one -- the per-thread mask read and the scattered writes outweigh
+//: the work skipped -- so finalise() switches to a full pass.
+static constexpr float ASSIGN_FULL_FRACTION = 0.5f;
+
+// Dilate a 0/1 mask by a fixed radius. Used for the detection border, where
+// the radius is 2 and a direct gather is cheaper than any prefilter.
+__global__
+void dilate_fixed_kernel(const int32_t* __restrict__ src,
+                         int32_t* __restrict__ dst,
+                         int W, int H, int r)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+
+    int x0 = max(0, x-r), x1 = min(W-1, x+r);
+    int y0 = max(0, y-r), y1 = min(H-1, y+r);
+    int32_t v = 0;
+    for (int sy = y0; sy <= y1 && !v; ++sy)
+        for (int sx = x0; sx <= x1; ++sx)
+            if (src[sy * W + sx]) { v = 1; break; }
+    dst[y * W + x] = v;
+}
+
+// Flag triangles whose canonical pixel falls inside the mask.
+//
+// Sampling the mask here rather than downloading it keeps the transfer
+// proportional to the triangle count (~50k flags) instead of the pixel count
+// (~1.5M int32). Reads d_raw_buf_, so it must run before detection overwrites
+// that buffer.
+__global__
+void mark_stale_kernel(const RawTriangle* __restrict__ tris, int n_tri,
+                       const int32_t* __restrict__ mask, int W, int H,
+                       uint8_t* __restrict__ stale)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tri) return;
+    const RawTriangle& r = tris[t];
+    stale[t] = (r.x >= 0 && r.x < W && r.y >= 0 && r.y < H && mask[r.y * W + r.x])
+             ? 1 : 0;
+}
+
+// dst |= src
+__global__
+void or_mask_kernel(const int32_t* __restrict__ src,
+                    int32_t* __restrict__ dst, int N)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N && src[i]) dst[i] = 1;
+}
+
+// One flag per MASK_TILE x MASK_TILE block: set if any pixel in it changed.
+__global__
+void build_tile_dirty_kernel(const int32_t* __restrict__ src,
+                             int32_t* __restrict__ tiles,
+                             int W, int H, int TX)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    if (!src[y * W + x]) return;
+    atomicOr(&tiles[(y / MASK_TILE) * TX + (x / MASK_TILE)], 1);
+}
+
+// Which pixels need their triangle re-assigned.
+//
+// Dilating by the uniform WINDOW_CAP, as the host version did, is far wider
+// than necessary: assign_triangles_kernel searches a window of
+// R = min(sqrt(dist) + SLACK, CAP), which at realistic seed densities is
+// nearer 7 than 20 -- roughly nine times the area. Each pixel is therefore
+// tested against its OWN R, via a tile prefilter so the scan stays cheap.
+//
+// That alone would not be safe: a pixel's triangle can be deleted by a change
+// outside its search window, and no amount of dilation around changed cells
+// catches that. remap_tgrid_kernel writes -1 at exactly those pixels when the
+// registry compacts, so the sentinel is tested directly and closes the gap.
+// The cost is retesting the hull exterior, which carries -1 permanently.
+__global__
+void build_reassign_mask_kernel(const int32_t* __restrict__ grid,
+                                const int32_t* __restrict__ t_grid,
+                                const int32_t* __restrict__ tiles,
+                                int32_t* __restrict__ mask,
+                                int W, int H, int TX)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+
+    int idx = y * W + x;
+    if (t_grid[idx] < 0) { mask[idx] = 1; return; }
+
+    int dist = grid[idx * 2 + 1];
+    int R    = min((int)sqrtf((float)max(dist, 0)) + WINDOW_SLACK, WINDOW_CAP);
+
+    int tx0 = max(0, x-R) / MASK_TILE, tx1 = min(W-1, x+R) / MASK_TILE;
+    int ty0 = max(0, y-R) / MASK_TILE, ty1 = min(H-1, y+R) / MASK_TILE;
+    int32_t v = 0;
+    for (int ty = ty0; ty <= ty1 && !v; ++ty)
+        for (int tx = tx0; tx <= tx1; ++tx)
+            if (tiles[ty * TX + tx]) { v = 1; break; }
+    mask[idx] = v;
+}
+
+// ---------------------------------------------------------------------------
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 
 IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds)
-    : W_(width), H_(height), N_(0), max_seeds_(max_seeds)
+    : W_(width), H_(height), N_(0), max_seeds_(max_seeds), pending_(false)
 {
     if (width <= 0 || height <= 0 || max_seeds <= 0)
         throw std::invalid_argument("dimensions and max_seeds must be positive");
 
     const int N = W_ * H_;
+    tiles_x_ = (W_ + MASK_TILE - 1) / MASK_TILE;
+    tiles_y_ = (H_ + MASK_TILE - 1) / MASK_TILE;
     cudaMalloc(&d_grid_,         (size_t)N * 2          * sizeof(int32_t));
     cudaMalloc(&d_tmp_,          (size_t)N * 2          * sizeof(int32_t));
     cudaMalloc(&d_changed_,      (size_t)N              * sizeof(int32_t));
@@ -296,10 +511,18 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds)
     cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 8  * sizeof(int32_t));
     cudaMalloc(&d_updated_flag_, 1                      * sizeof(int32_t));
     cudaMalloc(&d_mask_,         (size_t)N              * sizeof(int32_t));
+    cudaMalloc(&d_dirty_accum_,  (size_t)N              * sizeof(int32_t));
+    cudaMalloc(&d_tile_dirty_,
+               (size_t)tiles_x_ * tiles_y_ * sizeof(int32_t));
+    cudaMalloc(&d_count_,        1                      * sizeof(int32_t));
+    // A planar triangulation of n points has under 2n triangles; the detection
+    // buffer is sized the same way the CSR is, so match that bound.
+    cudaMalloc(&d_stale_,        (size_t)max_seeds * 4  * sizeof(uint8_t));
 
     cudaMemset(d_grid_,    -1, (size_t)N * 2 * sizeof(int32_t));  // UNDEF
     cudaMemset(d_t_grid_,  -1, (size_t)N     * sizeof(int32_t));
     cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t));
+    cudaMemset(d_dirty_accum_, 0, (size_t)N  * sizeof(int32_t));
 }
 
 IncrementalDelaunay::~IncrementalDelaunay()
@@ -308,6 +531,8 @@ IncrementalDelaunay::~IncrementalDelaunay()
     cudaFree(d_sx_);      cudaFree(d_sy_);        cudaFree(d_raw_buf_);
     cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
     cudaFree(d_updated_flag_); cudaFree(d_mask_);
+    cudaFree(d_dirty_accum_);  cudaFree(d_tile_dirty_); cudaFree(d_count_);
+    cudaFree(d_stale_);
 }
 
 // ---------------------------------------------------------------------------
@@ -393,12 +618,11 @@ void IncrementalDelaunay::rebuild_csr_and_upload_()
 }
 
 // ---------------------------------------------------------------------------
-// full_triangulate_: detect → dedup → CSR → assign (no mask)
+// full_topology_: detect → dedup → registry → CSR, over the whole grid
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms)
+void IncrementalDelaunay::full_topology_(float* det_ms, float* dedup_ms)
 {
-    const int N = W_ * H_;
     dim3 block(16, 16);
     dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
 
@@ -408,15 +632,16 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
         cudaEventSynchronize(b); float ms=0; cudaEventElapsedTime(&ms,a,b); return ms;
     };
 
-    cudaEvent_t e0,e1,e2,e3,e4,e5;
-    if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3);mk(&e4);mk(&e5); }
+    cudaEvent_t e0,e1,e2,e3;
+    if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3); }
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_raw_buf_);
     int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
     if (det_ms) rc(e0);
-    find_triangle_seeds_kernel<<<grid_dim, block>>>(d_grid_, W_, H_, d_raw, d_counter, nullptr);
+    find_triangle_seeds_kernel<<<grid_dim, block>>>(
+        d_grid_, W_, H_, d_sx_, d_sy_, d_raw, d_counter, nullptr);
     cudaDeviceSynchronize();
     int32_t raw_count = 0;
     cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -433,35 +658,27 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
     std::vector<RawTriangle> h_dedup(N_tri);
     cudaMemcpy(h_dedup.data(), d_raw, N_tri * sizeof(RawTriangle), cudaMemcpyDeviceToHost);
 
-    h_triangles_.clear(); h_triplet_to_tid_.clear(); h_canon_to_tid_.clear();
+    h_triangles_.clear(); h_triplet_to_tid_.clear();
     h_triangles_.reserve(N_tri);
     for (int32_t tid = 0; tid < N_tri; ++tid) {
         const auto& r = h_dedup[tid];
         h_triangles_.push_back({r.x, r.y, r.a, r.b, r.c, r.orig_a, r.orig_b, r.orig_c});
         h_triplet_to_tid_[pack_triplet_(r.a, r.b, r.c)] = tid;
-        h_canon_to_tid_[pack_xy_(r.x, r.y)] = tid;
     }
     // d_raw_buf_ already has the deduplicated triangles in correct order
 
     rebuild_csr_and_upload_();
 
-    if (asgn_ms) rc(e4);
-    if (N_tri > 0) {
-        assign_triangles_kernel<<<grid_dim, block>>>(
-            d_t_grid_, W_, H_, d_grid_, d_raw,
-            d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri, nullptr);
-        cudaDeviceSynchronize();
-    } else {
-        cudaMemset(d_t_grid_, -1, N * sizeof(int32_t));
-    }
-    if (asgn_ms) rc(e5);
+    // Every pixel's assignment is now stale. Marking them invalidated rather
+    // than assigning here lets assign_pending_ pick the mask up like any other
+    // dirty region, and makes a first insert behave like the rest.
+    cudaMemset(d_t_grid_, -1, (size_t)W_ * H_ * sizeof(int32_t));
 
     if (det_ms) {
-        *det_ms  = el(e0,e1);
+        *det_ms   = el(e0,e1);
         *dedup_ms = el(e2,e3);
-        *asgn_ms  = el(e4,e5);
-        cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
-        cudaEventDestroy(e3); cudaEventDestroy(e4); cudaEventDestroy(e5);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaEventDestroy(e2); cudaEventDestroy(e3);
     }
 }
 
@@ -469,9 +686,8 @@ void IncrementalDelaunay::full_triangulate_(float* det_ms, float* dedup_ms, floa
 // partial_triangulate_: use d_changed_ to scope detection and assignment
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, float* asgn_ms)
+void IncrementalDelaunay::partial_topology_(float* det_ms, float* dedup_ms)
 {
-    const int N = W_ * H_;
     dim3 block(16, 16);
     dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
 
@@ -481,47 +697,40 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
         cudaEventSynchronize(b); float ms=0; cudaEventElapsedTime(&ms,a,b); return ms;
     };
 
-    cudaEvent_t e0,e1,e2,e3,e4,e5;
-    if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3);mk(&e4);mk(&e5); }
+    cudaEvent_t e0,e1,e2,e3;
+    if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3); }
 
-    std::vector<int32_t> h_changed(N);
-    cudaMemcpy(h_changed.data(), d_changed_, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    // Detection border: this insert's changes expanded by 2, which is the reach
+    // of the L-shaped stencil in find_triangle_seeds_kernel. Scoped to
+    // d_changed_ rather than the accumulator so a deferred round does not
+    // re-detect regions earlier rounds already handled.
+    dilate_fixed_kernel<<<grid_dim, block>>>(d_changed_, d_mask_, W_, H_, 2);
+    cudaDeviceSynchronize();
 
-    // Build border (expand by 2 for L-shapes) and reassign (expand by WINDOW_CAP)
-    std::vector<int32_t> h_border(N, 0), h_reassign(N, 0);
-    for (int y = 0; y < H_; ++y) {
-        for (int x = 0; x < W_; ++x) {
-            if (!h_changed[y * W_ + x]) continue;
-            for (int dy = -2; dy <= 2; ++dy)
-            for (int dx = -2; dx <= 2; ++dx) {
-                int bx = x+dx, by = y+dy;
-                if (bx>=0 && bx<W_ && by>=0 && by<H_) h_border[by*W_+bx] = 1;
-            }
-            for (int dy = -WINDOW_CAP; dy <= WINDOW_CAP; ++dy)
-            for (int dx = -WINDOW_CAP; dx <= WINDOW_CAP; ++dx) {
-                int bx = x+dx, by = y+dy;
-                if (bx>=0 && bx<W_ && by>=0 && by<H_) h_reassign[by*W_+bx] = 1;
-            }
-        }
-    }
-
-    // Mark stale triangles (canonical pixel in border)
+    // Which existing triangles the border invalidates. Sampling the mask at the
+    // triangles' own canonical pixels moves N_tri flags instead of the whole
+    // W*H mask, and d_raw_buf_ already holds those positions on the device in
+    // registry order -- but only until detection overwrites it below, so this
+    // has to happen first.
     int old_count = (int)h_triangles_.size();
-    std::vector<bool> is_stale(old_count, false);
-    for (int tid = 0; tid < old_count; ++tid) {
-        const auto& t = h_triangles_[tid];
-        if (t.x >= 0 && t.x < W_ && t.y >= 0 && t.y < H_)
-            if (h_border[t.y * W_ + t.x]) is_stale[tid] = true;
+    std::vector<uint8_t> h_stale(old_count, 0);
+    if (old_count > 0) {
+        mark_stale_kernel<<<(old_count + 255) / 256, 256>>>(
+            static_cast<RawTriangle*>(d_raw_buf_), old_count,
+            d_mask_, W_, H_, d_stale_);
+        cudaDeviceSynchronize();
+        cudaMemcpy(h_stale.data(), d_stale_, old_count * sizeof(uint8_t),
+                   cudaMemcpyDeviceToHost);
     }
-
-    cudaMemcpy(d_mask_, h_border.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
+    auto is_stale = [&h_stale](int tid) { return h_stale[tid] != 0; };
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_raw_buf_);
     int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
     if (det_ms) rc(e0);
-    find_triangle_seeds_kernel<<<grid_dim, block>>>(d_grid_, W_, H_, d_raw, d_counter, d_mask_);
+    find_triangle_seeds_kernel<<<grid_dim, block>>>(
+        d_grid_, W_, H_, d_sx_, d_sy_, d_raw, d_counter, d_mask_);
     cudaDeviceSynchronize();
     int32_t raw_count = 0;
     cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -546,17 +755,18 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     for (const auto& r : h_new) {
         auto key = pack_triplet_(r.a, r.b, r.c);
         auto it = h_triplet_to_tid_.find(key);
-        if (it == h_triplet_to_tid_.end() || is_stale[it->second])
+        if (it == h_triplet_to_tid_.end() || is_stale(it->second))
             to_add.push_back({r.x, r.y, r.a, r.b, r.c, r.orig_a, r.orig_b, r.orig_c});
     }
 
     // Compact: keep non-stale, append new; build remap old→new
     std::vector<int32_t> remap(old_count, -1);
     std::vector<HTriangle> compacted;
-    compacted.reserve(old_count - (int)std::count(is_stale.begin(),is_stale.end(),true)
+    compacted.reserve(old_count - (int)std::count(h_stale.begin(), h_stale.end(),
+                                                  (uint8_t)1)
                       + (int)to_add.size());
     for (int tid = 0; tid < old_count; ++tid) {
-        if (!is_stale[tid]) {
+        if (!is_stale(tid)) {
             remap[tid] = (int32_t)compacted.size();
             compacted.push_back(h_triangles_[tid]);
         }
@@ -566,18 +776,22 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
     h_triangles_ = std::move(compacted);
 
     // Rebuild lookup maps
-    h_triplet_to_tid_.clear(); h_canon_to_tid_.clear();
+    h_triplet_to_tid_.clear();
     for (int tid = 0; tid < (int)h_triangles_.size(); ++tid) {
         const auto& t = h_triangles_[tid];
         h_triplet_to_tid_[pack_triplet_(t.a, t.b, t.c)] = tid;
-        h_canon_to_tid_[pack_xy_(t.x, t.y)] = tid;
     }
 
     // Upload triangle array and CSR
     upload_triangles_();
     rebuild_csr_and_upload_();
 
-    // Remap d_t_grid_ through old→new table
+    // Remap d_t_grid_ through old→new table. Pixels whose triangle went stale
+    // get the -1 fallback, which build_reassign_mask_kernel then treats as
+    // "must reassign" regardless of distance -- that is how a deleted triangle
+    // is caught when the change that deleted it lay outside the pixel's own
+    // search window.
+    const int N = W_ * H_;
     int32_t fallback = -1;
     if (old_count > 0) {
         int32_t* d_remap;
@@ -588,26 +802,75 @@ void IncrementalDelaunay::partial_triangulate_(float* det_ms, float* dedup_ms, f
         cudaFree(d_remap);
     }
 
-    // Re-assign pixels in expanded reassign region
-    cudaMemcpy(d_mask_, h_reassign.data(), N * sizeof(int32_t), cudaMemcpyHostToDevice);
-
-    int N_tri = (int)h_triangles_.size();
-    if (asgn_ms) rc(e4);
-    if (N_tri > 0) {
-        assign_triangles_kernel<<<grid_dim, block>>>(
-            d_t_grid_, W_, H_, d_grid_,
-            static_cast<RawTriangle*>(d_raw_buf_),
-            d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri, d_mask_);
-        cudaDeviceSynchronize();
-    }
-    if (asgn_ms) rc(e5);
-
     if (det_ms) {
         *det_ms   = el(e0,e1);
         *dedup_ms = el(e2,e3);
-        *asgn_ms  = el(e4,e5);
-        cudaEventDestroy(e0); cudaEventDestroy(e1); cudaEventDestroy(e2);
-        cudaEventDestroy(e3); cudaEventDestroy(e4); cudaEventDestroy(e5);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaEventDestroy(e2); cudaEventDestroy(e3);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// assign_pending_: one pixel-assignment pass covering everything deferred
+// ---------------------------------------------------------------------------
+
+void IncrementalDelaunay::build_reassign_mask_()
+{
+    dim3 block(16, 16);
+    dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
+
+    cudaMemset(d_tile_dirty_, 0,
+               (size_t)tiles_x_ * tiles_y_ * sizeof(int32_t));
+    build_tile_dirty_kernel<<<grid_dim, block>>>(
+        d_dirty_accum_, d_tile_dirty_, W_, H_, tiles_x_);
+    cudaDeviceSynchronize();
+
+    build_reassign_mask_kernel<<<grid_dim, block>>>(
+        d_grid_, d_t_grid_, d_tile_dirty_, d_mask_, W_, H_, tiles_x_);
+    cudaDeviceSynchronize();
+}
+
+int IncrementalDelaunay::count_mask_()
+{
+    thrust::device_ptr<int32_t> p(d_mask_);
+    return (int)thrust::reduce(p, p + (size_t)W_ * H_, (int32_t)0);
+}
+
+void IncrementalDelaunay::assign_pending_(float* asgn_ms)
+{
+    const int N = W_ * H_;
+    dim3 block(16, 16);
+    dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
+
+    int N_tri = (int)h_triangles_.size();
+    if (N_tri == 0) {
+        cudaMemset(d_t_grid_, -1, (size_t)N * sizeof(int32_t));
+        if (asgn_ms) *asgn_ms = 0.f;
+        return;
+    }
+
+    build_reassign_mask_();
+
+    // Masking is only worth its own overhead while it excludes enough pixels.
+    // Past that the mask read and the scattered writes cost more than the work
+    // they save, so hand the kernel a null mask and let it run coalesced.
+    const int dirty = count_mask_();
+    const bool use_mask = dirty < (int)(ASSIGN_FULL_FRACTION * (float)N);
+
+    cudaEvent_t e0, e1;
+    if (asgn_ms) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0); }
+
+    assign_triangles_kernel<<<grid_dim, block>>>(
+        d_t_grid_, W_, H_, d_grid_,
+        static_cast<RawTriangle*>(d_raw_buf_),
+        d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri,
+        use_mask ? d_mask_ : nullptr);
+    cudaDeviceSynchronize();
+
+    if (asgn_ms) {
+        cudaEventRecord(e1); cudaEventSynchronize(e1);
+        cudaEventElapsedTime(asgn_ms, e0, e1);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
     }
 }
 
@@ -688,15 +951,12 @@ void IncrementalDelaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 // insert
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::insert(
+void IncrementalDelaunay::apply_batch_(
     const std::vector<int32_t>& new_xs,
     const std::vector<int32_t>& new_ys,
-    std::vector<TriangleEntry>&  tri_map_out,
-    std::vector<int32_t>&        tgrid_out,
-    IncrementalTimings*          timings)
+    float* bfs_ms_out)
 {
     int k = (int)new_xs.size();
-    if (k == 0) { build_outputs_(tri_map_out, tgrid_out); return; }
 
     if (N_ + k > max_seeds_)
         throw std::invalid_argument("insert would exceed max_seeds capacity");
@@ -706,18 +966,21 @@ void IncrementalDelaunay::insert(
         if (new_xs[i] < 0 || new_xs[i] >= W_ || new_ys[i] < 0 || new_ys[i] >= H_)
             throw std::invalid_argument("seed coordinate out of bounds");
 
-    // Duplicate check within batch
-    for (int i = 0; i < k; ++i)
-    for (int j = i+1; j < k; ++j)
-        if (new_xs[i] == new_xs[j] && new_ys[i] == new_ys[j])
-            throw std::invalid_argument("duplicate seed positions within batch");
-
-    // Duplicate check against existing seeds
-    for (int i = 0; i < k; ++i)
-        if (h_seed_set_.count(pack_xy_(new_xs[i], new_ys[i])))
-            throw std::invalid_argument("seed position already exists");
-
-    bool is_first = (N_ == 0);
+    // Duplicate checks, within the batch and against existing seeds. Both go
+    // through a hash set: the intra-batch check used to be O(k^2), which is
+    // invisible for the handful of seeds the tests insert and quadratic for the
+    // thousands a refinement round adds.
+    {
+        std::unordered_set<uint64_t> batch_seen;
+        batch_seen.reserve(k * 2);
+        for (int i = 0; i < k; ++i) {
+            uint64_t key = pack_xy_(new_xs[i], new_ys[i]);
+            if (!batch_seen.insert(key).second)
+                throw std::invalid_argument("duplicate seed positions within batch");
+            if (h_seed_set_.count(key))
+                throw std::invalid_argument("seed position already exists");
+        }
+    }
 
     // Register seeds
     std::vector<int32_t> new_ids(k);
@@ -735,8 +998,10 @@ void IncrementalDelaunay::insert(
     cudaMemcpy(d_sy_ + N_ - k, new_ys.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
 
     // Reset change accumulator before writing seeds (so seed positions
-    // are the first entries in d_changed_ — necessary for partial_triangulate_
+    // are the first entries in d_changed_ — necessary for partial_topology_
     // to cover detection positions that touch the seed cell directly).
+    // d_changed_ is per-insert and scopes detection; d_dirty_accum_ below is
+    // the union since the last finalise and scopes assignment.
     cudaMemset(d_changed_, 0, (size_t)W_ * H_ * sizeof(int32_t));
 
     // Write seeds into grid (also marks seed cells in d_changed_)
@@ -752,25 +1017,84 @@ void IncrementalDelaunay::insert(
     cudaFree(d_kxs); cudaFree(d_kys); cudaFree(d_kids);
 
     // BFS
+    run_bfs_(bfs_ms_out);
+
+    // Fold this insert's changes into the set awaiting assignment.
+    const int N = W_ * H_;
+    or_mask_kernel<<<(N + 255) / 256, 256>>>(d_changed_, d_dirty_accum_, N);
+    cudaDeviceSynchronize();
+}
+
+// ---------------------------------------------------------------------------
+// insert_deferred / finalise / insert
+// ---------------------------------------------------------------------------
+
+void IncrementalDelaunay::insert_deferred(
+    const std::vector<int32_t>& new_xs,
+    const std::vector<int32_t>& new_ys,
+    IncrementalTimings*          timings)
+{
+    int k = (int)new_xs.size();
+    if (k == 0) return;
+
+    bool is_first = (N_ == 0);
+
     float bfs_ms = 0.f;
-    run_bfs_(timings ? &bfs_ms : nullptr);
+    apply_batch_(new_xs, new_ys, timings ? &bfs_ms : nullptr);
     if (timings) timings->bfs_ms = bfs_ms;
 
-    // Triangulate
-    float det_ms = 0.f, dup_ms = 0.f, asgn_ms = 0.f;
+    float det_ms = 0.f, dup_ms = 0.f;
     if (is_first)
-        full_triangulate_(timings ? &det_ms : nullptr,
-                          timings ? &dup_ms  : nullptr,
-                          timings ? &asgn_ms : nullptr);
+        full_topology_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr);
     else
-        partial_triangulate_(timings ? &det_ms : nullptr,
-                             timings ? &dup_ms  : nullptr,
-                             timings ? &asgn_ms : nullptr);
+        partial_topology_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr);
+
     if (timings) {
         timings->detect_ms = det_ms;
         timings->dedup_ms  = dup_ms;
-        timings->assign_ms = asgn_ms;
+        timings->assign_ms = 0.f;
     }
+    pending_ = true;
+}
 
+void IncrementalDelaunay::finalise(
+    std::vector<TriangleEntry>& tri_map_out,
+    std::vector<int32_t>&       tgrid_out,
+    IncrementalTimings*         timings)
+{
+    if (pending_) {
+        float asgn_ms = 0.f;
+        assign_pending_(timings ? &asgn_ms : nullptr);
+        if (timings) timings->assign_ms = asgn_ms;
+        cudaMemset(d_dirty_accum_, 0, (size_t)W_ * H_ * sizeof(int32_t));
+        pending_ = false;
+    }
     build_outputs_(tri_map_out, tgrid_out);
+}
+
+void IncrementalDelaunay::insert(
+    const std::vector<int32_t>& new_xs,
+    const std::vector<int32_t>& new_ys,
+    std::vector<TriangleEntry>&  tri_map_out,
+    std::vector<int32_t>&        tgrid_out,
+    IncrementalTimings*          timings)
+{
+    if (timings) *timings = IncrementalTimings{};
+    insert_deferred(new_xs, new_ys, timings);
+    finalise(tri_map_out, tgrid_out, timings);
+}
+
+// ---------------------------------------------------------------------------
+// get_triangles: topology without touching the raster
+// ---------------------------------------------------------------------------
+
+void IncrementalDelaunay::get_triangles(std::vector<TriangleEntry>& out) const
+{
+    int N_tri = (int)h_triangles_.size();
+    out.resize(N_tri);
+    for (int tid = 0; tid < N_tri; ++tid) {
+        const auto& t = h_triangles_[tid];
+        // Insertion-order ids, deliberately untranslated -- see the header.
+        out[tid] = {t.x, t.y, t.orig_a, t.orig_b, t.orig_c};
+    }
 }

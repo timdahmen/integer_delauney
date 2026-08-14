@@ -19,6 +19,7 @@ public:
 
     // Appends a batch of seeds (insertion-order IDs).
     // Returns current full triangle_map and triangulation grid (H,W,3).
+    // Exactly equivalent to insert_deferred() followed by finalise().
     void insert(
         const std::vector<int32_t>& new_xs,
         const std::vector<int32_t>& new_ys,
@@ -26,10 +27,46 @@ public:
         std::vector<int32_t>&        tgrid_out,
         IncrementalTimings*          timings = nullptr);
 
+    // Appends a batch, updating the Voronoi diagram and the triangle topology
+    // but NOT the per-pixel triangle assignment, and materialising no output.
+    //
+    // The per-pixel assignment is the expensive stage and the only one whose
+    // dirty region saturates for large scattered batches, so a caller that
+    // inserts repeatedly before it needs a raster should defer it.  Changes
+    // accumulate until finalise() assigns them in one pass.
+    //
+    // get_triangles() is valid between deferred inserts; the triangulation
+    // grid is not, and neither is get_voronoi_grid()'s triangle content.
+    void insert_deferred(
+        const std::vector<int32_t>& new_xs,
+        const std::vector<int32_t>& new_ys,
+        IncrementalTimings*          timings = nullptr);
+
+    // Assigns pixels for everything deferred since the last finalise, then
+    // materialises the outputs.  Chooses a masked or a full assignment by
+    // whichever covers less work, so a small accumulated change stays cheap and
+    // a large one does not pay for masking it cannot benefit from.
+    // Calling this with nothing pending only rebuilds the outputs.
+    void finalise(
+        std::vector<TriangleEntry>& tri_map_out,
+        std::vector<int32_t>&       tgrid_out,
+        IncrementalTimings*         timings = nullptr);
+
+    // Triangle topology alone, with no raster copied back.  Seed ids are
+    // INSERTION-order, not the sorted numbering insert()/finalise() report:
+    // a caller refining across several inserts keeps its own per-seed arrays
+    // aligned by appending, which sorted ids would invalidate on every call.
+    // Translate with sorted_rank() when handing results to the batch API.
+    void get_triangles(std::vector<TriangleEntry>& out) const;
+
+    // internal insertion-order id -> batch pipeline's sorted (x asc, y asc) id
+    const std::vector<int32_t>& sorted_rank() const { return h_sorted_rank_; }
+
     void get_voronoi_grid(std::vector<int32_t>& out) const;
     int  seed_count() const { return N_; }
     int  width()      const { return W_; }
     int  height()     const { return H_; }
+    bool has_pending() const { return pending_; }
 
 private:
     int W_, H_, N_, max_seeds_;
@@ -46,6 +83,16 @@ private:
     int32_t* d_csr_idx_;     // (max_seeds*8) CSR triangle IDs
     int32_t* d_updated_flag_;// (1)     BFS convergence flag
     int32_t* d_mask_;        // (H*W)   reused for border / reassign masks
+    // Changes since the last finalise, as opposed to d_changed_, which holds
+    // only the current insert's.  Detection is scoped by the latter so a
+    // deferred round does not re-detect earlier rounds' regions; assignment is
+    // scoped by the former because it has not run for any of them yet.
+    int32_t* d_dirty_accum_; // (H*W)   union of d_changed_ since last finalise
+    int32_t* d_tile_dirty_;  // (tiles) tile-level dirty flags, mask prefilter
+    int32_t* d_count_;       // (1)     dirty-pixel counter for the cost switch
+    uint8_t* d_stale_;       // (max triangles) per-triangle invalidation flags
+    int      tiles_x_, tiles_y_;
+    bool     pending_;       // deferred inserts awaiting a finalise
 
     // ---- host-side triangle registry ----
     struct HTriangle {
@@ -55,7 +102,9 @@ private:
     };
     std::vector<HTriangle>                 h_triangles_;
     std::unordered_map<uint64_t,int32_t>   h_triplet_to_tid_;
-    std::unordered_map<uint64_t,int32_t>   h_canon_to_tid_;
+    // (A canonical-pixel -> tid map used to live here. It was written on every
+    // registry rebuild and never read; with the 2x2 detection two triangles can
+    // share a canonical pixel anyway, so it could not have been a key.)
 
     // ---- host-side seed registry ----
     std::vector<int32_t>            h_sx_, h_sy_;
@@ -72,8 +121,18 @@ private:
     // ---- private helpers ----
     void rebuild_sorted_rank_();
     void run_bfs_(float* bfs_ms_out);
-    void full_triangulate_(float* detect_ms, float* dedup_ms, float* assign_ms);
-    void partial_triangulate_(float* detect_ms, float* dedup_ms, float* assign_ms);
+    // Topology only: detect + dedup + registry + CSR. Pixel assignment is
+    // separate so it can be deferred across several inserts and run once.
+    void full_topology_(float* detect_ms, float* dedup_ms);
+    void partial_topology_(float* detect_ms, float* dedup_ms);
+    // Registration + seed write + BFS, shared by insert() and insert_deferred().
+    void apply_batch_(const std::vector<int32_t>& new_xs,
+                      const std::vector<int32_t>& new_ys,
+                      float* bfs_ms_out);
+    // Pixel assignment over d_dirty_accum_, masked or full by measured cost.
+    void assign_pending_(float* assign_ms);
+    void build_reassign_mask_();
+    int  count_mask_();
     void rebuild_csr_and_upload_();
     void upload_triangles_();
     void build_outputs_(std::vector<TriangleEntry>& tri_map_out,

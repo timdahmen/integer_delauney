@@ -251,17 +251,18 @@ public:
     PyIncrementalDelaunay(int width, int height, int max_seeds)
         : impl_(width, height, max_seeds) {}
 
-    py::tuple insert(const py::object& seeds_obj)
+    py::tuple insert(const py::object& seeds_obj, bool as_arrays)
     {
         std::vector<int32_t> xs, ys;
         _parse_seeds(seeds_obj, xs, ys);
         std::vector<TriangleEntry> tri_map;
         std::vector<int32_t> tgrid;
         impl_.insert(xs, ys, tri_map, tgrid);
-        return _build_output(tri_map, tgrid, impl_.height(), impl_.width());
+        return _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
+                             as_arrays);
     }
 
-    py::tuple insert_timed(const py::object& seeds_obj)
+    py::tuple insert_timed(const py::object& seeds_obj, bool as_arrays)
     {
         std::vector<int32_t> xs, ys;
         _parse_seeds(seeds_obj, xs, ys);
@@ -269,15 +270,70 @@ public:
         std::vector<int32_t> tgrid;
         IncrementalTimings t;
         impl_.insert(xs, ys, tri_map, tgrid, &t);
+        auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
+                                 as_arrays);
+        return py::make_tuple(out[0], out[1], _timings_dict(t));
+    }
 
-        py::dict py_t;
-        py_t["bfs_ms"]    = t.bfs_ms;
-        py_t["detect_ms"] = t.detect_ms;
-        py_t["dedup_ms"]  = t.dedup_ms;
-        py_t["assign_ms"] = t.assign_ms;
+    void insert_deferred(const py::object& seeds_obj)
+    {
+        std::vector<int32_t> xs, ys;
+        _parse_seeds(seeds_obj, xs, ys);
+        impl_.insert_deferred(xs, ys);
+    }
 
-        auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width());
-        return py::make_tuple(out[0], out[1], py_t);
+    py::dict insert_deferred_timed(const py::object& seeds_obj)
+    {
+        std::vector<int32_t> xs, ys;
+        _parse_seeds(seeds_obj, xs, ys);
+        IncrementalTimings t;
+        impl_.insert_deferred(xs, ys, &t);
+        return _timings_dict(t);
+    }
+
+    py::tuple finalise(bool as_arrays)
+    {
+        std::vector<TriangleEntry> tri_map;
+        std::vector<int32_t> tgrid;
+        impl_.finalise(tri_map, tgrid);
+        return _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
+                             as_arrays);
+    }
+
+    py::tuple finalise_timed(bool as_arrays)
+    {
+        std::vector<TriangleEntry> tri_map;
+        std::vector<int32_t> tgrid;
+        IncrementalTimings t;
+        impl_.finalise(tri_map, tgrid, &t);
+        auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
+                                 as_arrays);
+        return py::make_tuple(out[0], out[1], _timings_dict(t));
+    }
+
+    // (N_tri, 3) vertex ids only -- no raster, no canonical pixels.
+    py::array_t<int32_t> get_triangles() const
+    {
+        std::vector<TriangleEntry> tris;
+        impl_.get_triangles(tris);
+        const int n = (int)tris.size();
+        py::array_t<int32_t> arr({n, 3});
+        auto* p = arr.mutable_data();
+        for (int i = 0; i < n; ++i) {
+            p[i*3]   = tris[i].id_a;
+            p[i*3+1] = tris[i].id_b;
+            p[i*3+2] = tris[i].id_c;
+        }
+        return arr;
+    }
+
+    py::array_t<int32_t> sorted_rank() const
+    {
+        const auto& r = impl_.sorted_rank();
+        py::array_t<int32_t> arr((py::ssize_t)r.size());
+        if (!r.empty())
+            std::memcpy(arr.mutable_data(), r.data(), r.size() * sizeof(int32_t));
+        return arr;
     }
 
     py::array_t<int32_t> get_voronoi_grid() const
@@ -290,16 +346,44 @@ public:
         return arr;
     }
 
-    int seed_count() const { return impl_.seed_count(); }
-    int width()      const { return impl_.width(); }
-    int height()     const { return impl_.height(); }
+    int  seed_count()  const { return impl_.seed_count(); }
+    int  width()       const { return impl_.width(); }
+    int  height()      const { return impl_.height(); }
+    bool has_pending() const { return impl_.has_pending(); }
 
 private:
     IncrementalDelaunay impl_;
 
+    static py::dict _timings_dict(const IncrementalTimings& t)
+    {
+        py::dict d;
+        d["bfs_ms"]    = t.bfs_ms;
+        d["detect_ms"] = t.detect_ms;
+        d["dedup_ms"]  = t.dedup_ms;
+        d["assign_ms"] = t.assign_ms;
+        return d;
+    }
+
     static void _parse_seeds(const py::object& seeds_obj,
                              std::vector<int32_t>& xs, std::vector<int32_t>& ys)
     {
+        // Fast path for the (N, 2) integer arrays callers actually pass. The
+        // generic path below casts two Python objects per seed, which is fine
+        // for a handful and not for the thousands a refinement round inserts.
+        if (py::isinstance<py::array>(seeds_obj)) {
+            auto arr = py::array_t<int32_t, py::array::c_style |
+                                            py::array::forcecast>::ensure(seeds_obj);
+            if (arr && arr.ndim() == 2 && arr.shape(1) == 2) {
+                const py::ssize_t n = arr.shape(0);
+                const int32_t* p = arr.data();
+                xs.resize(n); ys.resize(n);
+                for (py::ssize_t i = 0; i < n; ++i) {
+                    xs[i] = p[i*2];
+                    ys[i] = p[i*2 + 1];
+                }
+                return;
+            }
+        }
         for (auto item : seeds_obj) {
             auto pair = item.cast<py::sequence>();
             xs.push_back(pair[0].cast<int32_t>());
@@ -309,16 +393,29 @@ private:
 
     static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
                                    const std::vector<int32_t>& flat_out,
-                                   int H, int W)
+                                   int H, int W, bool as_arrays = false)
     {
-        py::dict py_map;
-        for (int32_t tid = 0; tid < (int32_t)tri_map.size(); ++tid) {
-            const auto& e = tri_map[tid];
-            py_map[py::int_(tid)] = py::make_tuple(e.x, e.y, e.id_a, e.id_b, e.id_c);
-        }
         py::array_t<int32_t> out_arr({H, W, 3});
         std::memcpy(out_arr.mutable_data(), flat_out.data(),
                     flat_out.size() * sizeof(int32_t));
+
+        const int32_t n_tri = (int32_t)tri_map.size();
+        if (as_arrays) {
+            py::array_t<int32_t> verts({(int)n_tri, 3});
+            auto* p = verts.mutable_data();
+            for (int32_t tid = 0; tid < n_tri; ++tid) {
+                p[tid*3]   = tri_map[tid].id_a;
+                p[tid*3+1] = tri_map[tid].id_b;
+                p[tid*3+2] = tri_map[tid].id_c;
+            }
+            return py::make_tuple(verts, out_arr);
+        }
+
+        py::dict py_map;
+        for (int32_t tid = 0; tid < n_tri; ++tid) {
+            const auto& e = tri_map[tid];
+            py_map[py::int_(tid)] = py::make_tuple(e.x, e.y, e.id_a, e.id_b, e.id_c);
+        }
         return py::make_tuple(py_map, out_arr);
     }
 };
@@ -377,17 +474,54 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "Create an incremental Delaunay triangulator with device-resident state.\n\n"
              "max_seeds: upper bound on total seeds ever inserted.")
         .def("insert", &PyIncrementalDelaunay::insert,
-             py::arg("seeds"),
+             py::arg("seeds"), py::arg("as_arrays") = false,
              "Insert a batch of (x, y) seeds and update the triangulation.\n\n"
              "Returns (triangle_map, triangulation_grid) where triangle_map is\n"
-             "{int: (x,y,id_a,id_b,id_c)} and triangulation_grid has shape (H,W,3).")
+             "{int: (x,y,id_a,id_b,id_c)}, or an (N_tri, 3) vertex-id array when\n"
+             "as_arrays=True, and triangulation_grid has shape (H,W,3).\n\n"
+             "Equivalent to insert_deferred() followed by finalise().")
         .def("insert_timed", &PyIncrementalDelaunay::insert_timed,
-             py::arg("seeds"),
+             py::arg("seeds"), py::arg("as_arrays") = false,
              "Same as insert() but also returns a timings dict with keys\n"
              "bfs_ms, detect_ms, dedup_ms, assign_ms.")
+        .def("insert_deferred", &PyIncrementalDelaunay::insert_deferred,
+             py::arg("seeds"),
+             "Insert a batch, updating the Voronoi diagram and triangle topology\n"
+             "but not the per-pixel assignment, and returning nothing.\n\n"
+             "Pixel assignment is the expensive stage and the only one whose\n"
+             "dirty region saturates for large scattered batches, so a caller\n"
+             "that inserts several times before it needs a raster should defer\n"
+             "it and call finalise() once.  get_triangles() stays valid in\n"
+             "between; the triangulation grid does not.")
+        .def("insert_deferred_timed", &PyIncrementalDelaunay::insert_deferred_timed,
+             py::arg("seeds"),
+             "Same as insert_deferred() but returns the timings dict.\n"
+             "assign_ms is always 0 here; it is reported by finalise().")
+        .def("finalise", &PyIncrementalDelaunay::finalise,
+             py::arg("as_arrays") = false,
+             "Assign pixels for everything deferred since the last finalise and\n"
+             "return (triangle_map, triangulation_grid).\n\n"
+             "Picks a masked or a full assignment by whichever covers less work,\n"
+             "so a small accumulated change stays cheap.  Calling this with\n"
+             "nothing pending just rebuilds the outputs.")
+        .def("finalise_timed", &PyIncrementalDelaunay::finalise_timed,
+             py::arg("as_arrays") = false,
+             "Same as finalise() but also returns the timings dict.")
+        .def("get_triangles", &PyIncrementalDelaunay::get_triangles,
+             "Triangle topology alone as an (N_tri, 3) int32 array, with no\n"
+             "raster copied back.\n\n"
+             "Seed ids are INSERTION-order, not the sorted numbering insert()\n"
+             "and finalise() report, so that a caller appending seeds across\n"
+             "several inserts keeps its own per-seed arrays aligned.  Use\n"
+             "sorted_rank to translate.")
+        .def_property_readonly("sorted_rank", &PyIncrementalDelaunay::sorted_rank,
+             "int32 array mapping insertion-order seed id -> sorted (x asc,\n"
+             "y asc) id, which is the numbering insert()/finalise() report.")
         .def("get_voronoi_grid", &PyIncrementalDelaunay::get_voronoi_grid,
              "Return the current Voronoi grid as int32 array of shape (H, W, 2).")
         .def_property_readonly("seed_count", &PyIncrementalDelaunay::seed_count)
         .def_property_readonly("width",  &PyIncrementalDelaunay::width)
-        .def_property_readonly("height", &PyIncrementalDelaunay::height);
+        .def_property_readonly("height", &PyIncrementalDelaunay::height)
+        .def_property_readonly("has_pending", &PyIncrementalDelaunay::has_pending,
+             "True when deferred inserts are awaiting a finalise().");
 }
