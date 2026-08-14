@@ -39,6 +39,12 @@ if _cuda_available():
 W, H = 64, 64
 MAX_SEEDS = 4096
 
+# Padding pinned to 0 throughout, matching batch_triangulate: the incremental
+# constructor now defaults to auto padding like the batch API, so leaving it
+# unset would compare a padded triangulation against an unpadded one and call
+# the difference a bug. Padding equivalence has its own tests.
+PADDING = 0
+
 
 def tri_set(tri_map):
     """Canonical triplet set, so insertion-order ids do not matter."""
@@ -75,14 +81,14 @@ def scattered_seeds(n, rng, w=W, h=H):
 class TestDeferredMatchesImmediate:
 
     def _run_immediate(self, batches):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map = tgrid = None
         for b in batches:
             tri_map, tgrid = inc.insert(b)
         return tri_set(tri_map), tgrid
 
     def _run_deferred(self, batches):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         for b in batches:
             inc.insert_deferred(b)
         tri_map, tgrid = inc.finalise()
@@ -125,7 +131,7 @@ class TestDeferredMatchesBatch:
     def test_triangles_match_batch(self):
         rng = np.random.default_rng(3)
         seeds = scattered_seeds(120, rng)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         for b in (seeds[:50], seeds[50:90], seeds[90:]):
             inc.insert_deferred(b)
         tri_map, _ = inc.finalise()
@@ -141,7 +147,7 @@ class TestDeferredMatchesBatch:
         """
         rng = np.random.default_rng(4)
         seeds = scattered_seeds(600, rng)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert_deferred(seeds[:100])
         inc.insert_deferred(seeds[100:])
         tri_map, _ = inc.finalise()
@@ -158,7 +164,7 @@ class TestDeferredApi:
     def test_has_pending_tracks_state(self):
         rng = np.random.default_rng(5)
         seeds = scattered_seeds(30, rng)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         assert not inc.has_pending
         inc.insert_deferred(seeds)
         assert inc.has_pending
@@ -168,7 +174,7 @@ class TestDeferredApi:
     def test_finalise_with_nothing_pending_is_idempotent(self):
         rng = np.random.default_rng(6)
         seeds = scattered_seeds(40, rng)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert_deferred(seeds)
         map1, grid1 = inc.finalise()
         map2, grid2 = inc.finalise()
@@ -184,7 +190,7 @@ class TestDeferredApi:
         """
         rng = np.random.default_rng(7)
         seeds = scattered_seeds(80, rng)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert_deferred(seeds[:40])
         inc.insert_deferred(seeds[40:])
 
@@ -200,7 +206,7 @@ class TestDeferredApi:
     def test_get_triangles_needs_no_finalise(self):
         rng = np.random.default_rng(8)
         seeds = scattered_seeds(60, rng)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert_deferred(seeds)
         tris = inc.get_triangles()
         assert tris.ndim == 2 and tris.shape[1] == 3
@@ -211,11 +217,11 @@ class TestDeferredApi:
         rng = np.random.default_rng(9)
         seeds = scattered_seeds(70, rng)
 
-        inc_a = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc_a = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc_a.insert_deferred(seeds)
         map_dict, grid_dict = inc_a.finalise(as_arrays=False)
 
-        inc_b = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc_b = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc_b.insert_deferred(seeds)
         map_arr, grid_arr = inc_b.finalise(as_arrays=True)
 
@@ -228,11 +234,11 @@ class TestDeferredApi:
         rng = np.random.default_rng(10)
         seeds = scattered_seeds(50, rng)
 
-        inc_a = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc_a = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc_a.insert_deferred(np.asarray(seeds, dtype=np.int32))
         map_a, grid_a = inc_a.finalise()
 
-        inc_b = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc_b = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc_b.insert_deferred(seeds)
         map_b, grid_b = inc_b.finalise()
 
@@ -240,12 +246,12 @@ class TestDeferredApi:
         np.testing.assert_array_equal(grid_a, grid_b)
 
     def test_duplicate_within_batch_still_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         with pytest.raises(ValueError):
             inc.insert_deferred([[1, 1], [2, 2], [1, 1]])
 
     def test_duplicate_across_deferred_batches_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert_deferred([[1, 1], [2, 2], [3, 5]])
         with pytest.raises(ValueError):
             inc.insert_deferred([[4, 4], [2, 2]])
@@ -253,7 +259,7 @@ class TestDeferredApi:
     def test_timings_reported(self):
         rng = np.random.default_rng(11)
         seeds = scattered_seeds(40, rng)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         t_ins = inc.insert_deferred_timed(seeds)
         # Assignment has not run yet; that is the whole point of the mode.
         assert t_ins["assign_ms"] == 0.0

@@ -176,6 +176,7 @@ tri = IncrementalDelaunay(
     width: int,
     height: int,
     max_seeds: int,
+    border_padding: int = -1,
 )
 ```
 
@@ -184,6 +185,23 @@ tri = IncrementalDelaunay(
 | `width` | `int` | Grid width in pixels. |
 | `height` | `int` | Grid height in pixels. |
 | `max_seeds` | `int` | Hard upper bound on total seeds ever inserted. Used to pre-allocate GPU memory. |
+| `border_padding` | `int` | Width of the padded detection canvas; `< 0` selects `auto_border_padding(width, height, max_seeds)`. |
+
+> **`border_padding` is fixed at construction here**, unlike the batch API where
+> it is a per-call argument. The padded canvas is the persistent device state,
+> so it cannot be resized per insert.
+>
+> This matters because the auto rule scales as `sqrt(area / n)` and therefore
+> *shrinks* as seeds are added. Resolving it against `max_seeds` matches what
+> the batch path would choose for the final state, but leaves a triangulation
+> sitting well below `max_seeds` under-padded. Pass a value explicitly when the
+> eventual seed count is not close to `max_seeds` — a test inserting 12 seeds
+> with `max_seeds=4096` wants roughly 18, not 1.
+>
+> Cost is `((W+2P)(H+2P)) / (WH)` in grid work — about 2% at 1500×1000 with
+> `P = 7`. Pass `0` to opt out entirely.
+
+Read `tri.border_padding` for the resolved value.
 
 ---
 
@@ -316,6 +334,7 @@ Returns the current Voronoi state as a `VoronoiGrid` without running a triangula
 | `tri.height` | `int` | Grid height. |
 | `tri.seed_count` | `int` | Number of seeds inserted so far. |
 | `tri.has_pending` | `bool` | True when deferred inserts await a `finalise()`. |
+| `tri.border_padding` | `int` | Resolved width of the padded detection canvas. |
 
 ---
 

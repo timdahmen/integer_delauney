@@ -248,8 +248,9 @@ private:
 
 class PyIncrementalDelaunay {
 public:
-    PyIncrementalDelaunay(int width, int height, int max_seeds)
-        : impl_(width, height, max_seeds) {}
+    PyIncrementalDelaunay(int width, int height, int max_seeds,
+                          int border_padding)
+        : impl_(width, height, max_seeds, border_padding) {}
 
     py::tuple insert(const py::object& seeds_obj, bool as_arrays)
     {
@@ -346,10 +347,11 @@ public:
         return arr;
     }
 
-    int  seed_count()  const { return impl_.seed_count(); }
-    int  width()       const { return impl_.width(); }
-    int  height()      const { return impl_.height(); }
-    bool has_pending() const { return impl_.has_pending(); }
+    int  seed_count()     const { return impl_.seed_count(); }
+    int  width()          const { return impl_.width(); }
+    int  height()         const { return impl_.height(); }
+    int  border_padding() const { return impl_.border_padding(); }
+    bool has_pending()    const { return impl_.has_pending(); }
 
 private:
     IncrementalDelaunay impl_;
@@ -469,10 +471,22 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "padded_voronoi_grid has shape (H+2*P, W+2*P, 2).");
 
     py::class_<PyIncrementalDelaunay>(m, "IncrementalDelaunay")
-        .def(py::init<int, int, int>(),
+        .def(py::init<int, int, int, int>(),
              py::arg("width"), py::arg("height"), py::arg("max_seeds"),
+             py::arg("border_padding") = -1,
              "Create an incremental Delaunay triangulator with device-resident state.\n\n"
-             "max_seeds: upper bound on total seeds ever inserted.")
+             "max_seeds: upper bound on total seeds ever inserted.\n"
+             "border_padding: width of the padded detection canvas; < 0 selects\n"
+             "  delauney.auto_border_padding(width, height, max_seeds).\n\n"
+             "  A triangle is registered where three Voronoi regions meet, i.e. at\n"
+             "  its circumcentre, and boundary triangles frequently have\n"
+             "  circumcentres outside the image, so at 0 they are never detected.\n"
+             "  Unlike the batch API this is fixed at construction, because the\n"
+             "  padded canvas is the persistent device state -- and the auto rule\n"
+             "  shrinks as seeds are added, so a state well below max_seeds is\n"
+             "  under-padded relative to what the batch path would pick for it.\n"
+             "  Pass a value explicitly when the eventual seed count is not close\n"
+             "  to max_seeds. Padding costs ((W+2P)(H+2P))/(WH) in grid work.")
         .def("insert", &PyIncrementalDelaunay::insert,
              py::arg("seeds"), py::arg("as_arrays") = false,
              "Insert a batch of (x, y) seeds and update the triangulation.\n\n"
@@ -522,6 +536,9 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def_property_readonly("seed_count", &PyIncrementalDelaunay::seed_count)
         .def_property_readonly("width",  &PyIncrementalDelaunay::width)
         .def_property_readonly("height", &PyIncrementalDelaunay::height)
+        .def_property_readonly("border_padding",
+             &PyIncrementalDelaunay::border_padding,
+             "Resolved width of the padded detection canvas.")
         .def_property_readonly("has_pending", &PyIncrementalDelaunay::has_pending,
              "True when deferred inserts are awaiting a finalise().");
 }

@@ -14,7 +14,16 @@ struct IncrementalTimings {
 
 class IncrementalDelaunay {
 public:
-    IncrementalDelaunay(int width, int height, int max_seeds);
+    // border_padding < 0 selects delauney::auto_border_padding(w, h, max_seeds).
+    //
+    // Unlike the batch API this is fixed at construction, because the padded
+    // canvas is the persistent device state. The auto rule scales as
+    // sqrt(area / n) and so shrinks as seeds are added, meaning a state well
+    // below max_seeds is under-padded relative to what the batch path would
+    // choose for it. Pass a value explicitly when the eventual seed count is
+    // not close to max_seeds.
+    IncrementalDelaunay(int width, int height, int max_seeds,
+                        int border_padding = -1);
     ~IncrementalDelaunay();
 
     // Appends a batch of seeds (insertion-order IDs).
@@ -63,15 +72,25 @@ public:
     const std::vector<int32_t>& sorted_rank() const { return h_sorted_rank_; }
 
     void get_voronoi_grid(std::vector<int32_t>& out) const;
-    int  seed_count() const { return N_; }
-    int  width()      const { return W_; }
-    int  height()     const { return H_; }
-    bool has_pending() const { return pending_; }
+    int  seed_count()    const { return N_; }
+    int  width()         const { return W_; }
+    int  height()        const { return H_; }
+    int  border_padding() const { return P_; }
+    bool has_pending()   const { return pending_; }
 
 private:
     int W_, H_, N_, max_seeds_;
+    // Detection canvas. All device grids live in padded coordinates: a triangle
+    // is registered where three Voronoi regions meet, i.e. at its circumcentre,
+    // and boundary triangles frequently have circumcentres outside the image,
+    // so at P_ = 0 they are never detected at all. Working padded throughout
+    // keeps every kernel on one coordinate system; the interior is extracted
+    // only when building outputs, and canonical triangle positions are shifted
+    // back by P_ there. Seed coordinates are stored padded on the device and
+    // unpadded on the host.
+    int P_, W_det_, H_det_;
 
-    // ---- persistent device buffers ----
+    // ---- persistent device buffers, all sized on the padded canvas ----
     int32_t* d_grid_;        // (H*W*2) Voronoi: interleaved (seed_id, distance)
     int32_t* d_tmp_;         // (H*W*2) BFS ping-pong
     int32_t* d_changed_;     // (H*W)   cells updated during BFS (accumulated)

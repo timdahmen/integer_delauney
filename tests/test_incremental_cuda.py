@@ -33,6 +33,12 @@ if _cuda_available():
 W, H = 64, 64
 MAX_SEEDS = 256
 
+# Padding pinned to 0 throughout, matching batch_triangulate: the incremental
+# constructor now defaults to auto padding like the batch API, so leaving it
+# unset would compare a padded triangulation against an unpadded one and call
+# the difference a bug. Padding equivalence has its own tests.
+PADDING = 0
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,7 +65,7 @@ def batch_triangulate(seeds):
 
 def incremental_insert_all(seeds_batches):
     """Insert batches one at a time, return final (tri_set, tgrid, vgrid)."""
-    inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+    inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
     tri_map = {}
     tgrid = None
     for batch in seeds_batches:
@@ -96,13 +102,13 @@ def tgrid_to_tri_sets(tgrid, tri_map):
 
 class TestConstruction:
     def test_initial_state(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         assert inc.seed_count == 0
         assert inc.width == W
         assert inc.height == H
 
     def test_initial_voronoi_grid_shape(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         vg = inc.get_voronoi_grid()
         assert vg.shape == (H, W, 2)
         assert vg.dtype == np.int32
@@ -118,19 +124,19 @@ class TestSingleSeed:
     SEED = [(32, 32)]
 
     def test_seed_count(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEED)
         assert inc.seed_count == 1
 
     def test_voronoi_all_same_seed(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEED)
         vg = inc.get_voronoi_grid()
         assert np.all(vg[:, :, 0] == 0), "All cells should belong to seed 0"
 
     def test_voronoi_distances_are_squared_l2(self):
         """The distance channel stores squared Euclidean distance, not Manhattan."""
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEED)
         vg = inc.get_voronoi_grid()
         sx, sy = self.SEED[0]
@@ -139,7 +145,7 @@ class TestSingleSeed:
         np.testing.assert_array_equal(vg[:, :, 1], expected.astype(np.int32))
 
     def test_no_triangles_single_seed(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, tgrid = inc.insert(self.SEED)
         assert len(tri_map) == 0
 
@@ -152,17 +158,17 @@ class TestTwoSeeds:
     SEEDS = [(10, 32), (50, 32)]
 
     def test_seed_count(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEEDS)
         assert inc.seed_count == 2
 
     def test_no_triangles_two_seeds(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, _ = inc.insert(self.SEEDS)
         assert len(tri_map) == 0
 
     def test_voronoi_matches_batch(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEEDS)
         vg_inc = inc.get_voronoi_grid()
 
@@ -179,12 +185,12 @@ class TestThreeSeeds:
     SEEDS = [(10, 10), (50, 10), (30, 50)]
 
     def test_exactly_one_triangle(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, _ = inc.insert(self.SEEDS)
         assert len(tri_map) == 1
 
     def test_triangle_triplet_matches_batch(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, _ = inc.insert(self.SEEDS)
         inc_set, _, _ = (
             frozenset(tuple(sorted([v[2], v[3], v[4]])) for v in tri_map.values()),
@@ -205,14 +211,14 @@ class TestThreeSeeds:
         replaces an assertion that every id was >= 0, which the CUDA kernel has
         never satisfied — it writes -1 for unconfined pixels.
         """
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, tgrid = inc.insert(self.SEEDS)
         t = tgrid[:, :, 2]
         assert np.all((t == -1) | ((t >= 0) & (t < len(tri_map))))
         assert np.any(t >= 0)
 
     def test_tgrid_shape(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, tgrid = inc.insert(self.SEEDS)
         assert tgrid.shape == (H, W, 3)
         assert tgrid.dtype == np.int32
@@ -227,7 +233,7 @@ class TestMultiSeedVsBatch:
 
     def test_triangle_sets_match(self):
         """Incremental insert-all-at-once must produce the same triangle set."""
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, _ = inc.insert(self.SEEDS)
         inc_set = frozenset(
             tuple(sorted([v[2], v[3], v[4]])) for v in tri_map.values()
@@ -236,7 +242,7 @@ class TestMultiSeedVsBatch:
         assert inc_set == batch_set
 
     def test_voronoi_distance_matches_batch(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEEDS)
         vg_inc = inc.get_voronoi_grid()
 
@@ -245,7 +251,7 @@ class TestMultiSeedVsBatch:
         np.testing.assert_array_equal(vg_inc[:, :, 1], vg_batch[:, :, 1])
 
     def test_seed_count(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEEDS)
         assert inc.seed_count == len(self.SEEDS)
 
@@ -258,13 +264,13 @@ class TestIncrementalBatches:
     SEEDS = [(5, 5), (55, 5), (30, 30), (5, 55), (55, 55)]
 
     def _insert_one_by_one(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         for s in self.SEEDS:
             tri_map, tgrid = inc.insert([s])
         return inc, tri_map, tgrid
 
     def test_seed_count_accumulates(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         for i, s in enumerate(self.SEEDS):
             inc.insert([s])
             assert inc.seed_count == i + 1
@@ -295,7 +301,7 @@ class TestIncrementalBatches:
     def test_two_batch_insert(self):
         """Insert seeds in two batches; result must match single-batch."""
         half = len(self.SEEDS) // 2
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert(self.SEEDS[:half])
         tri_map, _ = inc.insert(self.SEEDS[half:])
 
@@ -312,18 +318,18 @@ class TestIncrementalBatches:
 
 class TestDuplicateRejection:
     def test_duplicate_in_batch_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         with pytest.raises(Exception):
             inc.insert([(10, 10), (10, 10)])
 
     def test_duplicate_across_batches_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert([(10, 10)])
         with pytest.raises(Exception):
             inc.insert([(10, 10)])
 
     def test_non_duplicate_does_not_raise(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         inc.insert([(10, 10)])
         inc.insert([(10, 11)])  # different pixel — must not raise
 
@@ -334,22 +340,22 @@ class TestDuplicateRejection:
 
 class TestBoundsValidation:
     def test_negative_x_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         with pytest.raises(Exception):
             inc.insert([(-1, 10)])
 
     def test_x_equals_width_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         with pytest.raises(Exception):
             inc.insert([(W, 10)])
 
     def test_negative_y_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         with pytest.raises(Exception):
             inc.insert([(10, -1)])
 
     def test_y_equals_height_raises(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         with pytest.raises(Exception):
             inc.insert([(10, H)])
 
@@ -362,27 +368,27 @@ class TestTimedInsert:
     SEEDS = [(5, 5), (55, 5), (30, 30), (5, 55), (55, 55)]
 
     def test_timed_returns_three_tuple(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         result = inc.insert_timed(self.SEEDS)
         assert len(result) == 3
 
     def test_timed_timings_keys(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         _, _, t = inc.insert_timed(self.SEEDS)
         assert set(t.keys()) == {"bfs_ms", "detect_ms", "dedup_ms", "assign_ms"}
 
     def test_timed_timings_non_negative(self):
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         _, _, t = inc.insert_timed(self.SEEDS)
         for k, v in t.items():
             assert v >= 0.0, f"{k} = {v} is negative"
 
     def test_timed_result_matches_untimed(self):
         seeds = self.SEEDS
-        inc1 = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc1 = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map1, tgrid1 = inc1.insert(seeds)
 
-        inc2 = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc2 = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map2, tgrid2, _ = inc2.insert_timed(seeds)
 
         set1 = frozenset(tuple(sorted([v[2], v[3], v[4]])) for v in tri_map1.values())
@@ -406,7 +412,7 @@ class TestRandomSmoke:
     def test_20_seeds_all_at_once(self):
         # Sort before insertion so incremental IDs match the batch API's sort order.
         seeds = sorted(self._random_seeds(20, seed=1))
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, tgrid = inc.insert(seeds)
         inc_set = frozenset(
             tuple(sorted([v[2], v[3], v[4]])) for v in tri_map.values()
@@ -417,7 +423,7 @@ class TestRandomSmoke:
     def test_20_seeds_sequential(self):
         # Sort before insertion so incremental IDs match the batch API's sort order.
         seeds = sorted(self._random_seeds(20, seed=2))
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         for s in seeds:
             tri_map, tgrid = inc.insert([s])
 
@@ -429,7 +435,7 @@ class TestRandomSmoke:
 
     def test_tgrid_no_invalid_ids(self):
         seeds = self._random_seeds(15, seed=3)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, PADDING)
         tri_map, tgrid = inc.insert(seeds)
         valid_ids = set(tri_map.keys()) | {-1}
         used = set(int(x) for x in tgrid[:, :, 2].flat)
