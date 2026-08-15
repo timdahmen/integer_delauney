@@ -69,7 +69,8 @@ public:
     void get_triangles(std::vector<TriangleEntry>& out) const;
 
     // internal insertion-order id -> batch pipeline's sorted (x asc, y asc) id
-    const std::vector<int32_t>& sorted_rank() const { return h_sorted_rank_; }
+    const std::vector<int32_t>& sorted_rank() const
+    { ensure_sorted_rank_(); return h_sorted_rank_; }
 
     void get_voronoi_grid(std::vector<int32_t>& out) const;
     int  seed_count()    const { return N_; }
@@ -112,6 +113,11 @@ private:
     uint8_t* d_stale_;       // (max triangles) per-triangle invalidation flags
     int      tiles_x_, tiles_y_;
     bool     pending_;       // deferred inserts awaiting a finalise
+    // Derived structures whose only consumers run at assignment or output
+    // time. Rebuilding them per insert cost O(N_tri + N_seeds) of host work
+    // that a deferred round never read; they are now rebuilt on demand.
+    bool             csr_dirty_;
+    mutable bool     sorted_rank_dirty_;
 
     // ---- host-side triangle registry ----
     struct HTriangle {
@@ -135,10 +141,12 @@ private:
     // The batch pipeline instead numbers seeds in sorted (x asc, y asc) order.
     // h_sorted_rank_[internal_id] gives that sorted id, and outputs are
     // translated through it so both pipelines expose the same numbering.
-    std::vector<int32_t>            h_sorted_rank_;
+    mutable std::vector<int32_t>    h_sorted_rank_;
 
     // ---- private helpers ----
-    void rebuild_sorted_rank_();
+    void rebuild_sorted_rank_() const;
+    void ensure_sorted_rank_() const;
+    void ensure_csr_();
     void run_bfs_(float* bfs_ms_out);
     // Topology only: detect + dedup + registry + CSR. Pixel assignment is
     // separate so it can be deferred across several inserts and run once.

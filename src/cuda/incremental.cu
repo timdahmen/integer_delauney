@@ -494,7 +494,8 @@ void build_reassign_mask_kernel(const int32_t* __restrict__ grid,
 
 IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds,
                                          int border_padding)
-    : W_(width), H_(height), N_(0), max_seeds_(max_seeds), pending_(false)
+    : W_(width), H_(height), N_(0), max_seeds_(max_seeds), pending_(false),
+      csr_dirty_(true), sorted_rank_dirty_(true)
 {
     if (width <= 0 || height <= 0 || max_seeds <= 0)
         throw std::invalid_argument("dimensions and max_seeds must be positive");
@@ -678,7 +679,10 @@ void IncrementalDelaunay::full_topology_(float* det_ms, float* dedup_ms)
     }
     // d_raw_buf_ already has the deduplicated triangles in correct order
 
-    rebuild_csr_and_upload_();
+    // The CSR is not built here. Its only reader is assign_triangles_kernel,
+    // which runs in assign_pending_, so building it per insert was O(N_tri +
+    // N_seeds) of host work that a deferred round never used.
+    csr_dirty_ = true;
 
     // Every pixel's assignment is now stale. Marking them invalidated rather
     // than assigning here lets assign_pending_ pick the mask up like any other
@@ -793,9 +797,11 @@ void IncrementalDelaunay::partial_topology_(float* det_ms, float* dedup_ms)
         h_triplet_to_tid_[pack_triplet_(t.a, t.b, t.c)] = tid;
     }
 
-    // Upload triangle array and CSR
+    // The triangle array still has to go up: the next round's
+    // mark_stale_kernel reads d_raw_buf_ on the device. The CSR does not --
+    // see full_topology_.
     upload_triangles_();
-    rebuild_csr_and_upload_();
+    csr_dirty_ = true;
 
     // Remap d_t_grid_ through old→new table. Pixels whose triangle went stale
     // get the -1 fallback, which build_reassign_mask_kernel then treats as
@@ -860,6 +866,7 @@ void IncrementalDelaunay::assign_pending_(float* asgn_ms)
         return;
     }
 
+    ensure_csr_();
     build_reassign_mask_();
 
     // Masking is only worth its own overhead while it excludes enough pixels.
@@ -886,10 +893,32 @@ void IncrementalDelaunay::assign_pending_(float* asgn_ms)
 }
 
 // ---------------------------------------------------------------------------
+// Lazy rebuilds of the derived structures
+//
+// Both used to run on every insert. The CSR is read only by
+// assign_triangles_kernel and the sorted ranks only by the two output
+// builders, so a deferred round paid for neither.
+// ---------------------------------------------------------------------------
+
+void IncrementalDelaunay::ensure_csr_()
+{
+    if (!csr_dirty_) return;
+    rebuild_csr_and_upload_();
+    csr_dirty_ = false;
+}
+
+void IncrementalDelaunay::ensure_sorted_rank_() const
+{
+    if (!sorted_rank_dirty_) return;
+    rebuild_sorted_rank_();
+    sorted_rank_dirty_ = false;
+}
+
+// ---------------------------------------------------------------------------
 // rebuild_sorted_rank_: internal (insertion) id → batch (sorted x,y) id
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::rebuild_sorted_rank_()
+void IncrementalDelaunay::rebuild_sorted_rank_() const
 {
     std::vector<int32_t> order(N_);
     for (int i = 0; i < N_; ++i) order[i] = i;
@@ -910,6 +939,7 @@ void IncrementalDelaunay::rebuild_sorted_rank_()
 void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
                                          std::vector<int32_t>& tgrid_out) const
 {
+    ensure_sorted_rank_();
     const int N     = W_ * H_;
     const int N_det = W_det_ * H_det_;
     int N_tri = (int)h_triangles_.size();
@@ -955,6 +985,7 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
 
 void IncrementalDelaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 {
+    ensure_sorted_rank_();
     const int N     = W_ * H_;
     const int N_det = W_det_ * H_det_;
     out.resize(N * 2);
@@ -1020,7 +1051,10 @@ void IncrementalDelaunay::apply_batch_(
         h_seed_set_.insert(pack_xy_(new_xs[i], new_ys[i]));
     }
     N_ += k;
-    rebuild_sorted_rank_();
+    // Not rebuilt here. h_sorted_rank_ is read only by build_outputs_ and
+    // get_voronoi_grid, so an O(N log N) sort of every seed on every insert
+    // was work no deferred round could observe.
+    sorted_rank_dirty_ = true;
 
     // Upload new seed positions, shifted onto the padded canvas: every device
     // grid is in padded coordinates, so the seed coordinates the kernels
