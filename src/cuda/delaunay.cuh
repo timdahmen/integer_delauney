@@ -49,10 +49,13 @@ public:
     //
     // get_triangles() is valid between deferred inserts; the triangulation
     // grid is not, and neither is get_voronoi_grid()'s triangle content.
+    // new_values, when non-empty, must have one entry per seed: it is the
+    // scalar field sampled at them, appended in step so it cannot drift.
     void insert_deferred(
         const std::vector<int32_t>& new_xs,
         const std::vector<int32_t>& new_ys,
-        InsertTimings*          timings = nullptr);
+        InsertTimings*          timings = nullptr,
+        const std::vector<float>*   new_values = nullptr);
 
     // Assigns pixels for everything deferred since the last finalise, then
     // materialises the outputs.  Chooses a masked or a full assignment by
@@ -82,6 +85,42 @@ public:
     // do. Consumers score edges rather than triangles, so this is the shape the
     // data is wanted in.
     void get_edges(std::vector<int32_t>& out) const;
+
+    // ---- scalar field on the vertices, and the edge metric over it ----
+    //
+    // A caller that refines a mesh carries one number per vertex -- a measured
+    // value, a field sample -- and picks edges to subdivide by how much that
+    // number changes along them. Holding the field here rather than on the host
+    // keeps it beside the coordinates and the edge list, so scoring an edge
+    // reads three device arrays and moves nothing.
+    //
+    // Values arrive with the seeds they belong to, so the field cannot drift
+    // out of step with the vertex set.
+
+    //: score = |value[a] - value[b]| * |p[a] - p[b]|, zero for edges shorter
+    //: than min_length.
+    //:
+    //: |dv| is about |grad| * |ab|, so the score behaves like |grad| * |ab|^2,
+    //: which is how linear interpolation error scales over a triangle. Edges
+    //: below min_length are excluded because their midpoint rounds onto an
+    //: endpoint. Order matches get_edges().
+    void edge_scores(double min_length, std::vector<float>& out) const;
+
+    //: Midpoints of the highest-scoring edges, as flat (x0, y0, x1, y1, ...).
+    //:
+    //: An edge is taken when its score beats (min_score, tie_index) under the
+    //: ordering "higher score first, lower edge index on a tie". Passing the
+    //: k-th largest such key therefore takes exactly k edges, with no ties to
+    //: resolve and the same answer every run -- which is why selection can stay
+    //: with the caller while everything around it runs here: what crosses is
+    //: one score and one index, not a list.
+    //:
+    //: Midpoints landing on a pixel that is already a seed are dropped, which
+    //: needs no separate record of what has been sampled: a seed is exactly a
+    //: cell at distance zero in the Voronoi diagram. Midpoints colliding with
+    //: each other are dropped down to the one from the lowest edge index.
+    void select_midpoints(double min_length, float min_score, int32_t tie_index,
+                          std::vector<int32_t>& out) const;
 
     // internal insertion-order id -> batch pipeline's sorted (x asc, y asc) id
     const std::vector<int32_t>& sorted_rank() const
@@ -136,6 +175,10 @@ private:
     int32_t* d_count_;       // (1)     dirty-pixel counter for the cost switch
     uint8_t* d_stale_;       // (max triangles) per-triangle invalidation flags
     uint8_t* d_dead_;        // (max triangles) retired-slot flags, mirrors h_dead_
+    float*   d_values_;      // (max_seeds) scalar field, one per seed
+    float*   d_scores_;      // (3 * max triangles) one per edge
+    int64_t* d_mid_keys_;    // (max_seeds) packed midpoint pixel + edge index
+    int32_t* d_mid_count_;   // (1)
     int      tiles_x_, tiles_y_;
     bool     pending_;       // deferred inserts awaiting a finalise
     // Derived structures whose only consumers run at assignment or output
@@ -143,6 +186,12 @@ private:
     // that a deferred round never read; they are now rebuilt on demand.
     bool             csr_dirty_;
     mutable bool     sorted_rank_dirty_;
+    // The deduplicated edge list, cached in d_edge_keys_. get_edges,
+    // edge_scores and select_midpoints all index it, so they must see one
+    // list; rebuilding it per call would also sort 3T keys three times a round.
+    mutable bool     edges_dirty_;
+    mutable int      n_edges_;
+    bool             have_values_;
 
     // ---- host-side triangle registry ----
     struct HTriangle {
@@ -205,6 +254,7 @@ private:
     // tri_map is indexed by triangle id and must be dense for callers.
     void compact_registry_();
     bool should_compact_() const;
+    void ensure_edges_() const;
     void build_outputs_(std::vector<TriangleEntry>& tri_map_out,
                         std::vector<int32_t>& tgrid_out) const;
 

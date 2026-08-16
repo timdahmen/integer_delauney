@@ -247,6 +247,93 @@ void unpack_edge_keys_kernel(const int64_t* __restrict__ keys, int n_edges,
     out[(size_t)i * 2 + 1] = (int32_t)(k % n_seeds);
 }
 
+// ---------------------------------------------------------------------------
+// Kernels: the scalar field on the vertices
+// ---------------------------------------------------------------------------
+
+//: Two midpoint keys land on the same pixel. A functor rather than a lambda so
+//: the file needs no --extended-lambda.
+struct SamePixel {
+    int64_t stride;
+    __device__ bool operator()(int64_t x, int64_t y) const {
+        return x / stride == y / stride;
+    }
+};
+
+__device__ __forceinline__
+void unpack_edge(int64_t key, int64_t n_seeds, int32_t& a, int32_t& b)
+{
+    a = (int32_t)(key / n_seeds);
+    b = (int32_t)(key % n_seeds);
+}
+
+//: |dv| * |ab|, or zero for an edge too short to subdivide.
+//:
+//: Squared lengths are compared so the eligibility test needs no root; the
+//: score itself does, since it is a length rather than a comparison.
+__global__
+void score_edges_kernel(const int64_t* __restrict__ keys, int n_edges,
+                        int64_t n_seeds,
+                        const int32_t* __restrict__ sx,
+                        const int32_t* __restrict__ sy,
+                        const float* __restrict__ values,
+                        double min_len2,
+                        float* __restrict__ scores)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_edges) return;
+    int32_t a, b;
+    unpack_edge(keys[e], n_seeds, a, b);
+    const double dx = (double)sx[a] - sx[b];
+    const double dy = (double)sy[a] - sy[b];
+    const double len2 = dx * dx + dy * dy;
+    if (len2 < min_len2) { scores[e] = 0.f; return; }
+    const double dv = fabs((double)values[a] - (double)values[b]);
+    scores[e] = (float)(dv * sqrt(len2));
+}
+
+//: Take the edges clearing (min_score, tie_index), emit their midpoints.
+//:
+//: The ordering is score descending, edge index ascending on a tie, so the key
+//: is unique and exactly as many edges clear it as the caller intended.
+//:
+//: A midpoint on a cell at distance zero is already a seed and is dropped here:
+//: the Voronoi diagram is the record of what has been sampled, so no parallel
+//: list of taken positions is needed. Survivors are packed with their edge
+//: index so the collision pass that follows can keep a deterministic one.
+__global__
+void select_midpoints_kernel(const int64_t* __restrict__ keys, int n_edges,
+                             int64_t n_seeds,
+                             const int32_t* __restrict__ sx,
+                             const int32_t* __restrict__ sy,
+                             const float* __restrict__ values,
+                             const float* __restrict__ scores,
+                             float min_score, int32_t tie_index,
+                             int W_det, int H_det, int P,
+                             const int32_t* __restrict__ grid,
+                             int64_t* __restrict__ out, int32_t* __restrict__ count)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_edges) return;
+
+    const float s = scores[e];
+    if (s <= 0.f) return;
+    if (!(s > min_score || (s == min_score && e <= tie_index))) return;
+
+    int32_t a, b;
+    unpack_edge(keys[e], n_seeds, a, b);
+    // Padded coordinates throughout, like every other kernel here.
+    int mx = (int)lrint(0.5 * ((double)sx[a] + sx[b]));
+    int my = (int)lrint(0.5 * ((double)sy[a] + sy[b]));
+    mx = min(max(mx, P), W_det - 1 - P);
+    my = min(max(my, P), H_det - 1 - P);
+
+    if (grid[(my * W_det + mx) * 2 + 1] == 0) return;   // already a seed
+
+    const int64_t pixel = (int64_t)my * W_det + mx;
+    out[atomicAdd(count, 1)] = pixel * (int64_t)n_edges + e;
+}
+
 //: Clear pixels whose triangle has been retired.
 //:
 //: The counterpart to remap_tgrid_kernel for the incremental path, where ids do
@@ -480,7 +567,8 @@ void build_reassign_mask_kernel(const int32_t* __restrict__ grid,
 Delaunay::Delaunay(int width, int height, int max_seeds,
                                          int border_padding)
     : W_(width), H_(height), N_(0), max_seeds_(max_seeds), pending_(false),
-      n_live_(0), csr_dirty_(true), sorted_rank_dirty_(true)
+      n_live_(0), csr_dirty_(true), sorted_rank_dirty_(true),
+      edges_dirty_(true), n_edges_(0), have_values_(false)
 {
     if (width <= 0 || height <= 0 || max_seeds <= 0)
         throw std::invalid_argument("dimensions and max_seeds must be positive");
@@ -522,6 +610,10 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     // buffer is sized the same way the CSR is, so match that bound.
     cudaMalloc(&d_stale_,        (size_t)max_seeds * 4  * sizeof(uint8_t));
     cudaMalloc(&d_dead_,         (size_t)max_seeds * 4  * sizeof(uint8_t));
+    cudaMalloc(&d_values_,       (size_t)max_seeds      * sizeof(float));
+    cudaMalloc(&d_scores_,       (size_t)max_seeds * 12 * sizeof(float));
+    cudaMalloc(&d_mid_keys_,     (size_t)max_seeds      * sizeof(int64_t));
+    cudaMalloc(&d_mid_count_,    1                      * sizeof(int32_t));
     cudaMemset(d_dead_, 0,       (size_t)max_seeds * 4  * sizeof(uint8_t));
     // Three edge keys per triangle, over the same triangle bound as d_stale_.
     cudaMalloc(&d_edge_keys_,    (size_t)max_seeds * 4 * 3 * sizeof(int64_t));
@@ -540,6 +632,8 @@ Delaunay::~Delaunay()
     cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
     cudaFree(d_edge_keys_);
     cudaFree(d_dead_);
+    cudaFree(d_values_);   cudaFree(d_scores_);
+    cudaFree(d_mid_keys_); cudaFree(d_mid_count_);
     cudaFree(d_updated_flag_); cudaFree(d_mask_);
     cudaFree(d_dirty_accum_);  cudaFree(d_tile_dirty_); cudaFree(d_count_);
     cudaFree(d_stale_);
@@ -652,6 +746,7 @@ void Delaunay::compact_registry_()
     upload_triangles_();
     upload_dead_flags_();
     csr_dirty_ = true;
+    edges_dirty_ = true;
 
     const int N = W_det_ * H_det_;
     int32_t* d_remap = nullptr;
@@ -1173,8 +1268,13 @@ void Delaunay::apply_batch_(
 void Delaunay::insert_deferred(
     const std::vector<int32_t>& new_xs,
     const std::vector<int32_t>& new_ys,
-    InsertTimings*          timings)
+    InsertTimings*          timings,
+    const std::vector<float>*   new_values)
 {
+    if (new_values && new_values->size() != new_xs.size())
+        throw std::invalid_argument(
+            "values must have one entry per seed in the batch");
+    const int seeds_before = N_;
     int k = (int)new_xs.size();
     if (k == 0) return;
 
@@ -1191,6 +1291,15 @@ void Delaunay::insert_deferred(
         full_topology_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr);
     else
         partial_topology_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr);
+
+    if (new_values && !new_values->empty()) {
+        cudaMemcpy(d_values_ + seeds_before, new_values->data(),
+                   new_values->size() * sizeof(float), cudaMemcpyHostToDevice);
+        have_values_ = true;
+    }
+
+    // The triangulation moved, so the cached edge list no longer describes it.
+    edges_dirty_ = true;
 
     if (timings) {
         timings->detect_ms = det_ms;
@@ -1252,46 +1361,122 @@ void Delaunay::get_triangles(std::vector<TriangleEntry>& out) const
     }
 }
 
-void Delaunay::get_edges(std::vector<int32_t>& out) const
+void Delaunay::ensure_edges_() const
 {
+    if (!edges_dirty_) return;
+    n_edges_ = 0;
+    edges_dirty_ = false;
+
     const int n_tri = (int)h_triangles_.size();
-    out.clear();
     if (n_tri == 0 || N_ == 0 || n_live_ == 0) return;
 
-    // d_raw_buf_ holds the current triangle list: upload_triangles_ runs at the
-    // end of every topology update, and detection has not overwritten it since.
     const RawTriangle* d_tris = static_cast<const RawTriangle*>(d_raw_buf_);
     int64_t* d_keys = static_cast<int64_t*>(d_edge_keys_);
-    const int64_t n_seeds = (int64_t)N_;
 
     build_edge_keys_kernel<<<(n_tri + 255) / 256, 256>>>(
-        d_tris, n_tri, n_seeds, d_dead_, d_keys);
+        d_tris, n_tri, (int64_t)N_, d_dead_, d_keys);
     cudaDeviceSynchronize();
 
     thrust::device_ptr<int64_t> p(d_keys);
     thrust::sort(p, p + (size_t)n_tri * 3);
     auto end = thrust::unique(p, p + (size_t)n_tri * 3);
-    int n_edges = (int)(end - p);
+    int n = (int)(end - p);
     // Retired slots all emit EDGE_KEY_DEAD, which sorts last and uniques down
     // to the single trailing entry dropped here.
-    if (n_edges > 0) {
+    if (n > 0) {
         int64_t last = 0;
-        cudaMemcpy(&last, d_keys + (n_edges - 1), sizeof(int64_t),
+        cudaMemcpy(&last, d_keys + (n - 1), sizeof(int64_t),
                    cudaMemcpyDeviceToHost);
-        if (last == EDGE_KEY_DEAD) --n_edges;
+        if (last == EDGE_KEY_DEAD) --n;
     }
-    if (n_edges == 0) return;
+    n_edges_ = n;
+}
+
+void Delaunay::edge_scores(double min_length, std::vector<float>& out) const
+{
+    ensure_edges_();
+    out.clear();
+    if (n_edges_ == 0) return;
+    if (!have_values_)
+        throw std::logic_error(
+            "edge_scores needs a value per seed; pass values to insert_deferred");
+
+    score_edges_kernel<<<(n_edges_ + 255) / 256, 256>>>(
+        static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
+        d_sx_, d_sy_, d_values_, min_length * min_length, d_scores_);
+    cudaDeviceSynchronize();
+
+    out.resize(n_edges_);
+    cudaMemcpy(out.data(), d_scores_, (size_t)n_edges_ * sizeof(float),
+               cudaMemcpyDeviceToHost);
+}
+
+void Delaunay::select_midpoints(double min_length, float min_score,
+                                int32_t tie_index,
+                                std::vector<int32_t>& out) const
+{
+    ensure_edges_();
+    out.clear();
+    if (n_edges_ == 0) return;
+    if (!have_values_)
+        throw std::logic_error(
+            "select_midpoints needs a value per seed; pass values to insert_deferred");
+
+    // Scored again rather than cached from edge_scores: the caller may have
+    // changed min_length between the two, and a pass over the edges is cheaper
+    // than the round trip that would keep them in step.
+    score_edges_kernel<<<(n_edges_ + 255) / 256, 256>>>(
+        static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
+        d_sx_, d_sy_, d_values_, min_length * min_length, d_scores_);
+
+    cudaMemset(d_mid_count_, 0, sizeof(int32_t));
+    select_midpoints_kernel<<<(n_edges_ + 255) / 256, 256>>>(
+        static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
+        d_sx_, d_sy_, d_values_, d_scores_, min_score, tie_index,
+        W_det_, H_det_, P_, d_grid_, d_mid_keys_, d_mid_count_);
+    cudaDeviceSynchronize();
+
+    int32_t n = 0;
+    cudaMemcpy(&n, d_mid_count_, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    if (n == 0) return;
+
+    // Sorting by (pixel, edge index) puts colliding midpoints together with the
+    // lowest edge index first, so uniquing on the pixel keeps a deterministic
+    // one -- the emission order above is not, being an atomic race.
+    thrust::device_ptr<int64_t> p(d_mid_keys_);
+    thrust::sort(p, p + n);
+    const int64_t stride = (int64_t)n_edges_;
+    auto end = thrust::unique(p, p + n, SamePixel{stride});
+    const int m = (int)(end - p);
+
+    std::vector<int64_t> h_keys(m);
+    cudaMemcpy(h_keys.data(), d_mid_keys_, (size_t)m * sizeof(int64_t),
+               cudaMemcpyDeviceToHost);
+
+    out.resize((size_t)m * 2);
+    for (int i = 0; i < m; ++i) {
+        const int64_t pixel = h_keys[i] / stride;
+        out[(size_t)i * 2]     = (int32_t)(pixel % W_det_) - P_;
+        out[(size_t)i * 2 + 1] = (int32_t)(pixel / W_det_) - P_;
+    }
+}
+
+void Delaunay::get_edges(std::vector<int32_t>& out) const
+{
+    ensure_edges_();
+    out.clear();
+    if (n_edges_ == 0) return;
 
     // Unpacked on the device so the transfer is the (E, 2) result rather than
     // the 3T keys that produced it.
     int32_t* d_out = nullptr;
-    cudaMalloc(&d_out, (size_t)n_edges * 2 * sizeof(int32_t));
-    unpack_edge_keys_kernel<<<(n_edges + 255) / 256, 256>>>(
-        d_keys, n_edges, n_seeds, d_out);
+    cudaMalloc(&d_out, (size_t)n_edges_ * 2 * sizeof(int32_t));
+    unpack_edge_keys_kernel<<<(n_edges_ + 255) / 256, 256>>>(
+        static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_, d_out);
     cudaDeviceSynchronize();
 
-    out.resize((size_t)n_edges * 2);
-    cudaMemcpy(out.data(), d_out, (size_t)n_edges * 2 * sizeof(int32_t),
+    out.resize((size_t)n_edges_ * 2);
+    cudaMemcpy(out.data(), d_out, (size_t)n_edges_ * 2 * sizeof(int32_t),
                cudaMemcpyDeviceToHost);
     cudaFree(d_out);
 }

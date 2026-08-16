@@ -286,11 +286,39 @@ public:
         return py::make_tuple(out[0], out[1], _timings_dict(t));
     }
 
-    void insert_deferred(const py::object& seeds_obj)
+    void insert_deferred(const py::object& seeds_obj,
+                         const py::object& values_obj)
     {
         std::vector<int32_t> xs, ys;
         _parse_seeds(seeds_obj, xs, ys);
-        impl_.insert_deferred(xs, ys);
+        if (values_obj.is_none()) { impl_.insert_deferred(xs, ys); return; }
+        auto v = values_obj.cast<py::array_t<float,
+                     py::array::c_style | py::array::forcecast>>();
+        std::vector<float> vals(v.data(), v.data() + v.size());
+        impl_.insert_deferred(xs, ys, nullptr, &vals);
+    }
+
+    py::array_t<float> edge_scores(double min_length) const
+    {
+        std::vector<float> sc;
+        impl_.edge_scores(min_length, sc);
+        py::array_t<float> arr((py::ssize_t)sc.size());
+        if (!sc.empty())
+            std::memcpy(arr.mutable_data(), sc.data(), sc.size() * sizeof(float));
+        return arr;
+    }
+
+    py::array_t<int32_t> select_midpoints(double min_length, float min_score,
+                                          int32_t tie_index) const
+    {
+        std::vector<int32_t> flat;
+        impl_.select_midpoints(min_length, min_score, tie_index, flat);
+        const int n = (int)(flat.size() / 2);
+        py::array_t<int32_t> arr({n, 2});
+        if (n > 0)
+            std::memcpy(arr.mutable_data(), flat.data(),
+                        flat.size() * sizeof(int32_t));
+        return arr;
     }
 
     py::dict insert_deferred_timed(const py::object& seeds_obj)
@@ -556,9 +584,12 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "Same as insert() but also returns a timings dict with keys\n"
              "bfs_ms, detect_ms, dedup_ms, assign_ms.")
         .def("insert_deferred", &PyDelaunay::insert_deferred,
-             py::arg("seeds"),
+             py::arg("seeds"), py::arg("values") = py::none(),
              "Insert a batch, updating the Voronoi diagram and triangle topology\n"
              "but not the per-pixel assignment, and returning nothing.\n\n"
+             "values, when given, is one float per seed in the batch: the\n"
+             "scalar field sampled there, appended in step with the seeds so\n"
+             "it cannot fall out of alignment. edge_scores() needs it.\n\n"
              "Pixel assignment is the expensive stage and the only one whose\n"
              "dirty region saturates for large scattered batches, so a caller\n"
              "that inserts several times before it needs a raster should defer\n"
@@ -585,6 +616,25 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "and finalise() report, so that a caller appending seeds across\n"
              "several inserts keeps its own per-seed arrays aligned.  Use\n"
              "sorted_rank to translate.")
+        .def("edge_scores", &PyDelaunay::edge_scores,
+             py::arg("min_length") = 0.0,
+             "Per-edge |dv| * |ab| over the scalar field, as an (N_edges,) "
+             "float32 array in get_edges() order.\n\n"
+             "Edges shorter than min_length score 0, their midpoint rounding "
+             "onto an endpoint. Needs values to have been supplied to "
+             "insert_deferred.")
+        .def("select_midpoints", &PyDelaunay::select_midpoints,
+             py::arg("min_length"), py::arg("min_score"), py::arg("tie_index"),
+             "Midpoints of the top-scoring edges, as an (M, 2) int32 array.\n\n"
+             "An edge is taken when its score beats (min_score, tie_index) "
+             "under 'higher score first, lower edge index on a tie'. Passing "
+             "the k-th largest such key takes exactly k edges, "
+             "deterministically, so the caller can choose k without shipping "
+             "an index list back.\n\n"
+             "Midpoints already occupied by a seed are dropped -- a seed is a "
+             "cell at distance zero, so no record of taken positions is "
+             "needed -- and midpoints colliding with one another collapse to "
+             "the one from the lowest edge index.")
         .def("get_edges", &PyDelaunay::get_edges,
              "The distinct undirected edges as an (N_edges, 2) int32 array,\n"
              "each row (a, b) with a < b.\n\n"
