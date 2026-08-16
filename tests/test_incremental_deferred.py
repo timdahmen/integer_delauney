@@ -265,3 +265,90 @@ class TestDeferredApi:
         assert t_ins["assign_ms"] == 0.0
         _, _, t_fin = inc.finalise_timed()
         assert t_fin["assign_ms"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Retired slots
+# ---------------------------------------------------------------------------
+
+class TestRetiredSlots:
+    """A partial update retires invalidated triangles rather than renumbering.
+
+    Renumbering forced a full lookup-map rebuild, a full device upload and a
+    grid remap on every insert, all proportional to the total triangle count.
+    Retiring is a flag, so the ids of everything else stay put -- but that only
+    holds together if every consumer skips the retired slots, which is what
+    these check.
+    """
+
+    def _seeds(self, n, seed):
+        rng = np.random.default_rng(seed)
+        pts = set()
+        while len(pts) < n:
+            pts.add((int(rng.integers(1, W - 1)), int(rng.integers(1, H - 1))))
+        return np.array(sorted(pts), dtype=np.int32)
+
+    def test_triangle_count_never_includes_retired_slots(self):
+        """get_triangles reports live triangles only, however many rounds."""
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        seeds = self._seeds(150, 21)
+        inc.insert_deferred(seeds[:60])
+        counts = []
+        for lo in range(60, 150, 30):
+            inc.insert_deferred(seeds[lo:lo + 30])
+            tris = inc.get_triangles()
+            counts.append(len(tris))
+            # A planar triangulation of n points has fewer than 2n triangles;
+            # retired slots leaking in would break this immediately.
+            assert len(tris) < 2 * inc.seed_count
+            assert (tris >= 0).all() and (tris < inc.seed_count).all()
+        assert counts == sorted(counts), "triangle count should not fall"
+
+    def test_edges_agree_with_triangles_after_several_rounds(self):
+        """get_edges reads the device list, which holds retired slots too."""
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        seeds = self._seeds(150, 22)
+        inc.insert_deferred(seeds[:60])
+        for lo in range(60, 150, 30):
+            inc.insert_deferred(seeds[lo:lo + 30])
+            expected = set()
+            for a, b, c in inc.get_triangles():
+                for p, q in ((a, b), (b, c), (c, a)):
+                    expected.add((int(min(p, q)), int(max(p, q))))
+            got = {(int(a), int(b)) for a, b in inc.get_edges()}
+            assert got == expected
+
+    def test_finalise_returns_a_dense_triangle_map(self):
+        """tri_map is indexed by triangle id, so it must have no holes."""
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        seeds = self._seeds(150, 23)
+        for lo in range(0, 150, 30):
+            inc.insert_deferred(seeds[lo:lo + 30])
+        tri_map, tgrid = inc.finalise()
+        assert set(tri_map.keys()) == set(range(len(tri_map)))
+        ids = tgrid[:, :, 2]
+        assert ((ids == -1) | ((ids >= 0) & (ids < len(tri_map)))).all()
+
+    @pytest.mark.parametrize("seed", [24, 25, 26])
+    @pytest.mark.parametrize("chunk", [10, 40])
+    def test_many_small_inserts_still_track_the_batch(self, seed, chunk):
+        """The case that exercises retirement hardest: many tiny rounds.
+
+        Not asserted as exact equality. Twelve rounds give twelve chances to
+        meet a near-cocircular quad, where the two paths detect from different
+        Voronoi states and can take different diagonals -- both correct, and
+        neither resolvable on a raster. test_scipy_oracle.py quantifies that
+        against exact geometry; here the claim is only that retiring slots does
+        not lose or duplicate triangles, so a couple of flipped diagonals are
+        allowed and a systematic drift is not.
+        """
+        seeds = self._seeds(120, seed)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        for lo in range(0, len(seeds), chunk):
+            inc.insert_deferred(seeds[lo:lo + chunk])
+        tri_map, _ = inc.finalise()
+        got = tri_set(tri_map)
+        batch_set, _ = batch_triangulate(sorted(map(tuple, seeds.tolist())))
+
+        assert abs(len(got) - len(batch_set)) <= 2
+        assert len(got ^ batch_set) <= max(4, len(batch_set) // 50)

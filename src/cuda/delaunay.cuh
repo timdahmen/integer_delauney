@@ -112,7 +112,13 @@ private:
     int32_t* d_changed_;     // (H*W)   cells updated during BFS (accumulated)
     int32_t* d_sx_;          // (max_seeds) seed x
     int32_t* d_sy_;          // (max_seeds) seed y
-    void*    d_raw_buf_;     // detection scratch; see max_raw_triangles()
+    // The persistent triangle list, kept in step with h_triangles_.
+    void*    d_raw_buf_;
+    // Detection scratch, written from index 0 on every detect. Separate from
+    // the list above because detection would otherwise overwrite it, which is
+    // only survivable if the whole list is re-uploaded afterwards -- exactly
+    // the O(total triangles) work per insert this design removes.
+    void*    d_detect_buf_;  // see max_raw_triangles()
     // (3 * max triangles) packed undirected edge keys for get_edges(). Sized
     // like d_stale_, off the planarity bound of under 2n triangles for n seeds.
     void*    d_edge_keys_;
@@ -129,6 +135,7 @@ private:
     int32_t* d_tile_dirty_;  // (tiles) tile-level dirty flags, mask prefilter
     int32_t* d_count_;       // (1)     dirty-pixel counter for the cost switch
     uint8_t* d_stale_;       // (max triangles) per-triangle invalidation flags
+    uint8_t* d_dead_;        // (max triangles) retired-slot flags, mirrors h_dead_
     int      tiles_x_, tiles_y_;
     bool     pending_;       // deferred inserts awaiting a finalise
     // Derived structures whose only consumers run at assignment or output
@@ -143,7 +150,17 @@ private:
         int32_t a, b, c;            // sorted key (a<=b<=c)
         int32_t orig_a, orig_b, orig_c;
     };
+    // Slots, not a dense list. A partial update retires the triangles the
+    // change invalidated and appends their replacements; retiring is a flag,
+    // so the ids of everything else stay put and the lookup map only sees the
+    // entries that actually moved. Compacting instead would renumber every
+    // triangle, which forces a full map rebuild, a full device upload and a
+    // remap of the pixel grid -- all O(total triangles) on a change that
+    // touched a handful of them. Density is restored in compact_registry_(),
+    // which finalise() calls once per frame rather than once per insert.
     std::vector<HTriangle>                 h_triangles_;
+    std::vector<uint8_t>                   h_dead_;      // parallel to above
+    int                                    n_live_;      // live slot count
     std::unordered_map<uint64_t,int32_t>   h_triplet_to_tid_;
     // (A canonical-pixel -> tid map used to live here. It was written on every
     // registry rebuild and never read; with the 2x2 detection two triangles can
@@ -180,6 +197,14 @@ private:
     int  count_mask_();
     void rebuild_csr_and_upload_();
     void upload_triangles_();
+    // Only the appended tail, which is all a partial update changes.
+    void upload_triangles_range_(int first, int count);
+    void upload_dead_flags_();
+    // Squeeze the retired slots out and renumber. O(total triangles), so it
+    // runs when the holes are worth the pass, and before outputs are built --
+    // tri_map is indexed by triangle id and must be dense for callers.
+    void compact_registry_();
+    bool should_compact_() const;
     void build_outputs_(std::vector<TriangleEntry>& tri_map_out,
                         std::vector<int32_t>& tgrid_out) const;
 
