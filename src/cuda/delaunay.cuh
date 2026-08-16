@@ -71,6 +71,18 @@ public:
     // Translate with sorted_rank() when handing results to the batch API.
     void get_triangles(std::vector<TriangleEntry>& out) const;
 
+    // The distinct undirected edges of the current triangulation, as flat
+    // (a0, b0, a1, b1, ...) with a < b. Seed ids are INSERTION-order, matching
+    // get_triangles().
+    //
+    // Every interior edge is shared by two triangles, so the 3T edges a
+    // triangulation spells out hold each one about twice; deduplicating them is
+    // a sort and a unique over 3T keys, which is what the device is for and
+    // what a caller would otherwise pull 3T triangle indices across the bus to
+    // do. Consumers score edges rather than triangles, so this is the shape the
+    // data is wanted in.
+    void get_edges(std::vector<int32_t>& out) const;
+
     // internal insertion-order id -> batch pipeline's sorted (x asc, y asc) id
     const std::vector<int32_t>& sorted_rank() const
     { ensure_sorted_rank_(); return h_sorted_rank_; }
@@ -101,6 +113,9 @@ private:
     int32_t* d_sx_;          // (max_seeds) seed x
     int32_t* d_sy_;          // (max_seeds) seed y
     void*    d_raw_buf_;     // detection scratch; see max_raw_triangles()
+    // (3 * max triangles) packed undirected edge keys for get_edges(). Sized
+    // like d_stale_, off the planarity bound of under 2n triangles for n seeds.
+    void*    d_edge_keys_;
     int32_t* d_t_grid_;      // (H*W)   triangle_id per pixel
     int32_t* d_csr_ptr_;     // (max_seeds+1) CSR row starts
     int32_t* d_csr_idx_;     // (max_seeds*8) CSR triangle IDs

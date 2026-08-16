@@ -451,3 +451,84 @@ class TestRandomSmoke:
         valid_ids = set(tri_map.keys()) | {-1}
         used = set(int(x) for x in tgrid[:, :, 2].flat)
         assert used.issubset(valid_ids), f"Unknown IDs: {used - valid_ids}"
+
+
+# ---------------------------------------------------------------------------
+# get_edges
+# ---------------------------------------------------------------------------
+
+class TestGetEdges:
+    """Undirected edges, deduplicated on the device.
+
+    The oracle is the triangle list this same object reports: deriving edges
+    from it in numpy is what callers did before, so the two must agree exactly.
+    """
+
+    @staticmethod
+    def _edges_from_triangles(tris, n_seeds):
+        if len(tris) == 0:
+            return set()
+        out = set()
+        for a, b, c in tris:
+            for p, q in ((a, b), (b, c), (c, a)):
+                out.add((int(min(p, q)), int(max(p, q))))
+        return out
+
+    def _mesh(self, n, seed):
+        rng = np.random.default_rng(seed)
+        pts = sorted({(int(x), int(y))
+                      for x, y in rng.integers([0, 0], [W, H], size=(n * 3, 2))})
+        pts = pts[:n]
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        inc.insert_deferred(np.array(pts, dtype=np.int32))
+        return inc
+
+    @pytest.mark.parametrize("n", [3, 10, 60, 200])
+    def test_matches_edges_derived_from_the_triangles(self, n):
+        inc = self._mesh(n, seed=n)
+        expected = self._edges_from_triangles(inc.get_triangles(), inc.seed_count)
+        got = {(int(a), int(b)) for a, b in inc.get_edges()}
+        assert got == expected
+
+    def test_each_edge_appears_once_and_is_ordered(self):
+        inc = self._mesh(120, seed=5)
+        e = inc.get_edges()
+        assert e.ndim == 2 and e.shape[1] == 2
+        assert e.dtype == np.int32
+        assert (e[:, 0] < e[:, 1]).all(), "each row must be (min, max)"
+        assert len({(int(a), int(b)) for a, b in e}) == len(e)
+
+    def test_ids_are_insertion_order(self):
+        """Same numbering as get_triangles, so both index a caller's array."""
+        inc = self._mesh(80, seed=7)
+        n = inc.seed_count
+        e = inc.get_edges()
+        assert e.min() >= 0 and e.max() < n
+
+    def test_survives_further_inserts(self):
+        inc = self._mesh(60, seed=11)
+        before = len(inc.get_edges())
+        rng = np.random.default_rng(12)
+        seen = {(int(x), int(y)) for x, y in
+                np.asarray(inc.get_voronoi_grid())[:0, :0].reshape(0, 2)}  # empty
+        pts = []
+        used = set()
+        while len(pts) < 20:
+            p = (int(rng.integers(0, W)), int(rng.integers(0, H)))
+            if p not in used:
+                used.add(p)
+                pts.append(p)
+        try:
+            inc.insert_deferred(np.array(pts, dtype=np.int32))
+        except ValueError:
+            pytest.skip("random points collided with existing seeds")
+        after = inc.get_edges()
+        expected = self._edges_from_triangles(inc.get_triangles(), inc.seed_count)
+        assert {(int(a), int(b)) for a, b in after} == expected
+        assert len(after) > before
+
+    def test_two_seeds_have_no_triangle_and_no_edges(self):
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        inc.insert_deferred(np.array([[5, 5], [20, 20]], dtype=np.int32))
+        assert len(inc.get_triangles()) == 0
+        assert len(inc.get_edges()) == 0

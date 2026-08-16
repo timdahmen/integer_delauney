@@ -198,6 +198,44 @@ void find_triangle_seeds_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Kernels: undirected edge extraction
+//
+// One triangle contributes three edges. Orienting each as (min, max) makes the
+// two triangles sharing an edge produce the same key, so a sort and a unique
+// collapse them -- the same shape as the triangle dedup above.
+//
+// The key packs both endpoints into one int64 so the sort is over a scalar.
+// n_seeds is under 2^21 in any workable canvas and the product stays far inside
+// int64, so the packing is exact and its order is lexicographic in (min, max).
+// ---------------------------------------------------------------------------
+
+__global__
+void build_edge_keys_kernel(const RawTriangle* __restrict__ tris, int n_tri,
+                            int64_t n_seeds, int64_t* __restrict__ keys)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= n_tri) return;
+    const RawTriangle& r = tris[t];
+    const int32_t v[3] = {r.orig_a, r.orig_b, r.orig_c};
+    for (int e = 0; e < 3; ++e) {
+        int32_t p = v[e], q = v[(e + 1) % 3];
+        if (p > q) { int32_t s = p; p = q; q = s; }
+        keys[(size_t)t * 3 + e] = (int64_t)p * n_seeds + (int64_t)q;
+    }
+}
+
+__global__
+void unpack_edge_keys_kernel(const int64_t* __restrict__ keys, int n_edges,
+                             int64_t n_seeds, int32_t* __restrict__ out)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_edges) return;
+    int64_t k = keys[i];
+    out[(size_t)i * 2]     = (int32_t)(k / n_seeds);
+    out[(size_t)i * 2 + 1] = (int32_t)(k % n_seeds);
+}
+
+// ---------------------------------------------------------------------------
 // Kernel: remap triangle IDs in t_grid (after compaction)
 // ---------------------------------------------------------------------------
 
@@ -452,6 +490,8 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     // A planar triangulation of n points has under 2n triangles; the detection
     // buffer is sized the same way the CSR is, so match that bound.
     cudaMalloc(&d_stale_,        (size_t)max_seeds * 4  * sizeof(uint8_t));
+    // Three edge keys per triangle, over the same triangle bound as d_stale_.
+    cudaMalloc(&d_edge_keys_,    (size_t)max_seeds * 4 * 3 * sizeof(int64_t));
 
     cudaMemset(d_grid_,   SENTINEL_BYTE, (size_t)N * 2 * sizeof(int32_t));
     cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N     * sizeof(int32_t));
@@ -464,6 +504,7 @@ Delaunay::~Delaunay()
     cudaFree(d_grid_);    cudaFree(d_tmp_);      cudaFree(d_changed_);
     cudaFree(d_sx_);      cudaFree(d_sy_);        cudaFree(d_raw_buf_);
     cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
+    cudaFree(d_edge_keys_);
     cudaFree(d_updated_flag_); cudaFree(d_mask_);
     cudaFree(d_dirty_accum_);  cudaFree(d_tile_dirty_); cudaFree(d_count_);
     cudaFree(d_stale_);
@@ -1097,4 +1138,40 @@ void Delaunay::get_triangles(std::vector<TriangleEntry>& out) const
         // Canonical position in image coordinates, as build_outputs_ reports it.
         out[tid] = {t.x - P_, t.y - P_, t.orig_a, t.orig_b, t.orig_c};
     }
+}
+
+void Delaunay::get_edges(std::vector<int32_t>& out) const
+{
+    const int n_tri = (int)h_triangles_.size();
+    out.clear();
+    if (n_tri == 0 || N_ == 0) return;
+
+    // d_raw_buf_ holds the current triangle list: upload_triangles_ runs at the
+    // end of every topology update, and detection has not overwritten it since.
+    const RawTriangle* d_tris = static_cast<const RawTriangle*>(d_raw_buf_);
+    int64_t* d_keys = static_cast<int64_t*>(d_edge_keys_);
+    const int64_t n_seeds = (int64_t)N_;
+
+    build_edge_keys_kernel<<<(n_tri + 255) / 256, 256>>>(
+        d_tris, n_tri, n_seeds, d_keys);
+    cudaDeviceSynchronize();
+
+    thrust::device_ptr<int64_t> p(d_keys);
+    thrust::sort(p, p + (size_t)n_tri * 3);
+    auto end = thrust::unique(p, p + (size_t)n_tri * 3);
+    const int n_edges = (int)(end - p);
+    if (n_edges == 0) return;
+
+    // Unpacked on the device so the transfer is the (E, 2) result rather than
+    // the 3T keys that produced it.
+    int32_t* d_out = nullptr;
+    cudaMalloc(&d_out, (size_t)n_edges * 2 * sizeof(int32_t));
+    unpack_edge_keys_kernel<<<(n_edges + 255) / 256, 256>>>(
+        d_keys, n_edges, n_seeds, d_out);
+    cudaDeviceSynchronize();
+
+    out.resize((size_t)n_edges * 2);
+    cudaMemcpy(out.data(), d_out, (size_t)n_edges * 2 * sizeof(int32_t),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_out);
 }

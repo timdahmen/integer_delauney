@@ -338,6 +338,18 @@ public:
         return arr;
     }
 
+    py::array_t<int32_t> get_edges() const
+    {
+        std::vector<int32_t> flat;
+        impl_.get_edges(flat);
+        const int n = (int)(flat.size() / 2);
+        py::array_t<int32_t> arr({n, 2});
+        if (n > 0)
+            std::memcpy(arr.mutable_data(), flat.data(),
+                        flat.size() * sizeof(int32_t));
+        return arr;
+    }
+
     py::array_t<int32_t> sorted_rank() const
     {
         const auto& r = impl_.sorted_rank();
@@ -573,6 +585,16 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "and finalise() report, so that a caller appending seeds across\n"
              "several inserts keeps its own per-seed arrays aligned.  Use\n"
              "sorted_rank to translate.")
+        .def("get_edges", &PyDelaunay::get_edges,
+             "The distinct undirected edges as an (N_edges, 2) int32 array,\n"
+             "each row (a, b) with a < b.\n\n"
+             "Seed ids are INSERTION-order, matching get_triangles().\n\n"
+             "Deduplicated on the device. A triangulation spells out 3T edges\n"
+             "and every interior edge appears in two triangles, so a caller\n"
+             "that wants edges would otherwise pull all 3T triangle indices\n"
+             "across the bus and sort them on the host. Consumers score edges\n"
+             "rather than triangles, so this is the shape the data is wanted\n"
+             "in, and it moves less of it.")
         .def_property_readonly("sorted_rank", &PyDelaunay::sorted_rank,
              "int32 array mapping insertion-order seed id -> sorted (x asc,\n"
              "y asc) id, which is the numbering insert()/finalise() report.")
