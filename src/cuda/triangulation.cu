@@ -198,12 +198,20 @@ void cuda_compute_triangulation(
 
     std::vector<int32_t> h_n(N_det);
 
+    // Kept alive past the branch: at P > 0 its interior window also supplies the
+    // output grid's seed-id and distance channels, so no second diagram is
+    // needed. Empty when a caller-supplied grid is used instead.
+    std::vector<int32_t> padded_flat;
+
+    // A Voronoi diagram computed here when the caller did not bring one. Only
+    // reachable at P == 0, where detection reads the unpadded grid directly.
+    std::vector<int32_t> own_flat;
+
     if (P > 0) {
         std::vector<Seed> padded_seeds(N_seeds);
         for (int i = 0; i < N_seeds; ++i)
             padded_seeds[i] = {seed_xs[i] + P, seed_ys[i] + P};
 
-        std::vector<int32_t> padded_flat;
         cuda_compute_voronoi(W_det, H_det, padded_seeds, padded_flat);
 
         if (padded_voronoi_out)
@@ -212,6 +220,13 @@ void cuda_compute_triangulation(
         for (int i = 0; i < N_det; ++i)
             h_n[i] = padded_flat[i * 2];   // seed_id at even indices
     } else {
+        if (!voronoi_grid) {
+            std::vector<Seed> own_seeds(N_seeds);
+            for (int i = 0; i < N_seeds; ++i)
+                own_seeds[i] = {seed_xs[i], seed_ys[i]};
+            cuda_compute_voronoi(W, H, own_seeds, own_flat);
+            voronoi_grid = own_flat.data();
+        }
         for (int i = 0; i < N; ++i)
             h_n[i] = voronoi_grid[i * 2];
     }
@@ -366,11 +381,27 @@ void cuda_compute_triangulation(
     std::vector<int32_t> h_t(N);
     cudaMemcpy(h_t.data(), d_t, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
 
+    // Channels 0 and 1 are the seed id and distance. At P > 0 they come from the
+    // interior window of the padded diagram, which equals an unpadded one
+    // exactly -- verified bit-identical over 256x256 to 1510x1018 and up to
+    // 30000 seeds. That is what lets the caller stop computing its own.
     out_grid.resize(N * 3);
-    for (int i = 0; i < N; ++i) {
-        out_grid[i * 3]     = voronoi_grid[i * 2];
-        out_grid[i * 3 + 1] = voronoi_grid[i * 2 + 1];
-        out_grid[i * 3 + 2] = h_t[i];
+    if (P > 0) {
+        for (int y = 0; y < H; ++y) {
+            const int32_t* src = &padded_flat[(size_t)((y + P) * W_det + P) * 2];
+            int32_t* dst = &out_grid[(size_t)y * W * 3];
+            for (int x = 0; x < W; ++x) {
+                dst[x * 3]     = src[x * 2];
+                dst[x * 3 + 1] = src[x * 2 + 1];
+                dst[x * 3 + 2] = h_t[y * W + x];
+            }
+        }
+    } else {
+        for (int i = 0; i < N; ++i) {
+            out_grid[i * 3]     = voronoi_grid[i * 2];
+            out_grid[i * 3 + 1] = voronoi_grid[i * 2 + 1];
+            out_grid[i * 3 + 2] = h_t[i];
+        }
     }
 
     if (timings) {

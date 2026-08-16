@@ -21,17 +21,40 @@
 
 ---
 
-## `delauney.auto_border_padding`
+## `delauney.triangulate` (CUDA)
 
 ```python
-from delauney import auto_border_padding
+from delauney import triangulate
 
-padding: int = auto_border_padding(width: int, height: int, n_seeds: int)
+tri_map, tri_grid = triangulate(
+    width: int, height: int, seeds,
+    border_padding: int = -1, as_arrays: bool = False)
 ```
 
-Returns `round(sqrt(width * height / n_seeds))`, or `0` when `n_seeds <= 0`.
+**The normal entry point.** Takes seeds, returns a triangulation.
 
-A triangle is only detected where three Voronoi regions meet — its circumcenter. Border triangles frequently have circumcenters outside the image, so at padding `0` they are never registered and the pixels they cover degrade to nearest-seed with no error raised. This is the value both `GridTriangulation` paths use by default. Padding reduces but never eliminates missing triangles; sub-pixel slivers are missed at any padding.
+Equivalent to `Voronoi().compute()` followed by `GridTriangulation().compute()`, but builds the Voronoi diagram once instead of twice. At any `border_padding > 0` the triangulator computes its own *padded* diagram for detection, and used the caller's only to fill the output grid's seed-id and distance channels — which are exactly the interior window of the padded one. Measured at 1510×1018 with 30000 seeds: **157.0 ms for the pair against 116.8 ms here.**
+
+Reach for `Voronoi` and `GridTriangulation` separately only when you need the intermediate diagram, or when you want to triangulate a grid you built yourself (which only affects detection at `border_padding == 0`).
+
+---
+
+## `delauney.DEFAULT_BORDER_PADDING` and `max_boundary_spacing`
+
+```python
+from delauney import DEFAULT_BORDER_PADDING, max_boundary_spacing
+
+DEFAULT_BORDER_PADDING  # 16
+spacing: int = max_boundary_spacing(border_padding: int = DEFAULT_BORDER_PADDING)
+```
+
+A triangle is only detected where three Voronoi regions meet — its circumcenter. Border triangles frequently have circumcenters outside the image, so at padding `0` they are never registered and the pixels they cover degrade to nearest-seed with no error raised.
+
+The default used to be estimated per call as `sqrt(area / n_seeds)`. That estimates the wrong quantity: circumradius depends on triangle *shape*, and grows without limit as three points approach collinearity, at any seed count — measured out by 3.5× on a real frame. It is gone.
+
+What replaces it is a constant plus a contract: a caller that samples the convex hull boundary at spacing `s` is guaranteed no triangle is missed provided `border_padding >= s²/8`. `max_boundary_spacing` inverts that. See `BORDER_PADDING_BOUND.md`.
+
+Padding never eliminates missing triangles entirely; sub-pixel slivers are missed at any padding.
 
 ---
 
@@ -114,10 +137,10 @@ triangle_map, triangulation_grid = GridTriangulation().compute(
 |---|---|---|
 | `voronoi_grid` | `np.ndarray (H, W, 2) int32` | Output of `Voronoi.compute()`. |
 | `seed_positions` | `Seeds` | The same seed list passed to `Voronoi.compute()`. |
-| `border_padding` | `int` | Pixels of Voronoi canvas added on each side before triangle detection, exposing border triangles whose circumcenter lies outside the image. Negative (the default) resolves to `auto_border_padding`; `0` disables padding. The output grid is always the original `(H, W, 3)`. |
+| `border_padding` | `int` | Pixels of Voronoi canvas added on each side before triangle detection, exposing border triangles whose circumcenter lies outside the image. Negative (the default) resolves to `DEFAULT_BORDER_PADDING`; `0` disables padding. The output grid is always the original `(H, W, 3)`. |
 | `as_arrays` | `bool` | Return a `TriangleArray` instead of a `TriangleMap`, skipping the per-triangle Python objects. |
 
-> The reference implementation spells the auto default as `border_padding=None`; the CUDA binding cannot take `None` through an `int` argument and uses a negative sentinel instead. Both resolve to `auto_border_padding`.
+> The reference implementation spells the default as `border_padding=None`; the CUDA binding cannot take `None` through an `int` argument and uses a negative sentinel instead. Both resolve to `DEFAULT_BORDER_PADDING`.
 
 **Returns** `(TriangleMap | TriangleArray, TriangulationGrid)`
 
@@ -185,7 +208,7 @@ tri = Delaunay(
 | `width` | `int` | Grid width in pixels. |
 | `height` | `int` | Grid height in pixels. |
 | `max_seeds` | `int` | Hard upper bound on total seeds ever inserted. Used to pre-allocate GPU memory. |
-| `border_padding` | `int` | Width of the padded detection canvas; `< 0` selects `auto_border_padding(width, height, max_seeds)`. |
+| `border_padding` | `int` | Width of the padded detection canvas; `< 0` selects `DEFAULT_BORDER_PADDING`. |
 
 > **`border_padding` is fixed at construction here**, unlike the batch API where
 > it is a per-call argument. The padded canvas is the persistent device state,
@@ -361,24 +384,27 @@ The one deliberate signature difference: the reference spells the auto padding d
 
 ```python
 import numpy as np
-from delauney import Voronoi, GridTriangulation
+from delauney import triangulate
 
 seeds = [(10, 20), (50, 80), (120, 40)]
 W, H = 200, 150
 
-# Step 1: Voronoi diagram
-voronoi = Voronoi().compute(W, H, seeds)
-# voronoi[y, x, 0]  →  seed_id
-# voronoi[y, x, 1]  →  squared L2 distance
-
-# Step 2: Delaunay triangulation
-tri_map, tri_grid = GridTriangulation().compute(voronoi, seeds)
+tri_map, tri_grid = triangulate(W, H, seeds)
 # tri_map[tid]       →  (x, y, id_a, id_b, id_c)
+# tri_grid[y, x, 0]  →  seed_id
+# tri_grid[y, x, 1]  →  squared L2 distance
 # tri_grid[y, x, 2]  →  triangle_id, or -1 where no triangle contains the pixel
 
 # ... or skip the dict entirely when you only need vertex indices
-verts, tri_grid = GridTriangulation().compute(voronoi, seeds, as_arrays=True)
+verts, tri_grid = triangulate(W, H, seeds, as_arrays=True)
 # verts[tid]  →  array([id_a, id_b, id_c])
+
+# --- Only when you need the Voronoi diagram itself ---
+from delauney import Voronoi, GridTriangulation
+
+voronoi = Voronoi().compute(W, H, seeds)
+tri_map, tri_grid = GridTriangulation().compute(voronoi, seeds)
+# Note this computes the diagram twice at the default padding; see triangulate.
 
 # --- OR: incremental (GPU state persists across calls) ---
 from delauney._delauney_cuda import Delaunay

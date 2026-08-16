@@ -96,6 +96,44 @@ static int resolve_border_padding(int border_padding, int, int, int)
     return DEFAULT_BORDER_PADDING;
 }
 
+//: Pack a triangulation into the (triangle_map, grid) pair Python sees.
+//:
+//: Triangles are held C++-side as a contiguous vector whose index IS the
+//: triangle id. The dict form rebuilds that as one Python int plus one 5-tuple
+//: per triangle; as_arrays hands back the (N_tri, 3) indices instead, skipping
+//: the per-triangle Python objects.
+//:
+//: One definition for all three entry points. The two classes carried a copy
+//: each -- semantically identical, differing only in how they wrote the vertex
+//: array -- which is the same drift risk the detection kernel already had.
+static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
+                               const std::vector<int32_t>& flat_out,
+                               int H, int W, bool as_arrays = false)
+{
+    py::array_t<int32_t> out_arr({H, W, 3});
+    std::memcpy(out_arr.mutable_data(), flat_out.data(),
+                flat_out.size() * sizeof(int32_t));
+
+    const int32_t n_tri = (int32_t)tri_map.size();
+    if (as_arrays) {
+        py::array_t<int32_t> verts({(int)n_tri, 3});
+        auto* p = verts.mutable_data();
+        for (int32_t tid = 0; tid < n_tri; ++tid) {
+            p[tid * 3]     = tri_map[tid].id_a;
+            p[tid * 3 + 1] = tri_map[tid].id_b;
+            p[tid * 3 + 2] = tri_map[tid].id_c;
+        }
+        return py::make_tuple(verts, out_arr);
+    }
+
+    py::dict py_map;
+    for (int32_t tid = 0; tid < n_tri; ++tid) {
+        const auto& e = tri_map[tid];
+        py_map[py::int_(tid)] = py::make_tuple(e.x, e.y, e.id_a, e.id_b, e.id_c);
+    }
+    return py::make_tuple(py_map, out_arr);
+}
+
 class PyGridTriangulation {
 public:
     py::tuple compute(
@@ -212,38 +250,6 @@ public:
         return py::make_tuple(result[0], result[1], padded_arr);
     }
 
-private:
-    // Triangles are held C++-side as a contiguous vector whose index IS the
-    // triangle id.  The dict form rebuilds that as one Python int plus one
-    // 5-tuple per triangle; as_arrays hands back the (N_tri, 3) indices instead.
-    static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
-                                   const std::vector<int32_t>& flat_out,
-                                   int H, int W, bool as_arrays)
-    {
-        py::array_t<int32_t> out_arr({H, W, 3});
-        std::memcpy(out_arr.mutable_data(), flat_out.data(),
-                    flat_out.size() * sizeof(int32_t));
-
-        if (as_arrays) {
-            const int32_t n_tri = (int32_t)tri_map.size();
-            py::array_t<int32_t> verts({(int)n_tri, 3});
-            auto v = verts.mutable_unchecked<2>();
-            for (int32_t tid = 0; tid < n_tri; ++tid) {
-                const auto& e = tri_map[tid];
-                v(tid, 0) = e.id_a;
-                v(tid, 1) = e.id_b;
-                v(tid, 2) = e.id_c;
-            }
-            return py::make_tuple(verts, out_arr);
-        }
-
-        py::dict py_map;
-        for (int32_t tid = 0; tid < (int32_t)tri_map.size(); ++tid) {
-            const auto& e = tri_map[tid];
-            py_map[py::int_(tid)] = py::make_tuple(e.x, e.y, e.id_a, e.id_b, e.id_c);
-        }
-        return py::make_tuple(py_map, out_arr);
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -397,34 +403,49 @@ private:
         }
     }
 
-    static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
-                                   const std::vector<int32_t>& flat_out,
-                                   int H, int W, bool as_arrays = false)
-    {
-        py::array_t<int32_t> out_arr({H, W, 3});
-        std::memcpy(out_arr.mutable_data(), flat_out.data(),
-                    flat_out.size() * sizeof(int32_t));
-
-        const int32_t n_tri = (int32_t)tri_map.size();
-        if (as_arrays) {
-            py::array_t<int32_t> verts({(int)n_tri, 3});
-            auto* p = verts.mutable_data();
-            for (int32_t tid = 0; tid < n_tri; ++tid) {
-                p[tid*3]   = tri_map[tid].id_a;
-                p[tid*3+1] = tri_map[tid].id_b;
-                p[tid*3+2] = tri_map[tid].id_c;
-            }
-            return py::make_tuple(verts, out_arr);
-        }
-
-        py::dict py_map;
-        for (int32_t tid = 0; tid < n_tri; ++tid) {
-            const auto& e = tri_map[tid];
-            py_map[py::int_(tid)] = py::make_tuple(e.x, e.y, e.id_a, e.id_b, e.id_c);
-        }
-        return py::make_tuple(py_map, out_arr);
-    }
 };
+
+// ---------------------------------------------------------------------------
+// triangulate: seeds in, triangulation out
+// ---------------------------------------------------------------------------
+
+//: The whole pipeline in one call, and the one callers should reach for.
+//:
+//: Voronoi().compute() followed by GridTriangulation().compute() was the usual
+//: pairing, and at any padding above 0 it built the diagram twice: once in the
+//: caller, and once inside the triangulator on the padded canvas, because
+//: detection needs the padded one. The caller's copy then served only to fill
+//: two output channels that the padded diagram already contains in its interior
+//: window. Going through here computes it once.
+static py::tuple triangulate(
+    int width, int height,
+    const py::object& seeds_obj,
+    int border_padding = -1,
+    bool as_arrays = false)
+{
+    if (width <= 0 || height <= 0)
+        throw std::invalid_argument("width and height must be positive");
+
+    auto seeds = sort_seeds(seeds_obj, width, height);
+    int N_seeds = static_cast<int>(seeds.size());
+    border_padding = resolve_border_padding(border_padding, width, height, N_seeds);
+
+    std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
+    for (int i = 0; i < N_seeds; ++i) {
+        seed_xs[i] = seeds[i].x;
+        seed_ys[i] = seeds[i].y;
+    }
+
+    std::vector<TriangleEntry> tri_map;
+    std::vector<int32_t> flat_out;
+
+    // nullptr is the point of this function: the triangulator builds whichever
+    // diagram it actually needs and nothing else.
+    cuda_compute_triangulation(width, height, nullptr,
+        seed_xs, seed_ys, tri_map, flat_out, nullptr, border_padding);
+
+    return _build_output(tri_map, flat_out, height, width, as_arrays);
+}
 
 // ---------------------------------------------------------------------------
 // Module definition
@@ -441,6 +462,24 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "Compute an L2-distance (Euclidean) Voronoi diagram.\n\n"
              "Returns int32 array of shape (height, width, 2): "
              "(seed_id, squared L2 distance) per cell.");
+
+    m.def("triangulate", &triangulate,
+          py::arg("width"), py::arg("height"), py::arg("seeds"),
+          py::arg("border_padding") = -1,
+          py::arg("as_arrays") = false,
+          "Triangulate a seed set. The normal entry point.\n\n"
+          "Equivalent to Voronoi().compute() followed by\n"
+          "GridTriangulation().compute(), but builds the Voronoi diagram once\n"
+          "instead of twice: at border_padding > 0 the triangulator needs a\n"
+          "padded diagram for detection, and the interior window of that one is\n"
+          "bit-identical to the unpadded diagram a caller would compute, so the\n"
+          "caller's copy was pure duplicate work.\n\n"
+          "border_padding: pixels of Voronoi canvas added on each side before\n"
+          "detection, exposing border triangles whose circumcentre lies outside\n"
+          "the image. Negative (the default) uses DEFAULT_BORDER_PADDING; 0\n"
+          "disables padding. See BORDER_PADDING_BOUND.md.\n\n"
+          "Returns (triangle_map, triangulation_grid), the same pair\n"
+          "GridTriangulation.compute returns.");
 
     py::class_<PyGridTriangulation>(m, "GridTriangulation")
         .def(py::init<>())

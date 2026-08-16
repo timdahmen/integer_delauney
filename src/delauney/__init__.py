@@ -1,4 +1,4 @@
-_CUDA_EXPORTS = {"Voronoi", "GridTriangulation"}
+_CUDA_EXPORTS = {"Voronoi", "GridTriangulation", "Delaunay", "triangulate"}
 
 __all__ = list(_CUDA_EXPORTS) + ["DEFAULT_BORDER_PADDING", "max_boundary_spacing"]
 
@@ -50,7 +50,7 @@ def max_boundary_spacing(border_padding: int = DEFAULT_BORDER_PADDING) -> int:
 
 def __getattr__(name):
     if name in _CUDA_EXPORTS:
-        from delauney._delauney_cuda import Voronoi, GridTriangulation  # noqa: F401
-        globals().update({k: v for k, v in locals().items() if k in _CUDA_EXPORTS})
+        from delauney import _delauney_cuda as _cu
+        globals().update({k: getattr(_cu, k) for k in _CUDA_EXPORTS})
         return globals()[name]
     raise AttributeError(f"module 'delauney' has no attribute {name!r}")
