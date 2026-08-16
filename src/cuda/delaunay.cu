@@ -149,19 +149,14 @@ void voronoi_step_kernel(
 // ---------------------------------------------------------------------------
 // Kernel: 2x2-block triangle detection with optional mask
 //
-// Ported from triangulation.cu so the two pipelines detect the same triangles.
-// This file used to scan four L-shaped stencils per pixel and register one
-// triangle per stencil with three distinct seed ids. Where four Voronoi regions
-// meet all four stencils qualify, so it emitted four overlapping triangles at a
-// cocircular vertex where the quad admits only two -- 5.2% more triangles than
-// the batch path at 1.4% seed density, all of them distinct triples, so nothing
-// downstream deduplicated them away.
+// The rule itself is shared with the batch path -- see triangle_detect.cuh,
+// which also records why: this file once scanned four L-shaped stencils per
+// pixel and emitted four overlapping triangles at a cocircular vertex where the
+// quad admits two.
 //
-// The batch path grew the geometric tie-break in 0f79a7d and this copy did not.
-// Rather than fix the L-shape variant, it now uses the same 2x2 block scan and
-// the same diagonal rule, which is the only way the two stay in agreement.
-//
-// Grid is interleaved (seed_id, distance); only channel 0 is read.
+// What stays here is only what genuinely differs. The grid is interleaved
+// (seed_id, distance) rather than plain seed ids, and detection can be scoped
+// to a mask so a deferred round does not re-detect earlier rounds' regions.
 // ---------------------------------------------------------------------------
 
 __global__

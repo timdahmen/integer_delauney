@@ -99,7 +99,7 @@ private:
     int32_t* d_changed_;     // (H*W)   cells updated during BFS (accumulated)
     int32_t* d_sx_;          // (max_seeds) seed x
     int32_t* d_sy_;          // (max_seeds) seed y
-    void*    d_raw_buf_;     // (H*W*4 * sizeof(RawTriangle)) detection scratch
+    void*    d_raw_buf_;     // detection scratch; see max_raw_triangles()
     int32_t* d_t_grid_;      // (H*W)   triangle_id per pixel
     int32_t* d_csr_ptr_;     // (max_seeds+1) CSR row starts
     int32_t* d_csr_idx_;     // (max_seeds*8) CSR triangle IDs
