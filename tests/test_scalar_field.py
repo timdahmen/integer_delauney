@@ -294,3 +294,102 @@ class TestLocate:
     def test_empty_query(self):
         mesh, _, _ = self._mesh_and_queries(100, 10, seed=79)
         assert len(mesh.locate(np.zeros((0, 2), dtype=np.int32))) == 0
+
+
+class TestInCircumsphere:
+    """The in-circle predicate, lifted out of the plane by t.
+
+    dx^2 + dy^2 + t^2 < R^2, so t eats into the circumradius and a triangle of
+    circumradius R admits nothing beyond t = R. The oracle is the numpy this
+    replaced, and matching it is delicate: the test is decided on a boundary,
+    so the circumcentre is computed in the reference's operation order rather
+    than the algebraically equal simplification, and distances are compared
+    rather than squared distances.
+    """
+
+    def _mesh(self, n, seed):
+        mesh, pts, _ = make_mesh(n, seed)
+        mesh.finalise()                       # dense ids on both sides
+        verts = mesh.sorted_rank[mesh.get_triangles()]
+        srt = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+        return mesh, srt, verts
+
+    @staticmethod
+    def _host(seeds, verts, tids, pts, t):
+        from stads.utility_functions import compute_triangle_circumcircles
+        ok = tids >= 0
+        out = np.zeros(len(pts), dtype=bool)
+        if not ok.any():
+            return out
+        v = verts[tids[ok]]
+        tri = np.zeros((int(ok.sum()), 3, 3))
+        tri[:, :, 0] = seeds[v, 0]
+        tri[:, :, 1] = seeds[v, 1]
+        centers, _ = compute_triangle_circumcircles(tri)
+        radii = np.linalg.norm(tri - centers[:, None, :], axis=2).max(axis=1)
+        p3 = np.column_stack([pts[ok, 0], pts[ok, 1], t[ok]]).astype(np.float64)
+        out[ok] = np.linalg.norm(p3 - centers, axis=1) < radii
+        return out
+
+    @pytest.mark.parametrize("t_val", [0.0, 1.0, 4.0, 12.0, 40.0])
+    def test_matches_the_host_predicate(self, t_val):
+        pytest.importorskip("stads.utility_functions")
+        mesh, seeds, verts = self._mesh(400, seed=int(t_val) + 3)
+        rng = np.random.default_rng(int(t_val) + 5)
+        q = np.stack([rng.integers(0, W, 3000),
+                      rng.integers(0, H, 3000)], axis=1).astype(np.int32)
+        t = np.full(len(q), t_val, dtype=np.float64)
+        got, tids = mesh.in_circumsphere(q, t)
+        want = self._host(seeds, verts, tids, q, t)
+
+        # Disagreement is allowed only where the point sits exactly on the
+        # circumsphere -- a seed is a vertex of its own triangle, so d == R and
+        # the comparison is a tie. Callers filter those out before asking.
+        diff = np.flatnonzero(got != want)
+        seedset = {(int(x), int(y)) for x, y in seeds}
+        for i in diff:
+            assert (int(q[i, 0]), int(q[i, 1])) in seedset, (
+                f"disagreed at {q[i]}, which is not a vertex")
+
+    def test_t_shrinks_the_admissible_radius(self):
+        """The point of the lift: larger t admits strictly fewer points."""
+        mesh, seeds, _ = self._mesh(400, seed=31)
+        rng = np.random.default_rng(32)
+        q = np.stack([rng.integers(0, W, 3000),
+                      rng.integers(0, H, 3000)], axis=1).astype(np.int32)
+        counts = []
+        for t_val in (0.0, 2.0, 5.0, 10.0, 25.0):
+            m, _ = mesh.in_circumsphere(q, np.full(len(q), t_val))
+            counts.append(int(m.sum()))
+        assert counts == sorted(counts, reverse=True), counts
+        assert counts[0] > counts[-1]
+
+    def test_far_enough_in_time_admits_nothing(self):
+        """t beyond every circumradius: no triangle can reach that far back."""
+        mesh, seeds, _ = self._mesh(400, seed=33)
+        rng = np.random.default_rng(34)
+        q = np.stack([rng.integers(0, W, 500),
+                      rng.integers(0, H, 500)], axis=1).astype(np.int32)
+        m, _ = mesh.in_circumsphere(q, np.full(len(q), 1e6))
+        assert not m.any()
+
+    def test_reports_the_containing_triangle(self):
+        """Found on the way, so it is returned rather than asked for twice."""
+        mesh, seeds, _ = self._mesh(400, seed=35)
+        rng = np.random.default_rng(36)
+        q = np.stack([rng.integers(0, W, 2000),
+                      rng.integers(0, H, 2000)], axis=1).astype(np.int32)
+        _, tids = mesh.in_circumsphere(q, np.zeros(len(q)))
+        np.testing.assert_array_equal(tids, mesh.locate(q))
+
+    def test_no_triangle_means_not_inside(self):
+        mesh, seeds, _ = self._mesh(60, seed=37)
+        far = np.array([[0, 0], [W - 1, H - 1]], dtype=np.int32)
+        m, tids = mesh.in_circumsphere(far, np.zeros(2))
+        assert not m[tids < 0].any()
+
+    def test_length_mismatch_raises(self):
+        mesh, seeds, _ = self._mesh(60, seed=39)
+        q = np.array([[10, 10], [20, 20]], dtype=np.int32)
+        with pytest.raises(Exception):
+            mesh.in_circumsphere(q, np.zeros(1))

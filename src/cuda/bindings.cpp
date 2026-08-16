@@ -330,6 +330,36 @@ public:
         return arr;
     }
 
+    py::tuple in_circumsphere(
+        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& pts,
+        const py::array_t<double, py::array::c_style | py::array::forcecast>& t)
+    {
+        auto info = pts.request();
+        if (info.ndim != 2 || info.shape[1] != 2)
+            throw std::invalid_argument("points must have shape (N, 2)");
+        const int n = (int)info.shape[0];
+        if ((int)t.size() != n)
+            throw std::invalid_argument("t must have one entry per point");
+
+        const auto* p = static_cast<const int32_t*>(info.ptr);
+        std::vector<int32_t> xs(n), ys(n);
+        for (int i = 0; i < n; ++i) { xs[i] = p[i*2]; ys[i] = p[i*2+1]; }
+        std::vector<double> ts(t.data(), t.data() + n);
+
+        std::vector<uint8_t> mask;
+        std::vector<int32_t> tids;
+        impl_.in_circumsphere(xs, ys, ts, mask, tids);
+
+        py::array_t<bool> m((py::ssize_t)mask.size());
+        py::array_t<int32_t> ti((py::ssize_t)tids.size());
+        auto* mp = m.mutable_data();
+        for (size_t i = 0; i < mask.size(); ++i) mp[i] = mask[i] != 0;
+        if (!tids.empty())
+            std::memcpy(ti.mutable_data(), tids.data(),
+                        tids.size() * sizeof(int32_t));
+        return py::make_tuple(m, ti);
+    }
+
     py::array_t<float> get_values() const
     {
         std::vector<float> v;
@@ -677,6 +707,18 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "cell at distance zero, so no record of taken positions is "
              "needed -- and midpoints colliding with one another collapse to "
              "the one from the better-scoring edge.")
+        .def("in_circumsphere", &PyDelaunay::in_circumsphere,
+             py::arg("points"), py::arg("t"),
+             "The in-circle predicate lifted out of the plane by t.\n\n"
+             "For each point, is it inside the circumsphere of the triangle "
+             "containing it, with the triangle at t = 0 and the point at t:\n\n"
+             "    dx^2 + dy^2 + t^2 < R^2\n\n"
+             "A caller using t for elapsed time reads this as close enough in "
+             "space and recent enough in time; a triangle of circumradius R "
+             "admits nothing beyond t = R.\n\n"
+             "Returns (mask, triangle_ids). The triangle is reported because a "
+             "caller asking this usually wants it and it is found on the way; "
+             "-1 where no triangle contains the point, where the mask is False.")
         .def("locate", &PyDelaunay::locate, py::arg("points"),
              "Triangle containing each point of an (N, 2) int32 array, in "
              "image coordinates, as an (N,) int32 array. -1 where no triangle "

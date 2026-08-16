@@ -146,6 +146,22 @@ public:
                 const std::vector<int32_t>& qy,
                 std::vector<int32_t>& out);
 
+    //: The in-circle predicate, lifted out of the plane by t: is the point
+    //: inside the circumsphere of the triangle containing it, when the triangle
+    //: lies at t = 0 and the point at t?
+    //:
+    //:     dx^2 + dy^2 + t^2 < R^2
+    //:
+    //: A caller using t for elapsed time reads this as "close enough in space
+    //: and recent enough in time"; a triangle of circumradius R admits nothing
+    //: beyond t = R. Reports the containing triangle alongside, since a caller
+    //: asking this almost always wants it and it is found on the way.
+    void in_circumsphere(const std::vector<int32_t>& qx,
+                         const std::vector<int32_t>& qy,
+                         const std::vector<double>& qt,
+                         std::vector<uint8_t>& mask_out,
+                         std::vector<int32_t>& tid_out);
+
     // internal insertion-order id -> batch pipeline's sorted (x asc, y asc) id
     const std::vector<int32_t>& sorted_rank() const
     { ensure_sorted_rank_(); return h_sorted_rank_; }
