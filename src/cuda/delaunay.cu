@@ -19,12 +19,13 @@
 //        b. Flag triangles whose canonical pixel is in border, by sampling the
 //           mask on the device at those positions.
 //        c. Re-detect in border, merge new triplets, compact the registry.
-//        d. Remap d_t_grid_ through old→new; deleted triangles leave -1.
+//        d. Remap d_t_grid_ through old→new; deleted triangles leave
+//           NO_TRIANGLE.
 //
 // finalise():
 //   5. Build the reassign mask from d_dirty_accum_: per-pixel radius
 //      R = min(sqrt(dist)+SLACK, CAP) via a tile prefilter, plus every pixel
-//      left at -1 by the remap.
+//      left at NO_TRIANGLE by the remap.
 //   6. Assign, masked or full according to how much of the image is dirty.
 //   7. Materialise tri_map and the (H,W,3) grid.
 
@@ -47,6 +48,12 @@
 
 // UNDEF_SEED, RawTriangle, RawLess, RawEqual and the detection rule are shared
 // with the batch path; see triangle_detect.cuh.
+
+//: An entry in the old->new remap for a triangle that did not survive
+//: compaction. Distinct from NO_TRIANGLE, which is what the *pixel* grid then
+//: receives for those triangles: this one says "this id is gone", the other
+//: says "no triangle covers this pixel".
+static constexpr int32_t TID_DELETED = -1;
 
 // ---------------------------------------------------------------------------
 // Device helpers
@@ -202,7 +209,12 @@ void remap_tgrid_kernel(int32_t* __restrict__ t_grid, int N,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     int32_t old_tid = t_grid[i];
-    if (old_tid < 0 || old_tid >= remap_size || remap[old_tid] < 0)
+    // Already uncovered, out of range, or the triangle did not survive
+    // compaction. The last case is why finalise() can reassign a pixel whose
+    // own neighbourhood never changed: build_reassign_mask_kernel tests for the
+    // fallback directly, since no dilation around changed cells would find it.
+    if (old_tid == NO_TRIANGLE || old_tid >= remap_size
+            || remap[old_tid] == TID_DELETED)
         t_grid[i] = fallback;
     else
         t_grid[i] = remap[old_tid];
@@ -258,7 +270,7 @@ void assign_triangles_kernel(
             nearby[n_nearby++] = sid;
     }
 
-    int32_t best = -1;
+    int32_t best = NO_TRIANGLE;
     for (int i = 0; i < n_nearby; ++i) {
         int32_t sid = nearby[i];
         if (sid < 0 || sid >= N_seeds) continue;
@@ -269,7 +281,7 @@ void assign_triangles_kernel(
             float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
             float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
             if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy))
-                if (best == -1 || tid > best) best = tid;
+                if (best == NO_TRIANGLE || tid > best) best = tid;
         }
     }
     t_grid[y * W + x] = best;
@@ -363,9 +375,9 @@ void build_tile_dirty_kernel(const int32_t* __restrict__ src,
 //
 // That alone would not be safe: a pixel's triangle can be deleted by a change
 // outside its search window, and no amount of dilation around changed cells
-// catches that. remap_tgrid_kernel writes -1 at exactly those pixels when the
-// registry compacts, so the sentinel is tested directly and closes the gap.
-// The cost is retesting the hull exterior, which carries -1 permanently.
+// catches that. remap_tgrid_kernel writes NO_TRIANGLE at exactly those pixels
+// when the registry compacts, so the sentinel is tested directly and closes
+// the gap. The cost is retesting the hull exterior, which carries it always.
 __global__
 void build_reassign_mask_kernel(const int32_t* __restrict__ grid,
                                 const int32_t* __restrict__ t_grid,
@@ -378,7 +390,7 @@ void build_reassign_mask_kernel(const int32_t* __restrict__ grid,
     if (x >= W || y >= H) return;
 
     int idx = y * W + x;
-    if (t_grid[idx] < 0) { mask[idx] = 1; return; }
+    if (t_grid[idx] == NO_TRIANGLE) { mask[idx] = 1; return; }
 
     int dist = grid[idx * 2 + 1];
     int R    = min((int)sqrtf((float)max(dist, 0)) + WINDOW_SLACK, WINDOW_CAP);
@@ -441,8 +453,8 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     // buffer is sized the same way the CSR is, so match that bound.
     cudaMalloc(&d_stale_,        (size_t)max_seeds * 4  * sizeof(uint8_t));
 
-    cudaMemset(d_grid_,    -1, (size_t)N * 2 * sizeof(int32_t));  // UNDEF
-    cudaMemset(d_t_grid_,  -1, (size_t)N     * sizeof(int32_t));
+    cudaMemset(d_grid_,   SENTINEL_BYTE, (size_t)N * 2 * sizeof(int32_t));
+    cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N     * sizeof(int32_t));
     cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t));
     cudaMemset(d_dirty_accum_, 0, (size_t)N  * sizeof(int32_t));
 }
@@ -597,7 +609,7 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     // Every pixel's assignment is now stale. Marking them invalidated rather
     // than assigning here lets assign_pending_ pick the mask up like any other
     // dirty region, and makes a first insert behave like the rest.
-    cudaMemset(d_t_grid_, -1, (size_t)W_det_ * H_det_ * sizeof(int32_t));
+    cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)W_det_ * H_det_ * sizeof(int32_t));
 
     if (det_ms) {
         *det_ms   = el(e0,e1);
@@ -685,7 +697,7 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     }
 
     // Compact: keep non-stale, append new; build remap old→new
-    std::vector<int32_t> remap(old_count, -1);
+    std::vector<int32_t> remap(old_count, TID_DELETED);
     std::vector<HTriangle> compacted;
     compacted.reserve(old_count - (int)std::count(h_stale.begin(), h_stale.end(),
                                                   (uint8_t)1)
@@ -714,12 +726,12 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     csr_dirty_ = true;
 
     // Remap d_t_grid_ through old→new table. Pixels whose triangle went stale
-    // get the -1 fallback, which build_reassign_mask_kernel then treats as
+    // get the NO_TRIANGLE fallback, which build_reassign_mask_kernel treats as
     // "must reassign" regardless of distance -- that is how a deleted triangle
     // is caught when the change that deleted it lay outside the pixel's own
     // search window.
     const int N = W_det_ * H_det_;
-    int32_t fallback = -1;
+    int32_t fallback = NO_TRIANGLE;
     if (old_count > 0) {
         int32_t* d_remap;
         cudaMalloc(&d_remap, old_count * sizeof(int32_t));
@@ -771,7 +783,7 @@ void Delaunay::assign_pending_(float* asgn_ms)
 
     int N_tri = (int)h_triangles_.size();
     if (N_tri == 0) {
-        cudaMemset(d_t_grid_, -1, (size_t)N * sizeof(int32_t));
+        cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N * sizeof(int32_t));
         if (asgn_ms) *asgn_ms = 0.f;
         return;
     }

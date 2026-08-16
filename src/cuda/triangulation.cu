@@ -31,9 +31,9 @@
 // Shared structs
 // ---------------------------------------------------------------------------
 
-// RawTriangle, RawLess, RawEqual, UNDEF_SEED and the detection rule itself all
-// live in triangle_detect.cuh, shared with the incremental path.
-static constexpr int32_t UNDEF = UNDEF_SEED;
+// RawTriangle, RawLess, RawEqual and the detection rule itself all live in
+// triangle_detect.cuh, shared with the incremental path; UNDEF_SEED and
+// NO_TRIANGLE in voronoi.cuh and triangulation.cuh respectively.
 
 // ---------------------------------------------------------------------------
 // Kernel 1: detect triangle seeds via 2x2 block scan
@@ -128,7 +128,7 @@ void assign_triangles_kernel(
 
     float px = (float)x;
     float py = (float)y;
-    int32_t best = -1;
+    int32_t best = NO_TRIANGLE;
 
     for (int sid = 0; sid < N_seeds; ++sid) {
         if (abs(seed_xs[sid] - x) > window_cap) continue;
@@ -140,7 +140,7 @@ void assign_triangles_kernel(
             float bx = (float)seed_xs[tri.orig_b], by = (float)seed_ys[tri.orig_b];
             float cx = (float)seed_xs[tri.orig_c], cy = (float)seed_ys[tri.orig_c];
             if (point_in_triangle(px, py, ax, ay, bx, by, cx, cy))
-                if (best == -1 || tid > best)
+                if (best == NO_TRIANGLE || tid > best)
                     best = tid;
         }
     }

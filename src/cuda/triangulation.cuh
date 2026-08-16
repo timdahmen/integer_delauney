@@ -11,6 +11,16 @@
 //: boundary is sampled. See BORDER_PADDING_BOUND.md.
 static constexpr int DEFAULT_BORDER_PADDING = 16;
 
+//: Channel 2 of the triangulation grid where no triangle contains the pixel.
+//:
+//: Two quite different situations produce it and neither is an error: the pixel
+//: lies outside the convex hull, or it lies inside a triangle the raster never
+//: witnessed. Both need the same nearest-seed handling downstream, so they are
+//: not distinguished. Distinct from UNDEF_SEED, which says the *Voronoi* cell
+//: has no owner, and from TID_DELETED in delaunay.cu, which says a triangle id
+//: no longer exists after the registry compacted.
+static constexpr int32_t NO_TRIANGLE = -1;
+
 struct TriangleEntry {
     int32_t x, y;
     int32_t id_a, id_b, id_c;

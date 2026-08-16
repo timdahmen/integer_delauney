@@ -26,7 +26,7 @@
 // Device helpers
 // ---------------------------------------------------------------------------
 
-static constexpr int32_t UNDEFINED = -1;
+// UNDEF_SEED comes from voronoi.cuh.
 
 // Compare two (seed_id, distance) candidates; return true if b beats a.
 // Lower distance wins; on tie, higher seed_id wins.
@@ -78,7 +78,7 @@ void voronoi_step_kernel(
 
         int nb = (ny * W + nx) * 2;
         int32_t n_id = src[nb];
-        if (n_id == UNDEFINED) continue;
+        if (n_id == UNDEF_SEED) continue;
 
         // Recomputed from the seed position, never accumulated through
         // neighbours -- that would give a Manhattan metric.
@@ -86,7 +86,7 @@ void voronoi_step_kernel(
         int32_t ddy = y - seed_ys[n_id];
         int32_t n_d = ddx * ddx + ddy * ddy;
 
-        if (best_id == UNDEFINED || beats(best_id, best_d, n_id, n_d)) {
+        if (best_id == UNDEF_SEED || beats(best_id, best_d, n_id, n_d)) {
             best_id = n_id;
             best_d  = n_d;
         }
@@ -113,8 +113,8 @@ void cuda_compute_voronoi(
     const int bytes   = N * 2 * sizeof(int32_t);
     const int N_seeds = (int)seeds.size();
 
-    // Initialise host grid: seed pixels get (seed_id, 0), rest get UNDEFINED
-    std::vector<int32_t> h_grid(N * 2, UNDEFINED);
+    // Initialise host grid: seed pixels get (seed_id, 0), rest get UNDEF_SEED
+    std::vector<int32_t> h_grid(N * 2, UNDEF_SEED);
     for (int i = 0; i < N_seeds; ++i) {
         int base = (seeds[i].y * W + seeds[i].x) * 2;
         h_grid[base]     = static_cast<int32_t>(i);

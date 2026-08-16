@@ -23,11 +23,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 
-//: A grid cell the Voronoi BFS has not reached yet. The batch path never sees
-//: one -- it always runs the BFS to completion before detecting -- but the
-//: incremental path detects into a partially filled grid, so the shared code
-//: has to tolerate it.
-static constexpr int32_t UNDEF_SEED = -1;
+#include "voronoi.cuh"   // UNDEF_SEED
 
 //: One detected triangle, before deduplication.
 //:

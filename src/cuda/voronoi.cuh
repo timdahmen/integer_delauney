@@ -6,6 +6,24 @@ struct Seed {
     int32_t x, y;
 };
 
+//: A Voronoi cell no seed owns yet, i.e. one the BFS has not reached.
+//:
+//: The batch path never exposes one -- it runs the BFS to completion before
+//: anything reads the grid -- but the incremental path detects into a partially
+//: filled grid, so consumers must tolerate it. Lives here rather than beside the
+//: triangulation code because it is a property of the Voronoi grid itself; it
+//: previously existed under three names (UNDEF_SEED, UNDEF, UNDEFINED) in three
+//: files, all meaning this.
+static constexpr int32_t UNDEF_SEED = -1;
+
+//: Byte value for cudaMemset when filling an int32 buffer with a -1 sentinel.
+//:
+//: cudaMemset sets *bytes*, not words. It happens to produce the right result
+//: for -1 because every byte of -1 is 0xFF -- which is exactly why -1 is the
+//: sentinel and not some other negative number. Spelled out so the coincidence
+//: is deliberate rather than something a reader has to rederive.
+static constexpr int SENTINEL_BYTE = 0xFF;
+
 void cuda_compute_voronoi(
     int W, int H,
     const std::vector<Seed>& seeds,
