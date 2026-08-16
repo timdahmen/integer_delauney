@@ -67,6 +67,30 @@ public:
         std::vector<int32_t>&       tgrid_out,
         InsertTimings*         timings = nullptr);
 
+    // Same as finalise(), except the per-pixel outputs stay on the device
+    // instead of being downloaded and cropped on the host: tri_map_out is
+    // still built host-side, since it is per-triangle and small, but the
+    // (H*W) triangle-id, seed-id and outside-hull arrays are written directly
+    // into device_pixel_tids()/device_pixel_seed_ids()/device_outside_mask()
+    // by a crop kernel and never copied to host memory here.
+    //
+    // Those three views are valid from the moment this call returns until
+    // generation() next changes, i.e. until the next call to insert(),
+    // insert_deferred(), finalise() or finalise_device() on this object, or
+    // until the object is destroyed. A caller holding a view across such a
+    // call is reading memory that has moved on.
+    void finalise_device(std::vector<TriangleEntry>& tri_map_out);
+
+    const int32_t* device_pixel_tids()     const { return d_pixel_tids_; }
+    const int32_t* device_pixel_seed_ids() const { return d_pixel_seed_ids_; }
+    const uint8_t* device_outside_mask()   const { return d_outside_mask_; }
+
+    // Bumped by every call that can change what the three device_* buffers
+    // above contain (see finalise_device()). A snapshot taken at one
+    // generation and compared against a later one tells a consumer its view
+    // is stale before it reads through a pointer that has been reused.
+    uint64_t generation() const { return generation_; }
+
     // Triangle topology alone, with no raster copied back.  Seed ids are
     // INSERTION-order, not the sorted numbering insert()/finalise() report:
     // a caller refining across several inserts keeps its own per-seed arrays
@@ -202,6 +226,12 @@ private:
     // like d_stale_, off the planarity bound of under 2n triangles for n seeds.
     void*    d_edge_keys_;
     int32_t* d_t_grid_;      // (H*W)   triangle_id per pixel
+    // ---- device-resident finalise_device() outputs, see the header above ----
+    int32_t* d_sorted_rank_;    // (max_seeds) device mirror of h_sorted_rank_
+    int32_t* d_pixel_tids_;     // (H*W) triangle id per pixel, NO_TRIANGLE -> 0
+    int32_t* d_pixel_seed_ids_; // (H*W) nearest seed id per pixel, sorted numbering
+    uint8_t* d_outside_mask_;   // (H*W) 1 where the pixel has no containing triangle
+    uint64_t generation_;       // see generation() above
     int32_t* d_csr_ptr_;     // (max_seeds+1) CSR row starts
     int32_t* d_csr_idx_;     // (max_seeds*8) CSR triangle IDs
     int32_t* d_updated_flag_;// (1)     BFS convergence flag
@@ -307,8 +337,15 @@ private:
     void compact_registry_();
     bool should_compact_() const;
     void ensure_edges_() const;
+    // Shared by build_outputs_() and build_outputs_device_(): the per-triangle
+    // vertex ids, translated through sorted_rank(). Small (per-triangle), so
+    // both paths build it on the host the same way.
+    void build_tri_map_(std::vector<TriangleEntry>& tri_map_out) const;
     void build_outputs_(std::vector<TriangleEntry>& tri_map_out,
                         std::vector<int32_t>& tgrid_out) const;
+    // As build_outputs_(), but launches the crop kernel into the persistent
+    // device_pixel_*() buffers instead of downloading and cropping on the host.
+    void build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) const;
 
     static uint64_t pack_triplet_(int32_t a, int32_t b, int32_t c) {
         return (uint64_t(a) << 42) | (uint64_t(b) << 21) | uint64_t(c);

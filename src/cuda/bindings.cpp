@@ -253,6 +253,55 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Device-resident view, returned by PyDelaunay::finalise_device()
+// ---------------------------------------------------------------------------
+
+//: A read-only window onto one of a Delaunay object's device buffers,
+//: exposed to Python as __cuda_array_interface__ only -- no other way to
+//: reach the pointer. Deliberately not a registry: one view, one owner, one
+//: buffer, found only via finalise_device()'s return value.
+//:
+//: Two independent things keep this safe to hand to another CUDA extension:
+//: `owner_` is a reference to the parent Delaunay's Python object, so
+//: ordinary refcounting keeps the device memory allocated for as long as any
+//: view over it is reachable, even if the caller's own reference to the mesh
+//: has already been reassigned. `mesh_` lets __cuda_array_interface__ compare
+//: the mesh's *current* generation() against the value snapshotted when this
+//: view was made, so a view read after the mesh was mutated again raises
+//: instead of silently exposing memory that has moved on.
+class PyDeviceArrayView {
+public:
+    PyDeviceArrayView(py::object owner, const Delaunay* mesh,
+                      const void* ptr, py::ssize_t count,
+                      std::string typestr, uint64_t generation)
+        : owner_(std::move(owner)), mesh_(mesh), ptr_(ptr), count_(count),
+          typestr_(std::move(typestr)), generation_(generation) {}
+
+    py::dict cuda_array_interface() const
+    {
+        if (mesh_->generation() != generation_)
+            throw std::runtime_error(
+                "device view is stale: the mesh was mutated after "
+                "finalise_device() produced this view");
+        py::dict d;
+        d["shape"]   = py::make_tuple(count_);
+        d["typestr"] = typestr_;
+        d["data"]    = py::make_tuple((uintptr_t)ptr_, /*read_only=*/true);
+        d["strides"] = py::none();
+        d["version"] = 3;
+        return d;
+    }
+
+private:
+    py::object owner_;        // keeps the parent Delaunay (and its buffers) alive
+    const Delaunay* mesh_;    // valid as long as owner_ is -- see above
+    const void* ptr_;
+    py::ssize_t count_;
+    std::string typestr_;
+    uint64_t generation_;     // snapshot at construction time
+};
+
+// ---------------------------------------------------------------------------
 // Delaunay wrapper
 // ---------------------------------------------------------------------------
 
@@ -420,6 +469,41 @@ public:
         auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
                                  as_arrays);
         return py::make_tuple(out[0], out[1], _timings_dict(t));
+    }
+
+    // As finalise(as_arrays=True), except the (H,W,3) raster never comes back
+    // to the host: the three channels TriangulationAdapter used to slice out
+    // of it are returned as __cuda_array_interface__ views straight onto the
+    // Delaunay object's own device memory instead. Returns
+    // (triangle_verts, pixel_tids, pixel_seed_ids, outside_hull_mask).
+    py::tuple finalise_device()
+    {
+        std::vector<TriangleEntry> tri_map;
+        impl_.finalise_device(tri_map);
+
+        py::array_t<int32_t> verts({(int)tri_map.size(), 3});
+        auto* p = verts.mutable_data();
+        for (size_t tid = 0; tid < tri_map.size(); ++tid) {
+            p[tid * 3]     = tri_map[tid].id_a;
+            p[tid * 3 + 1] = tri_map[tid].id_b;
+            p[tid * 3 + 2] = tri_map[tid].id_c;
+        }
+
+        // The existing Python wrapper for `this` -- reference, not a new
+        // object, since pybind11 already owns one. This is what each view
+        // keeps alive; see PyDeviceArrayView.
+        py::object self = py::cast(this, py::return_value_policy::reference);
+        const py::ssize_t n = (py::ssize_t)impl_.width() * impl_.height();
+        const uint64_t gen = impl_.generation();
+
+        py::object pixel_tids = py::cast(PyDeviceArrayView(
+            self, &impl_, impl_.device_pixel_tids(), n, "<i4", gen));
+        py::object pixel_seed_ids = py::cast(PyDeviceArrayView(
+            self, &impl_, impl_.device_pixel_seed_ids(), n, "<i4", gen));
+        py::object outside_mask = py::cast(PyDeviceArrayView(
+            self, &impl_, impl_.device_outside_mask(), n, "|u1", gen));
+
+        return py::make_tuple(verts, pixel_tids, pixel_seed_ids, outside_mask);
     }
 
     // (N_tri, 3) vertex ids only -- no raster, no canonical pixels.
@@ -627,6 +711,12 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "Returns (triangle_map, triangulation_grid, padded_voronoi_grid) where "
              "padded_voronoi_grid has shape (H+2*P, W+2*P, 2).");
 
+    py::class_<PyDeviceArrayView>(m, "DeviceArrayView")
+        .def_property_readonly("__cuda_array_interface__",
+             &PyDeviceArrayView::cuda_array_interface,
+             "CUDA Array Interface (v3), read-only. Raises RuntimeError if the\n"
+             "owning Delaunay object has been mutated since this view was made.");
+
     py::class_<PyDelaunay>(m, "Delaunay")
         .def(py::init<int, int, int, int>(),
              py::arg("width"), py::arg("height"), py::arg("max_seeds"),
@@ -681,6 +771,15 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def("finalise_timed", &PyDelaunay::finalise_timed,
              py::arg("as_arrays") = false,
              "Same as finalise() but also returns the timings dict.")
+        .def("finalise_device", &PyDelaunay::finalise_device,
+             "Same as finalise(as_arrays=True), except pixel_tids,\n"
+             "pixel_seed_ids and outside_hull_mask stay on the device: each\n"
+             "comes back as a __cuda_array_interface__ view onto this object's\n"
+             "own memory instead of a NumPy array.\n\n"
+             "Returns (triangle_verts, pixel_tids, pixel_seed_ids,\n"
+             "outside_hull_mask). The three views are valid until this object's\n"
+             "next mutating call (insert/insert_deferred/finalise/\n"
+             "finalise_device) or destruction; reading one afterward raises.")
         .def("get_triangles", &PyDelaunay::get_triangles,
              "Triangle topology alone as an (N_tri, 3) int32 array, with no\n"
              "raster copied back.\n\n"

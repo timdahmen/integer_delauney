@@ -777,7 +777,7 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
                                          int border_padding)
     : W_(width), H_(height), N_(0), max_seeds_(max_seeds), pending_(false),
       n_live_(0), csr_dirty_(true), sorted_rank_dirty_(true),
-      edges_dirty_(true), n_edges_(0), have_values_(false)
+      edges_dirty_(true), n_edges_(0), have_values_(false), generation_(0)
 {
     if (width <= 0 || height <= 0 || max_seeds <= 0)
         throw std::invalid_argument("dimensions and max_seeds must be positive");
@@ -807,6 +807,12 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     cudaMalloc(&d_detect_buf_,
                max_raw_triangles(W_det_, H_det_) * sizeof(RawTriangle));
     cudaMalloc(&d_t_grid_,       (size_t)N              * sizeof(int32_t));
+    // Sized on the unpadded image, unlike the buffers above: these are the
+    // finalise_device() outputs, addressed in image space by the crop kernel.
+    cudaMalloc(&d_sorted_rank_,     (size_t)max_seeds       * sizeof(int32_t));
+    cudaMalloc(&d_pixel_tids_,      (size_t)W_ * H_         * sizeof(int32_t));
+    cudaMalloc(&d_pixel_seed_ids_,  (size_t)W_ * H_         * sizeof(int32_t));
+    cudaMalloc(&d_outside_mask_,    (size_t)W_ * H_         * sizeof(uint8_t));
     cudaMalloc(&d_csr_ptr_,      (size_t)(max_seeds + 1)* sizeof(int32_t));
     cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 8  * sizeof(int32_t));
     cudaMalloc(&d_updated_flag_, 1                      * sizeof(int32_t));
@@ -844,6 +850,8 @@ Delaunay::~Delaunay()
     cudaFree(d_sx_);      cudaFree(d_sy_);        cudaFree(d_raw_buf_);
     cudaFree(d_detect_buf_);
     cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
+    cudaFree(d_sorted_rank_);    cudaFree(d_pixel_tids_);
+    cudaFree(d_pixel_seed_ids_); cudaFree(d_outside_mask_);
     cudaFree(d_edge_keys_);
     cudaFree(d_dead_);
     cudaFree(d_values_);   cudaFree(d_scores_);  cudaFree(d_score_keys_);
@@ -1328,18 +1336,21 @@ void Delaunay::rebuild_sorted_rank_() const
     h_sorted_rank_.assign(N_, 0);
     for (int rank = 0; rank < N_; ++rank)
         h_sorted_rank_[order[rank]] = rank;
+
+    // Mirrored for crop_pixel_arrays_kernel, which remaps seed ids on the
+    // device instead of walking the padded canvas back through the host.
+    if (N_ > 0)
+        cudaMemcpy(d_sorted_rank_, h_sorted_rank_.data(),
+                   (size_t)N_ * sizeof(int32_t), cudaMemcpyHostToDevice);
 }
 
 // ---------------------------------------------------------------------------
 // build_outputs_
 // ---------------------------------------------------------------------------
 
-void Delaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
-                                         std::vector<int32_t>& tgrid_out) const
+void Delaunay::build_tri_map_(std::vector<TriangleEntry>& tri_map_out) const
 {
     ensure_sorted_rank_();
-    const int N     = W_ * H_;
-    const int N_det = W_det_ * H_det_;
     int N_tri = (int)h_triangles_.size();
 
     // Translate internal insertion-order ids to the batch pipeline's sorted
@@ -1358,6 +1369,23 @@ void Delaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
         tri_map_out[tid] = {t.x - P_, t.y - P_,
                             ext(t.orig_a), ext(t.orig_b), ext(t.orig_c)};
     }
+}
+
+void Delaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
+                                         std::vector<int32_t>& tgrid_out) const
+{
+    build_tri_map_(tri_map_out);
+    ensure_sorted_rank_();
+    const int N     = W_ * H_;
+    const int N_det = W_det_ * H_det_;
+
+    // Translate internal insertion-order seed ids to the batch pipeline's
+    // sorted numbering (see h_sorted_rank_) -- same table build_tri_map_()
+    // used, applied here to the raster instead of the triangle vertices.
+    auto ext = [this](int32_t internal) -> int32_t {
+        return (internal >= 0 && internal < (int32_t)h_sorted_rank_.size())
+             ? h_sorted_rank_[internal] : internal;
+    };
 
     std::vector<int32_t> h_t(N_det), h_grid(N_det * 2);
     cudaMemcpy(h_t.data(),    d_t_grid_, N_det     * sizeof(int32_t), cudaMemcpyDeviceToHost);
@@ -1375,6 +1403,52 @@ void Delaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
             tgrid_out[d*3+2] = h_t[s];
         }
     }
+}
+
+//: The device counterpart of build_outputs_()'s crop loop: one thread per
+//: image pixel, reading the padded d_grid_/d_t_grid_ exactly as the host loop
+//: does and writing straight into the three finalise_device() buffers instead
+//: of a host vector. Also bakes in the outside-hull substitution
+//: (NO_TRIANGLE -> 0) that TriangulationAdapter used to do in NumPy, since the
+//: mask is already known at the pixel that needs it.
+__global__
+void crop_pixel_arrays_kernel(const int32_t* __restrict__ grid,
+                              const int32_t* __restrict__ t_grid,
+                              const int32_t* __restrict__ sorted_rank,
+                              int sorted_rank_size,
+                              int W, int H, int P, int W_det,
+                              int32_t* __restrict__ pixel_tids_out,
+                              int32_t* __restrict__ pixel_seed_ids_out,
+                              uint8_t* __restrict__ outside_mask_out)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+
+    const int s = (y + P) * W_det + P + x;
+    const int d = y * W + x;
+
+    const int32_t seed_id = grid[s * 2];
+    pixel_seed_ids_out[d] = (seed_id >= 0 && seed_id < sorted_rank_size)
+                           ? sorted_rank[seed_id] : seed_id;
+
+    const int32_t tid = t_grid[s];
+    const bool outside = (tid == NO_TRIANGLE);
+    outside_mask_out[d] = outside ? 1 : 0;
+    pixel_tids_out[d]   = outside ? 0 : tid;
+}
+
+void Delaunay::build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) const
+{
+    build_tri_map_(tri_map_out);
+    ensure_sorted_rank_();
+
+    dim3 block(16, 16);
+    dim3 grid_dim((W_ + 15) / 16, (H_ + 15) / 16);
+    crop_pixel_arrays_kernel<<<grid_dim, block>>>(
+        d_grid_, d_t_grid_, d_sorted_rank_, (int)h_sorted_rank_.size(),
+        W_, H_, P_, W_det_,
+        d_pixel_tids_, d_pixel_seed_ids_, d_outside_mask_);
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,6 +1584,10 @@ void Delaunay::insert_deferred(
     int k = (int)new_xs.size();
     if (k == 0) return;
 
+    // Invalidates any finalise_device() view outstanding from before this
+    // call: the source grids it read are about to change under it.
+    ++generation_;
+
     bool is_first = (N_ == 0);
 
     float bfs_ms = 0.f;
@@ -1560,8 +1638,25 @@ void Delaunay::finalise(
         if (timings) timings->assign_ms = asgn_ms;
         cudaMemset(d_dirty_accum_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t));
         pending_ = false;
+        // The grids finalise_device()'s buffers were cropped from just moved.
+        ++generation_;
     }
     build_outputs_(tri_map_out, tgrid_out);
+}
+
+void Delaunay::finalise_device(std::vector<TriangleEntry>& tri_map_out)
+{
+    // One generation per call: even a call with nothing pending re-launches
+    // the crop kernel and produces a view a caller should treat as new.
+    ++generation_;
+
+    compact_registry_();
+    if (pending_) {
+        assign_pending_(nullptr);
+        cudaMemset(d_dirty_accum_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t));
+        pending_ = false;
+    }
+    build_outputs_device_(tri_map_out);
 }
 
 void Delaunay::insert(
