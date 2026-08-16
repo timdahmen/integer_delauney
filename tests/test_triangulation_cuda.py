@@ -23,8 +23,8 @@ skip_no_cuda = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def cuda_vd():
-    from delauney._delauney_cuda import RegularDelaunay
-    return RegularDelaunay()
+    from delauney._delauney_cuda import Voronoi
+    return Voronoi()
 
 
 @pytest.fixture(scope="module")
@@ -35,8 +35,8 @@ def cuda_tri():
 
 @pytest.fixture(scope="module")
 def ref_vd():
-    from delauney.reference.voronoi import RegularDelaunay
-    return RegularDelaunay()
+    from delauney.reference.voronoi import Voronoi
+    return Voronoi()
 
 
 @pytest.fixture(scope="module")
@@ -140,7 +140,7 @@ class TestCocircularAgreement:
 
     Both are fed the *same* Voronoi grid, which keeps this about the diagonal
     rule: the two Voronoi implementations can legitimately differ at ties, and
-    CUDA can additionally settle on a non-nearest seed (see RegularDelaunay in
+    CUDA can additionally settle on a non-nearest seed (see Voronoi in
     reference/voronoi.py), which would otherwise show up here as noise.
     """
 

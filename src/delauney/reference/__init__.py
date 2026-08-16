@@ -1,4 +1,4 @@
-from .voronoi import RegularDelaunay
+from .voronoi import Voronoi
 from .triangulation import GridTriangulation
 
-__all__ = ["RegularDelaunay", "GridTriangulation"]
+__all__ = ["Voronoi", "GridTriangulation"]

@@ -1,4 +1,4 @@
-// CUDA kernel for RegularDelaunay: parallel L2-distance Voronoi BFS.
+// CUDA kernel for Voronoi: parallel L2-distance Voronoi BFS.
 //
 // Grid representation: flat int32 array of (seed_id, squared_l2_distance) pairs.
 // Index layout: cell (x, y) → base index (y * W + x) * 2.
@@ -35,7 +35,7 @@ static constexpr int32_t UNDEFINED = -1;
 // this kernel advances one cell per iteration, so it can settle at a fixed
 // point that is not nearest-seed (rare, grows with seed density -- measured
 // 2/16384 pixels at 128x128 with 400 seeds, off by 1-3 in squared distance).
-// See RegularDelaunay's docstring in reference/voronoi.py.
+// See Voronoi's docstring in reference/voronoi.py.
 __device__ __forceinline__
 bool beats(int32_t a_id, int32_t a_d, int32_t b_id, int32_t b_d)
 {

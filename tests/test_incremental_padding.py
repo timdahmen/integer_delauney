@@ -1,4 +1,4 @@
-"""Border padding in IncrementalDelaunay.
+"""Border padding in Delaunay.
 
 A triangle is registered where three Voronoi regions meet -- its circumcentre --
 and boundary triangles frequently have circumcentres outside the image, so at
@@ -53,13 +53,13 @@ def scattered(n, seed, w=W, h=H):
 
 
 def batch(seeds, padding):
-    vg = _cu.RegularDelaunay().compute(W, H, seeds)
+    vg = _cu.Voronoi().compute(W, H, seeds)
     tm, tg = _cu.GridTriangulation().compute(vg, seeds, padding)
     return tri_set(tm), tg
 
 
 def incremental(seeds, padding, batches=1):
-    inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, padding)
+    inc = _cu.Delaunay(W, H, MAX_SEEDS, padding)
     step = max(1, len(seeds) // batches)
     for i in range(0, len(seeds), step):
         inc.insert_deferred(seeds[i:i + step])
@@ -103,12 +103,12 @@ class TestPaddingMatchesBatch:
     def test_matches_batch_after_several_deferred_inserts(self):
         """Padding must survive incremental insertion, not just a first build."""
         seeds = scattered(250, 7)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, 6)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, 6)
         for i in range(0, len(seeds), 50):
             inc.insert_deferred(seeds[i:i + 50])
         i_map, i_grid = inc.finalise()
 
-        vg = _cu.RegularDelaunay().compute(W, H, seeds)
+        vg = _cu.Voronoi().compute(W, H, seeds)
         b_map, b_grid = _cu.GridTriangulation().compute(vg, seeds, 6)
 
         assert tri_set(i_map) == tri_set(b_map)
@@ -170,7 +170,7 @@ class TestPaddingApi:
     def test_output_shapes_are_image_sized(self):
         """The padded canvas is internal; outputs stay (H, W, *)."""
         seeds = scattered(80, 3)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, 9)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, 9)
         inc.insert_deferred(seeds)
         _, tgrid = inc.finalise()
         assert np.asarray(tgrid).shape == (H, W, 3)
@@ -184,17 +184,17 @@ class TestPaddingApi:
         to what the batch path would pick for it. A constant removes that
         disagreement by construction.
         """
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS)
         assert inc.border_padding == DEFAULT_BORDER_PADDING
-        assert _cu.IncrementalDelaunay(W, H, MAX_SEEDS * 8).border_padding             == DEFAULT_BORDER_PADDING
+        assert _cu.Delaunay(W, H, MAX_SEEDS * 8).border_padding             == DEFAULT_BORDER_PADDING
 
     def test_explicit_padding_is_reported(self):
-        assert _cu.IncrementalDelaunay(W, H, MAX_SEEDS, 5).border_padding == 5
-        assert _cu.IncrementalDelaunay(W, H, MAX_SEEDS, 0).border_padding == 0
+        assert _cu.Delaunay(W, H, MAX_SEEDS, 5).border_padding == 5
+        assert _cu.Delaunay(W, H, MAX_SEEDS, 0).border_padding == 0
 
     def test_seed_bounds_are_image_coordinates_not_padded(self):
         """Padding must not quietly widen the accepted coordinate range."""
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, 8)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, 8)
         with pytest.raises(ValueError):
             inc.insert_deferred([[W, 0]])
         with pytest.raises(ValueError):
@@ -205,9 +205,9 @@ class TestPaddingApi:
     def test_voronoi_matches_batch_under_padding(self):
         """Padding changes detection, not the Voronoi diagram of the image."""
         seeds = scattered(100, 4)
-        inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS, 7)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, 7)
         inc.insert_deferred(seeds)
         inc.finalise()
         vg_inc = np.asarray(inc.get_voronoi_grid())
-        vg_batch = np.asarray(_cu.RegularDelaunay().compute(W, H, seeds))
+        vg_batch = np.asarray(_cu.Voronoi().compute(W, H, seeds))
         np.testing.assert_array_equal(vg_inc[:, :, 1], vg_batch[:, :, 1])

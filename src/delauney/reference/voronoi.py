@@ -1,11 +1,11 @@
-"""NumPy reference implementation of RegularDelaunay (L2-distance Voronoi)."""
+"""NumPy reference implementation of Voronoi (L2-distance Voronoi)."""
 import numpy as np
 
 
 _UNDEFINED = -1
 
 
-class RegularDelaunay:
+class Voronoi:
     """Computes an L2-distance (Euclidean) Voronoi diagram on an integer grid.
 
     Seed IDs are assigned in ascending X order, tiebroken by ascending Y.

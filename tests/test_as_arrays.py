@@ -3,9 +3,9 @@ import numpy as np
 import pytest
 
 from delauney.reference.triangulation import GridTriangulation
-from delauney.reference.voronoi import RegularDelaunay
+from delauney.reference.voronoi import Voronoi
 
-_vd = RegularDelaunay()
+_vd = Voronoi()
 _tri = GridTriangulation()
 
 W = H = 48
@@ -67,7 +67,7 @@ class TestCudaAsArrays:
         from delauney import _delauney_cuda as dc
 
         seeds = _seeds(30, 5)
-        vg = np.asarray(dc.RegularDelaunay().compute(W, H, seeds))
+        vg = np.asarray(dc.Voronoi().compute(W, H, seeds))
         verts, g_arr = dc.GridTriangulation().compute(vg, seeds, as_arrays=True)
         tri_map, g_dict = dc.GridTriangulation().compute(vg, seeds)
 
@@ -81,6 +81,6 @@ class TestCudaAsArrays:
         from delauney import _delauney_cuda as dc
 
         seeds = _seeds(20, 6)
-        vg = np.asarray(dc.RegularDelaunay().compute(W, H, seeds))
+        vg = np.asarray(dc.Voronoi().compute(W, H, seeds))
         tri_map, _ = dc.GridTriangulation().compute(vg, seeds)
         assert isinstance(tri_map, dict)

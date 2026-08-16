@@ -35,10 +35,10 @@ A triangle is only detected where three Voronoi regions meet — its circumcente
 
 ---
 
-## `delauney.RegularDelaunay` (CUDA)
+## `delauney.Voronoi` (CUDA)
 
 ```python
-from delauney import RegularDelaunay
+from delauney import Voronoi
 ```
 
 One-shot, stateless computation of an L2-distance (Euclidean) Voronoi diagram on the GPU.
@@ -46,7 +46,7 @@ One-shot, stateless computation of an L2-distance (Euclidean) Voronoi diagram on
 ### Constructor
 
 ```python
-RegularDelaunay()
+Voronoi()
 ```
 
 No parameters.
@@ -56,7 +56,7 @@ No parameters.
 ### `compute`
 
 ```python
-voronoi_grid = RegularDelaunay().compute(
+voronoi_grid = Voronoi().compute(
     width: int,
     height: int,
     seeds: Seeds,
@@ -75,7 +75,7 @@ voronoi_grid = RegularDelaunay().compute(
 
 > **Accuracy.** Both paths propagate locally. At cells equidistant from two seeds they may pick different — equally correct — seeds, so do not assume bit-equality of channel 0 at ties.
 >
-> The CUDA kernel advances one cell per iteration and can additionally settle at a fixed point that is *not* nearest-seed. Measured at 128×128 with 400 seeds: 2 of 16384 pixels, off by 1–3 in squared distance. It is rare and grows with seed density. Use `delauney.reference.RegularDelaunay` when exactness matters.
+> The CUDA kernel advances one cell per iteration and can additionally settle at a fixed point that is *not* nearest-seed. Measured at 128×128 with 400 seeds: 2 of 16384 pixels, off by 1–3 in squared distance. It is rare and grows with seed density. Use `delauney.reference.Voronoi` when exactness matters.
 
 **Raises** `ValueError` if seeds is empty, contains duplicates, or any coordinate is out of bounds.
 
@@ -112,8 +112,8 @@ triangle_map, triangulation_grid = GridTriangulation().compute(
 
 | Parameter | Type | Description |
 |---|---|---|
-| `voronoi_grid` | `np.ndarray (H, W, 2) int32` | Output of `RegularDelaunay.compute()`. |
-| `seed_positions` | `Seeds` | The same seed list passed to `RegularDelaunay.compute()`. |
+| `voronoi_grid` | `np.ndarray (H, W, 2) int32` | Output of `Voronoi.compute()`. |
+| `seed_positions` | `Seeds` | The same seed list passed to `Voronoi.compute()`. |
 | `border_padding` | `int` | Pixels of Voronoi canvas added on each side before triangle detection, exposing border triangles whose circumcenter lies outside the image. Negative (the default) resolves to `auto_border_padding`; `0` disables padding. The output grid is always the original `(H, W, 3)`. |
 | `as_arrays` | `bool` | Return a `TriangleArray` instead of a `TriangleMap`, skipping the per-triangle Python objects. |
 
@@ -159,10 +159,10 @@ Same as `compute()`, but also returns the padded Voronoi canvas that triangle de
 
 ---
 
-## `delauney._delauney_cuda.IncrementalDelaunay` (CUDA)
+## `delauney._delauney_cuda.Delaunay` (CUDA)
 
 ```python
-from delauney._delauney_cuda import IncrementalDelaunay
+from delauney._delauney_cuda import Delaunay
 ```
 
 > **Note:** Not re-exported from the `delauney` top-level. Import directly from the C extension.
@@ -172,7 +172,7 @@ Stateful GPU triangulator that maintains Voronoi + triangulation state across mu
 ### Constructor
 
 ```python
-tri = IncrementalDelaunay(
+tri = Delaunay(
     width: int,
     height: int,
     max_seeds: int,
@@ -260,7 +260,7 @@ and the only one whose dirty region saturates once a batch is large and
 scattered. A caller inserting repeatedly before it needs a raster should defer:
 
 ```python
-tri = IncrementalDelaunay(W, H, max_seeds)
+tri = Delaunay(W, H, max_seeds)
 tri.insert_deferred(initial_seeds)
 for _ in range(rounds):
     tris = tri.get_triangles()        # topology only, no raster
@@ -341,19 +341,19 @@ Returns the current Voronoi state as a `VoronoiGrid` without running a triangula
 ## `delauney.reference` — Pure NumPy Fallback
 
 ```python
-from delauney.reference import RegularDelaunay, GridTriangulation
+from delauney.reference import Voronoi, GridTriangulation
 ```
 
-CPU-only reference implementations with matching signatures. Useful for testing without a GPU. No `IncrementalDelaunay` equivalent exists.
+CPU-only reference implementations with matching signatures. Useful for testing without a GPU. No `Delaunay` equivalent exists.
 
 | Class | Method | Signature |
 |---|---|---|
-| `reference.RegularDelaunay` | `compute` | `(width, height, seeds) → VoronoiGrid` |
+| `reference.Voronoi` | `compute` | `(width, height, seeds) → VoronoiGrid` |
 | `reference.GridTriangulation` | `compute` | `(voronoi_grid, seed_positions, border_padding=None, as_arrays=False) → (TriangleMap \| TriangleArray, TriangulationGrid)` |
 
 The one deliberate signature difference: the reference spells the auto padding default as `border_padding=None`, the CUDA path as a negative `int`. There is no `compute_timed` or `compute_debug` on the reference.
 
-**Cocircular quads:** at a degree-4 Voronoi vertex a quad has two equally valid triangulations. Both paths resolve it the same way — shorter diagonal, tiebreaking away from the lowest seed id — so given the same Voronoi grid they produce identical triangle sets. Note that they may still differ *end to end*, because the two Voronoi implementations can disagree first (see the accuracy note under `RegularDelaunay`).
+**Cocircular quads:** at a degree-4 Voronoi vertex a quad has two equally valid triangulations. Both paths resolve it the same way — shorter diagonal, tiebreaking away from the lowest seed id — so given the same Voronoi grid they produce identical triangle sets. Note that they may still differ *end to end*, because the two Voronoi implementations can disagree first (see the accuracy note under `Voronoi`).
 
 ---
 
@@ -361,13 +361,13 @@ The one deliberate signature difference: the reference spells the auto padding d
 
 ```python
 import numpy as np
-from delauney import RegularDelaunay, GridTriangulation
+from delauney import Voronoi, GridTriangulation
 
 seeds = [(10, 20), (50, 80), (120, 40)]
 W, H = 200, 150
 
 # Step 1: Voronoi diagram
-voronoi = RegularDelaunay().compute(W, H, seeds)
+voronoi = Voronoi().compute(W, H, seeds)
 # voronoi[y, x, 0]  →  seed_id
 # voronoi[y, x, 1]  →  squared L2 distance
 
@@ -381,9 +381,9 @@ verts, tri_grid = GridTriangulation().compute(voronoi, seeds, as_arrays=True)
 # verts[tid]  →  array([id_a, id_b, id_c])
 
 # --- OR: incremental (GPU state persists across calls) ---
-from delauney._delauney_cuda import IncrementalDelaunay
+from delauney._delauney_cuda import Delaunay
 
-tri = IncrementalDelaunay(W, H, max_seeds=1000)
+tri = Delaunay(W, H, max_seeds=1000)
 tri_map, tri_grid = tri.insert([(10, 20), (50, 80)])
 tri_map, tri_grid = tri.insert([(120, 40)])  # adds to existing state
 print(tri.seed_count)  # → 3

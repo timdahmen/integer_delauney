@@ -1,4 +1,4 @@
-// CUDA implementation of IncrementalDelaunay.
+// CUDA implementation of Delaunay.
 //
 // The work splits into topology (cheap, scoped to the changed region) and pixel
 // assignment (expensive, and the only stage whose dirty region saturates once a
@@ -28,7 +28,7 @@
 //   6. Assign, masked or full according to how much of the image is dirty.
 //   7. Materialise tri_map and the (H,W,3) grid.
 
-#include "incremental.cuh"
+#include "delaunay.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -492,7 +492,7 @@ void build_reassign_mask_kernel(const int32_t* __restrict__ grid,
 // Constructor / Destructor
 // ---------------------------------------------------------------------------
 
-IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds,
+Delaunay::Delaunay(int width, int height, int max_seeds,
                                          int border_padding)
     : W_(width), H_(height), N_(0), max_seeds_(max_seeds), pending_(false),
       csr_dirty_(true), sorted_rank_dirty_(true)
@@ -534,7 +534,7 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds,
     cudaMemset(d_dirty_accum_, 0, (size_t)N  * sizeof(int32_t));
 }
 
-IncrementalDelaunay::~IncrementalDelaunay()
+Delaunay::~Delaunay()
 {
     cudaFree(d_grid_);    cudaFree(d_tmp_);      cudaFree(d_changed_);
     cudaFree(d_sx_);      cudaFree(d_sy_);        cudaFree(d_raw_buf_);
@@ -548,7 +548,7 @@ IncrementalDelaunay::~IncrementalDelaunay()
 // run_bfs_: write new seeds already in d_grid_, BFS until stable
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::run_bfs_(float* bfs_ms_out)
+void Delaunay::run_bfs_(float* bfs_ms_out)
 {
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
@@ -585,7 +585,7 @@ void IncrementalDelaunay::run_bfs_(float* bfs_ms_out)
 // upload_triangles_: sync h_triangles_ → d_raw_buf_
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::upload_triangles_()
+void Delaunay::upload_triangles_()
 {
     int N_tri = (int)h_triangles_.size();
     std::vector<RawTriangle> h_raw(N_tri);
@@ -600,7 +600,7 @@ void IncrementalDelaunay::upload_triangles_()
 // rebuild_csr_and_upload_
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::rebuild_csr_and_upload_()
+void Delaunay::rebuild_csr_and_upload_()
 {
     int N_tri = (int)h_triangles_.size();
     std::vector<int32_t> h_csr_ptr(N_ + 1, 0);
@@ -630,7 +630,7 @@ void IncrementalDelaunay::rebuild_csr_and_upload_()
 // full_topology_: detect → dedup → registry → CSR, over the whole grid
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::full_topology_(float* det_ms, float* dedup_ms)
+void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
 {
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
@@ -698,7 +698,7 @@ void IncrementalDelaunay::full_topology_(float* det_ms, float* dedup_ms)
 // partial_triangulate_: use d_changed_ to scope detection and assignment
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::partial_topology_(float* det_ms, float* dedup_ms)
+void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
 {
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
@@ -828,7 +828,7 @@ void IncrementalDelaunay::partial_topology_(float* det_ms, float* dedup_ms)
 // assign_pending_: one pixel-assignment pass covering everything deferred
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::build_reassign_mask_()
+void Delaunay::build_reassign_mask_()
 {
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
@@ -844,13 +844,13 @@ void IncrementalDelaunay::build_reassign_mask_()
     cudaDeviceSynchronize();
 }
 
-int IncrementalDelaunay::count_mask_()
+int Delaunay::count_mask_()
 {
     thrust::device_ptr<int32_t> p(d_mask_);
     return (int)thrust::reduce(p, p + (size_t)W_det_ * H_det_, (int32_t)0);
 }
 
-void IncrementalDelaunay::assign_pending_(float* asgn_ms)
+void Delaunay::assign_pending_(float* asgn_ms)
 {
     const int N = W_det_ * H_det_;
     dim3 block(16, 16);
@@ -897,14 +897,14 @@ void IncrementalDelaunay::assign_pending_(float* asgn_ms)
 // builders, so a deferred round paid for neither.
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::ensure_csr_()
+void Delaunay::ensure_csr_()
 {
     if (!csr_dirty_) return;
     rebuild_csr_and_upload_();
     csr_dirty_ = false;
 }
 
-void IncrementalDelaunay::ensure_sorted_rank_() const
+void Delaunay::ensure_sorted_rank_() const
 {
     if (!sorted_rank_dirty_) return;
     rebuild_sorted_rank_();
@@ -915,7 +915,7 @@ void IncrementalDelaunay::ensure_sorted_rank_() const
 // rebuild_sorted_rank_: internal (insertion) id → batch (sorted x,y) id
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::rebuild_sorted_rank_() const
+void Delaunay::rebuild_sorted_rank_() const
 {
     std::vector<int32_t> order(N_);
     for (int i = 0; i < N_; ++i) order[i] = i;
@@ -933,7 +933,7 @@ void IncrementalDelaunay::rebuild_sorted_rank_() const
 // build_outputs_
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
+void Delaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
                                          std::vector<int32_t>& tgrid_out) const
 {
     ensure_sorted_rank_();
@@ -980,7 +980,7 @@ void IncrementalDelaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out
 // get_voronoi_grid
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::get_voronoi_grid(std::vector<int32_t>& out) const
+void Delaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 {
     ensure_sorted_rank_();
     const int N     = W_ * H_;
@@ -1008,7 +1008,7 @@ void IncrementalDelaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 // insert
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::apply_batch_(
+void Delaunay::apply_batch_(
     const std::vector<int32_t>& new_xs,
     const std::vector<int32_t>& new_ys,
     float* bfs_ms_out)
@@ -1098,10 +1098,10 @@ void IncrementalDelaunay::apply_batch_(
 // insert_deferred / finalise / insert
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::insert_deferred(
+void Delaunay::insert_deferred(
     const std::vector<int32_t>& new_xs,
     const std::vector<int32_t>& new_ys,
-    IncrementalTimings*          timings)
+    InsertTimings*          timings)
 {
     int k = (int)new_xs.size();
     if (k == 0) return;
@@ -1126,10 +1126,10 @@ void IncrementalDelaunay::insert_deferred(
     pending_ = true;
 }
 
-void IncrementalDelaunay::finalise(
+void Delaunay::finalise(
     std::vector<TriangleEntry>& tri_map_out,
     std::vector<int32_t>&       tgrid_out,
-    IncrementalTimings*         timings)
+    InsertTimings*         timings)
 {
     if (pending_) {
         float asgn_ms = 0.f;
@@ -1141,14 +1141,14 @@ void IncrementalDelaunay::finalise(
     build_outputs_(tri_map_out, tgrid_out);
 }
 
-void IncrementalDelaunay::insert(
+void Delaunay::insert(
     const std::vector<int32_t>& new_xs,
     const std::vector<int32_t>& new_ys,
     std::vector<TriangleEntry>&  tri_map_out,
     std::vector<int32_t>&        tgrid_out,
-    IncrementalTimings*          timings)
+    InsertTimings*          timings)
 {
-    if (timings) *timings = IncrementalTimings{};
+    if (timings) *timings = InsertTimings{};
     insert_deferred(new_xs, new_ys, timings);
     finalise(tri_map_out, tgrid_out, timings);
 }
@@ -1157,7 +1157,7 @@ void IncrementalDelaunay::insert(
 // get_triangles: topology without touching the raster
 // ---------------------------------------------------------------------------
 
-void IncrementalDelaunay::get_triangles(std::vector<TriangleEntry>& out) const
+void Delaunay::get_triangles(std::vector<TriangleEntry>& out) const
 {
     int N_tri = (int)h_triangles_.size();
     out.resize(N_tri);

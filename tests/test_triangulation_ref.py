@@ -1,10 +1,10 @@
 """Tests for the NumPy reference GridTriangulation implementation."""
 import numpy as np
 import pytest
-from delauney.reference.voronoi import RegularDelaunay
+from delauney.reference.voronoi import Voronoi
 from delauney.reference.triangulation import GridTriangulation, _point_in_triangle
 
-_vd = RegularDelaunay()
+_vd = Voronoi()
 _tri = GridTriangulation()
 
 

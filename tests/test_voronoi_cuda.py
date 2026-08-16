@@ -1,4 +1,4 @@
-"""CUDA tests for RegularDelaunay — skipped automatically when no GPU is available."""
+"""CUDA tests for Voronoi — skipped automatically when no GPU is available."""
 import numpy as np
 import pytest
 
@@ -22,14 +22,14 @@ skip_no_cuda = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def cuda_vd():
-    from delauney._delauney_cuda import RegularDelaunay
-    return RegularDelaunay()
+    from delauney._delauney_cuda import Voronoi
+    return Voronoi()
 
 
 @pytest.fixture(scope="module")
 def ref_vd():
-    from delauney.reference.voronoi import RegularDelaunay
-    return RegularDelaunay()
+    from delauney.reference.voronoi import Voronoi
+    return Voronoi()
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +73,7 @@ class TestCudaMatchesReference:
         """Both paths must agree, except at cells equidistant from two seeds.
 
         The two update schedules can settle on different but equally correct
-        fixed points at ties (see RegularDelaunay in reference/voronoi.py), so
+        fixed points at ties (see Voronoi in reference/voronoi.py), so
         the assertions are exact everywhere else: distances bit-for-bit, ids
         wherever the nearest seed is unique, and at a tie the chosen seed must
         still be a nearest one.

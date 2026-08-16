@@ -9,7 +9,7 @@ Pixels no triangle contains are exempt from the assertion.
 """
 import numpy as np
 import pytest
-from delauney.reference.voronoi import RegularDelaunay
+from delauney.reference.voronoi import Voronoi
 from delauney.reference.triangulation import GridTriangulation, _point_in_triangle
 
 
@@ -68,7 +68,7 @@ CASES = [
 
 @pytest.mark.parametrize("name,W,H,seeds", CASES, ids=[c[0] for c in CASES])
 def test_every_pixel_in_correct_triangle(name, W, H, seeds):
-    vgrid = RegularDelaunay().compute(W, H, seeds)
+    vgrid = Voronoi().compute(W, H, seeds)
     tri_map, tgrid = GridTriangulation().compute(vgrid, seeds)
 
     if not tri_map:

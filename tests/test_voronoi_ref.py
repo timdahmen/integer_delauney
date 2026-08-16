@@ -1,9 +1,9 @@
-"""Tests for the NumPy reference RegularDelaunay implementation."""
+"""Tests for the NumPy reference Voronoi implementation."""
 import numpy as np
 import pytest
-from delauney.reference.voronoi import RegularDelaunay
+from delauney.reference.voronoi import Voronoi
 
-vd = RegularDelaunay()
+vd = Voronoi()
 
 
 # ---------------------------------------------------------------------------

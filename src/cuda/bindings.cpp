@@ -1,7 +1,7 @@
 // pybind11 bindings for the CUDA Voronoi + triangulation kernels.
 //
-// Exposed module: _delauney_cuda -- RegularDelaunay, GridTriangulation and
-// IncrementalDelaunay.  Per-method signatures live in the docstrings below;
+// Exposed module: _delauney_cuda -- Voronoi, GridTriangulation and
+// Delaunay.  Per-method signatures live in the docstrings below;
 // API_REFERENCE.md documents the Python-facing contract.
 //
 // `seeds` / `seed_positions` must be a sequence of (x, y) pairs.
@@ -14,7 +14,7 @@
 
 #include "voronoi.cuh"
 #include "triangulation.cuh"
-#include "incremental.cuh"
+#include "delaunay.cuh"
 
 #include <algorithm>
 #include <cmath>
@@ -55,10 +55,10 @@ static std::vector<Seed> sort_seeds(const py::object& seeds_obj, int W, int H)
 }
 
 // ---------------------------------------------------------------------------
-// RegularDelaunay wrapper
+// Voronoi wrapper
 // ---------------------------------------------------------------------------
 
-class PyRegularDelaunay {
+class PyVoronoi {
 public:
     py::array_t<int32_t> compute(int width, int height, const py::object& seeds_obj)
     {
@@ -247,12 +247,12 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// IncrementalDelaunay wrapper
+// Delaunay wrapper
 // ---------------------------------------------------------------------------
 
-class PyIncrementalDelaunay {
+class PyDelaunay {
 public:
-    PyIncrementalDelaunay(int width, int height, int max_seeds,
+    PyDelaunay(int width, int height, int max_seeds,
                           int border_padding)
         : impl_(width, height, max_seeds, border_padding) {}
 
@@ -273,7 +273,7 @@ public:
         _parse_seeds(seeds_obj, xs, ys);
         std::vector<TriangleEntry> tri_map;
         std::vector<int32_t> tgrid;
-        IncrementalTimings t;
+        InsertTimings t;
         impl_.insert(xs, ys, tri_map, tgrid, &t);
         auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
                                  as_arrays);
@@ -291,7 +291,7 @@ public:
     {
         std::vector<int32_t> xs, ys;
         _parse_seeds(seeds_obj, xs, ys);
-        IncrementalTimings t;
+        InsertTimings t;
         impl_.insert_deferred(xs, ys, &t);
         return _timings_dict(t);
     }
@@ -309,7 +309,7 @@ public:
     {
         std::vector<TriangleEntry> tri_map;
         std::vector<int32_t> tgrid;
-        IncrementalTimings t;
+        InsertTimings t;
         impl_.finalise(tri_map, tgrid, &t);
         auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
                                  as_arrays);
@@ -358,9 +358,9 @@ public:
     bool has_pending()    const { return impl_.has_pending(); }
 
 private:
-    IncrementalDelaunay impl_;
+    Delaunay impl_;
 
-    static py::dict _timings_dict(const IncrementalTimings& t)
+    static py::dict _timings_dict(const InsertTimings& t)
     {
         py::dict d;
         d["bfs_ms"]    = t.bfs_ms;
@@ -434,9 +434,9 @@ PYBIND11_MODULE(_delauney_cuda, m)
 {
     m.doc() = "CUDA-accelerated Voronoi + Delaunay triangulation";
 
-    py::class_<PyRegularDelaunay>(m, "RegularDelaunay")
+    py::class_<PyVoronoi>(m, "Voronoi")
         .def(py::init<>())
-        .def("compute", &PyRegularDelaunay::compute,
+        .def("compute", &PyVoronoi::compute,
              py::arg("width"), py::arg("height"), py::arg("seeds"),
              "Compute an L2-distance (Euclidean) Voronoi diagram.\n\n"
              "Returns int32 array of shape (height, width, 2): "
@@ -475,7 +475,7 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "Returns (triangle_map, triangulation_grid, padded_voronoi_grid) where "
              "padded_voronoi_grid has shape (H+2*P, W+2*P, 2).");
 
-    py::class_<PyIncrementalDelaunay>(m, "IncrementalDelaunay")
+    py::class_<PyDelaunay>(m, "Delaunay")
         .def(py::init<int, int, int, int>(),
              py::arg("width"), py::arg("height"), py::arg("max_seeds"),
              py::arg("border_padding") = -1,
@@ -492,18 +492,18 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "  under-padded relative to what the batch path would pick for it.\n"
              "  Pass a value explicitly when the eventual seed count is not close\n"
              "  to max_seeds. Padding costs ((W+2P)(H+2P))/(WH) in grid work.")
-        .def("insert", &PyIncrementalDelaunay::insert,
+        .def("insert", &PyDelaunay::insert,
              py::arg("seeds"), py::arg("as_arrays") = false,
              "Insert a batch of (x, y) seeds and update the triangulation.\n\n"
              "Returns (triangle_map, triangulation_grid) where triangle_map is\n"
              "{int: (x,y,id_a,id_b,id_c)}, or an (N_tri, 3) vertex-id array when\n"
              "as_arrays=True, and triangulation_grid has shape (H,W,3).\n\n"
              "Equivalent to insert_deferred() followed by finalise().")
-        .def("insert_timed", &PyIncrementalDelaunay::insert_timed,
+        .def("insert_timed", &PyDelaunay::insert_timed,
              py::arg("seeds"), py::arg("as_arrays") = false,
              "Same as insert() but also returns a timings dict with keys\n"
              "bfs_ms, detect_ms, dedup_ms, assign_ms.")
-        .def("insert_deferred", &PyIncrementalDelaunay::insert_deferred,
+        .def("insert_deferred", &PyDelaunay::insert_deferred,
              py::arg("seeds"),
              "Insert a batch, updating the Voronoi diagram and triangle topology\n"
              "but not the per-pixel assignment, and returning nothing.\n\n"
@@ -512,38 +512,38 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "that inserts several times before it needs a raster should defer\n"
              "it and call finalise() once.  get_triangles() stays valid in\n"
              "between; the triangulation grid does not.")
-        .def("insert_deferred_timed", &PyIncrementalDelaunay::insert_deferred_timed,
+        .def("insert_deferred_timed", &PyDelaunay::insert_deferred_timed,
              py::arg("seeds"),
              "Same as insert_deferred() but returns the timings dict.\n"
              "assign_ms is always 0 here; it is reported by finalise().")
-        .def("finalise", &PyIncrementalDelaunay::finalise,
+        .def("finalise", &PyDelaunay::finalise,
              py::arg("as_arrays") = false,
              "Assign pixels for everything deferred since the last finalise and\n"
              "return (triangle_map, triangulation_grid).\n\n"
              "Picks a masked or a full assignment by whichever covers less work,\n"
              "so a small accumulated change stays cheap.  Calling this with\n"
              "nothing pending just rebuilds the outputs.")
-        .def("finalise_timed", &PyIncrementalDelaunay::finalise_timed,
+        .def("finalise_timed", &PyDelaunay::finalise_timed,
              py::arg("as_arrays") = false,
              "Same as finalise() but also returns the timings dict.")
-        .def("get_triangles", &PyIncrementalDelaunay::get_triangles,
+        .def("get_triangles", &PyDelaunay::get_triangles,
              "Triangle topology alone as an (N_tri, 3) int32 array, with no\n"
              "raster copied back.\n\n"
              "Seed ids are INSERTION-order, not the sorted numbering insert()\n"
              "and finalise() report, so that a caller appending seeds across\n"
              "several inserts keeps its own per-seed arrays aligned.  Use\n"
              "sorted_rank to translate.")
-        .def_property_readonly("sorted_rank", &PyIncrementalDelaunay::sorted_rank,
+        .def_property_readonly("sorted_rank", &PyDelaunay::sorted_rank,
              "int32 array mapping insertion-order seed id -> sorted (x asc,\n"
              "y asc) id, which is the numbering insert()/finalise() report.")
-        .def("get_voronoi_grid", &PyIncrementalDelaunay::get_voronoi_grid,
+        .def("get_voronoi_grid", &PyDelaunay::get_voronoi_grid,
              "Return the current Voronoi grid as int32 array of shape (H, W, 2).")
-        .def_property_readonly("seed_count", &PyIncrementalDelaunay::seed_count)
-        .def_property_readonly("width",  &PyIncrementalDelaunay::width)
-        .def_property_readonly("height", &PyIncrementalDelaunay::height)
+        .def_property_readonly("seed_count", &PyDelaunay::seed_count)
+        .def_property_readonly("width",  &PyDelaunay::width)
+        .def_property_readonly("height", &PyDelaunay::height)
         .def_property_readonly("border_padding",
-             &PyIncrementalDelaunay::border_padding,
+             &PyDelaunay::border_padding,
              "Resolved width of the padded detection canvas.")
-        .def_property_readonly("has_pending", &PyIncrementalDelaunay::has_pending,
+        .def_property_readonly("has_pending", &PyDelaunay::has_pending,
              "True when deferred inserts are awaiting a finalise().");
 }

@@ -5,14 +5,14 @@
 #include <vector>
 #include "triangulation.cuh"   // TriangleEntry
 
-struct IncrementalTimings {
+struct InsertTimings {
     float bfs_ms    = 0.f;
     float detect_ms = 0.f;
     float dedup_ms  = 0.f;
     float assign_ms = 0.f;
 };
 
-class IncrementalDelaunay {
+class Delaunay {
 public:
     // border_padding < 0 uses DEFAULT_BORDER_PADDING.
     //
@@ -24,9 +24,9 @@ public:
     //
     // The padding a seed set needs is bounded only when the caller controls how
     // densely the convex hull boundary is sampled. See BORDER_PADDING_BOUND.md.
-    IncrementalDelaunay(int width, int height, int max_seeds,
+    Delaunay(int width, int height, int max_seeds,
                         int border_padding = -1);
-    ~IncrementalDelaunay();
+    ~Delaunay();
 
     // Appends a batch of seeds (insertion-order IDs).
     // Returns current full triangle_map and triangulation grid (H,W,3).
@@ -36,7 +36,7 @@ public:
         const std::vector<int32_t>& new_ys,
         std::vector<TriangleEntry>&  tri_map_out,
         std::vector<int32_t>&        tgrid_out,
-        IncrementalTimings*          timings = nullptr);
+        InsertTimings*          timings = nullptr);
 
     // Appends a batch, updating the Voronoi diagram and the triangle topology
     // but NOT the per-pixel triangle assignment, and materialising no output.
@@ -51,7 +51,7 @@ public:
     void insert_deferred(
         const std::vector<int32_t>& new_xs,
         const std::vector<int32_t>& new_ys,
-        IncrementalTimings*          timings = nullptr);
+        InsertTimings*          timings = nullptr);
 
     // Assigns pixels for everything deferred since the last finalise, then
     // materialises the outputs.  Chooses a masked or a full assignment by
@@ -61,7 +61,7 @@ public:
     void finalise(
         std::vector<TriangleEntry>& tri_map_out,
         std::vector<int32_t>&       tgrid_out,
-        IncrementalTimings*         timings = nullptr);
+        InsertTimings*         timings = nullptr);
 
     // Triangle topology alone, with no raster copied back.  Seed ids are
     // INSERTION-order, not the sorted numbering insert()/finalise() report:

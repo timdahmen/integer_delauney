@@ -1,6 +1,6 @@
 """NumPy reference implementation of GridTriangulation."""
 import numpy as np
-from delauney.reference.voronoi import RegularDelaunay as _RefVoronoi
+from delauney.reference.voronoi import Voronoi as _RefVoronoi
 
 
 class GridTriangulation:
@@ -35,11 +35,11 @@ class GridTriangulation:
         Parameters
         ----------
         voronoi_grid:
-            int32 array of shape (H, W, 2) produced by RegularDelaunay.
+            int32 array of shape (H, W, 2) produced by Voronoi.
         seed_positions:
             Seed coordinates in the same order as used to produce voronoi_grid
             (i.e. index == seed_id after the x-then-y sort applied internally
-            by RegularDelaunay).  Pass the *original* seed list; this method
+            by Voronoi).  Pass the *original* seed list; this method
             re-applies the same sort so that index == seed_id.
         border_padding:
             Pixels of Voronoi canvas to add on each side before triangle

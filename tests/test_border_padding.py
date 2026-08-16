@@ -19,9 +19,9 @@ import pytest
 
 from delauney import DEFAULT_BORDER_PADDING, max_boundary_spacing
 from delauney.reference.triangulation import GridTriangulation
-from delauney.reference.voronoi import RegularDelaunay
+from delauney.reference.voronoi import Voronoi
 
-_vd = RegularDelaunay()
+_vd = Voronoi()
 _tri = GridTriangulation()
 
 
@@ -129,7 +129,7 @@ class TestCudaDefaultMatchesReference:
         from delauney import _delauney_cuda as dc
 
         seeds = _seeds(self.W, self.H, 40, seed=17)
-        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        vg = np.asarray(dc.Voronoi().compute(self.W, self.H, seeds))
 
         default_map, default_grid = dc.GridTriangulation().compute(vg, seeds)
         explicit_map, explicit_grid = dc.GridTriangulation().compute(
@@ -144,7 +144,7 @@ class TestCudaDefaultMatchesReference:
         from delauney import _delauney_cuda as dc
 
         seeds = _seeds(self.W, self.H, 40, seed=18)
-        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        vg = np.asarray(dc.Voronoi().compute(self.W, self.H, seeds))
         cuda_map, _ = dc.GridTriangulation().compute(vg, seeds)
         cuda_explicit, _ = dc.GridTriangulation().compute(
             vg, seeds, DEFAULT_BORDER_PADDING)
@@ -154,7 +154,7 @@ class TestCudaDefaultMatchesReference:
         from delauney import _delauney_cuda as dc
 
         seeds = _seeds(self.W, self.H, 40, seed=19)
-        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        vg = np.asarray(dc.Voronoi().compute(self.W, self.H, seeds))
         default_map, _ = dc.GridTriangulation().compute(vg, seeds)
         zero_map, _ = dc.GridTriangulation().compute(vg, seeds, 0)
         assert len(default_map) >= len(zero_map)
@@ -164,7 +164,7 @@ class TestCudaDefaultMatchesReference:
         from delauney import _delauney_cuda as dc
 
         seeds = _seeds(self.W, self.H, 25, seed=23)
-        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        vg = np.asarray(dc.Voronoi().compute(self.W, self.H, seeds))
         zero_map, _ = dc.GridTriangulation().compute(vg, seeds, 0)
         padded_map, _ = dc.GridTriangulation().compute(
             vg, seeds, DEFAULT_BORDER_PADDING)
@@ -173,7 +173,7 @@ class TestCudaDefaultMatchesReference:
     def test_incremental_default_matches_the_constant(self):
         from delauney import _delauney_cuda as dc
 
-        inc = dc.IncrementalDelaunay(self.W, self.H, 512)
+        inc = dc.Delaunay(self.W, self.H, 512)
         assert inc.border_padding == DEFAULT_BORDER_PADDING
-        assert dc.IncrementalDelaunay(self.W, self.H, 512, 5).border_padding == 5
-        assert dc.IncrementalDelaunay(self.W, self.H, 512, 0).border_padding == 0
+        assert dc.Delaunay(self.W, self.H, 512, 5).border_padding == 5
+        assert dc.Delaunay(self.W, self.H, 512, 0).border_padding == 0
