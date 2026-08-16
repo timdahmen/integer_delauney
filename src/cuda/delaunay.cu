@@ -678,6 +678,10 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     cudaMalloc(&d_dead_,         (size_t)max_seeds * 4  * sizeof(uint8_t));
     cudaMalloc(&d_values_,       (size_t)max_seeds      * sizeof(float));
     cudaMalloc(&d_score_keys_,   (size_t)max_seeds * 12 * sizeof(uint64_t));
+    cudaMalloc(&d_tri_count_,    1                      * sizeof(int32_t));
+    cudaMalloc(&d_seed_stage_,   (size_t)max_seeds * 3  * sizeof(int32_t));
+    cudaMalloc(&d_remap_,        (size_t)max_seeds * 4  * sizeof(int32_t));
+    cudaMalloc(&d_edge_out_,     (size_t)max_seeds * 24 * sizeof(int32_t));
     cudaMalloc(&d_scores_,       (size_t)max_seeds * 12 * sizeof(float));
     cudaMalloc(&d_mid_keys_,     (size_t)max_seeds      * sizeof(int64_t));
     cudaMalloc(&d_mid_count_,    1                      * sizeof(int32_t));
@@ -704,6 +708,8 @@ Delaunay::~Delaunay()
     cudaFree(d_updated_flag_); cudaFree(d_mask_);
     cudaFree(d_dirty_accum_);  cudaFree(d_tile_dirty_); cudaFree(d_count_);
     cudaFree(d_stale_);
+    cudaFree(d_tri_count_);  cudaFree(d_seed_stage_);
+    cudaFree(d_remap_);      cudaFree(d_edge_out_);
 }
 
 // ---------------------------------------------------------------------------
@@ -816,14 +822,11 @@ void Delaunay::compact_registry_()
     edges_dirty_ = true;
 
     const int N = W_det_ * H_det_;
-    int32_t* d_remap = nullptr;
-    cudaMalloc(&d_remap, (size_t)old_count * sizeof(int32_t));
-    cudaMemcpy(d_remap, remap.data(), (size_t)old_count * sizeof(int32_t),
+    cudaMemcpy(d_remap_, remap.data(), (size_t)old_count * sizeof(int32_t),
                cudaMemcpyHostToDevice);
-    remap_tgrid_kernel<<<(N+255)/256, 256>>>(d_t_grid_, N, d_remap, old_count,
+    remap_tgrid_kernel<<<(N+255)/256, 256>>>(d_t_grid_, N, d_remap_, old_count,
                                              NO_TRIANGLE);
     cudaDeviceSynchronize();
-    cudaFree(d_remap);
 }
 
 // ---------------------------------------------------------------------------
@@ -881,7 +884,7 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     if (det_ms) { mk(&e0);mk(&e1);mk(&e2);mk(&e3); }
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_detect_buf_);
-    int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
+    int32_t* d_counter = d_tri_count_;
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
     if (det_ms) rc(e0);
@@ -890,7 +893,6 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     cudaDeviceSynchronize();
     int32_t raw_count = 0;
     cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_counter);
     if (det_ms) rc(e1);
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
@@ -981,7 +983,7 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     auto is_stale = [&h_stale](int tid) { return h_stale[tid] != 0; };
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_detect_buf_);
-    int32_t* d_counter; cudaMalloc(&d_counter, sizeof(int32_t));
+    int32_t* d_counter = d_tri_count_;
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
     if (det_ms) rc(e0);
@@ -990,7 +992,6 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     cudaDeviceSynchronize();
     int32_t raw_count = 0;
     cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_counter);
     if (det_ms) rc(e1);
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
@@ -1308,16 +1309,14 @@ void Delaunay::apply_batch_(
     cudaMemset(d_changed_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t));
 
     // Write seeds into grid (also marks seed cells in d_changed_)
-    int32_t *d_kxs, *d_kys, *d_kids;
-    cudaMalloc(&d_kxs,  k * sizeof(int32_t));
-    cudaMalloc(&d_kys,  k * sizeof(int32_t));
-    cudaMalloc(&d_kids, k * sizeof(int32_t));
+    int32_t* d_kxs  = d_seed_stage_;
+    int32_t* d_kys  = d_seed_stage_ + max_seeds_;
+    int32_t* d_kids = d_seed_stage_ + 2 * max_seeds_;
     cudaMemcpy(d_kxs,  padded_xs.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
     cudaMemcpy(d_kys,  padded_ys.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kids, new_ids.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kids, new_ids.data(),    k * sizeof(int32_t), cudaMemcpyHostToDevice);
     write_seeds_kernel<<<(k+255)/256, 256>>>(d_grid_, d_changed_, W_det_, d_kxs, d_kys, d_kids, k);
     cudaDeviceSynchronize();
-    cudaFree(d_kxs); cudaFree(d_kys); cudaFree(d_kids);
 
     // BFS
     run_bfs_(bfs_ms_out, iters_out);
@@ -1566,14 +1565,12 @@ void Delaunay::get_edges(std::vector<int32_t>& out) const
 
     // Unpacked on the device so the transfer is the (E, 2) result rather than
     // the 3T keys that produced it.
-    int32_t* d_out = nullptr;
-    cudaMalloc(&d_out, (size_t)n_edges_ * 2 * sizeof(int32_t));
     unpack_edge_keys_kernel<<<(n_edges_ + 255) / 256, 256>>>(
-        static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_, d_out);
+        static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
+        d_edge_out_);
     cudaDeviceSynchronize();
 
     out.resize((size_t)n_edges_ * 2);
-    cudaMemcpy(out.data(), d_out, (size_t)n_edges_ * 2 * sizeof(int32_t),
+    cudaMemcpy(out.data(), d_edge_out_, (size_t)n_edges_ * 2 * sizeof(int32_t),
                cudaMemcpyDeviceToHost);
-    cudaFree(d_out);
 }

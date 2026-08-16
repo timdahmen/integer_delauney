@@ -184,6 +184,14 @@ private:
     int32_t* d_dirty_accum_; // (H*W)   union of d_changed_ since last finalise
     int32_t* d_tile_dirty_;  // (tiles) tile-level dirty flags, mask prefilter
     int32_t* d_count_;       // (1)     dirty-pixel counter for the cost switch
+    // Scratch that used to be cudaMalloc'd and freed inside the calls that use
+    // it. All are bounded by max_seeds or the triangle bound, so they are
+    // allocated once; a cudaFree synchronises the device, which is a steep
+    // price for a buffer whose size was known at construction.
+    int32_t* d_tri_count_;   // (1)     detection output counter
+    int32_t* d_seed_stage_;  // (3 * max_seeds) staged x, y, id for an insert
+    int32_t* d_remap_;       // (max triangles) old id -> new, for compaction
+    int32_t* d_edge_out_;    // (2 * 3 * max triangles) unpacked edge pairs
     uint8_t* d_stale_;       // (max triangles) per-triangle invalidation flags
     uint8_t* d_dead_;        // (max triangles) retired-slot flags, mirrors h_dead_
     float*   d_values_;      // (max_seeds) scalar field, one per seed
