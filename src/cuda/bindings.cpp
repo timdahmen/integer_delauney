@@ -310,6 +310,26 @@ public:
         return arr;
     }
 
+    py::array_t<int32_t> locate(
+        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& pts)
+    {
+        auto info = pts.request();
+        if (info.ndim != 2 || info.shape[1] != 2)
+            throw std::invalid_argument("points must have shape (N, 2)");
+        const int n = (int)info.shape[0];
+        const auto* p = static_cast<const int32_t*>(info.ptr);
+        std::vector<int32_t> xs(n), ys(n);
+        for (int i = 0; i < n; ++i) { xs[i] = p[i * 2]; ys[i] = p[i * 2 + 1]; }
+
+        std::vector<int32_t> out;
+        impl_.locate(xs, ys, out);
+        py::array_t<int32_t> arr((py::ssize_t)out.size());
+        if (!out.empty())
+            std::memcpy(arr.mutable_data(), out.data(),
+                        out.size() * sizeof(int32_t));
+        return arr;
+    }
+
     py::array_t<float> get_values() const
     {
         std::vector<float> v;
@@ -657,6 +677,16 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "cell at distance zero, so no record of taken positions is "
              "needed -- and midpoints colliding with one another collapse to "
              "the one from the better-scoring edge.")
+        .def("locate", &PyDelaunay::locate, py::arg("points"),
+             "Triangle containing each point of an (N, 2) int32 array, in "
+             "image coordinates, as an (N,) int32 array. -1 where no triangle "
+             "contains it.\n\n"
+             "Ids index get_triangles(), which finalise()'s triangle map "
+             "agrees with.\n\n"
+             "For containment at a list of positions rather than a raster. "
+             "finalise() answers the same question for every pixel; asking it "
+             "about a few thousand points and reading the rest back out is "
+             "about twenty times the work at a real canvas size.")
         .def("get_seeds", &PyDelaunay::get_seeds,
              "Seed positions as an (N, 2) int32 array, in insertion order.")
         .def("get_values", &PyDelaunay::get_values,

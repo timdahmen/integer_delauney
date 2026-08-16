@@ -133,6 +133,19 @@ public:
     void get_seeds(std::vector<int32_t>& out) const;
     void get_values(std::vector<float>& out) const;
 
+    //: The triangle containing each query point, or NO_TRIANGLE, in image
+    //: coordinates. Ids index get_triangles(), which finalise()'s triangle map
+    //: agrees with -- the registry is compacted first, so both are dense and in
+    //: the same order.
+    //:
+    //: For a caller that wants containment for a list of positions rather than
+    //: a raster. finalise() answers the same question for all 1.5M pixels of a
+    //: real canvas; asking it about 70k points and reading the rest back out is
+    //: about twenty times the work the question needs.
+    void locate(const std::vector<int32_t>& qx,
+                const std::vector<int32_t>& qy,
+                std::vector<int32_t>& out);
+
     // internal insertion-order id -> batch pipeline's sorted (x asc, y asc) id
     const std::vector<int32_t>& sorted_rank() const
     { ensure_sorted_rank_(); return h_sorted_rank_; }

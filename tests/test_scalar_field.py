@@ -231,3 +231,66 @@ class TestSeedsAndValues:
         np.testing.assert_array_equal(seeds[:len(pts)], pts)
         np.testing.assert_array_equal(seeds[len(pts):], mid)
         np.testing.assert_allclose(values[len(pts):], new)
+
+
+class TestLocate:
+    """Containment for a list of points, without rasterising the canvas.
+
+    The oracle is the finalised grid, which answers the same question for every
+    pixel -- so locate() reading differently at any point would be a bug, not a
+    tolerance.
+    """
+
+    def _mesh_and_queries(self, n, nq, seed):
+        mesh, pts, vals = make_mesh(n, seed)
+        rng = np.random.default_rng(seed + 1)
+        q = np.stack([rng.integers(0, W, nq), rng.integers(0, H, nq)],
+                     axis=1).astype(np.int32)
+        return mesh, pts, q
+
+    @pytest.mark.parametrize("n,nq", [(50, 200), (400, 2000), (400, 9000)])
+    def test_matches_the_finalised_grid(self, n, nq):
+        mesh, pts, q = self._mesh_and_queries(n, nq, seed=n + nq)
+        got = mesh.locate(q)
+        _, grid = mesh.finalise(as_arrays=True)
+        want = np.asarray(grid)[q[:, 1], q[:, 0], 2]
+        np.testing.assert_array_equal(got, want)
+
+    def test_valid_before_any_finalise(self):
+        """The caller queries a mesh refinement left unfinalised, so the answer
+        must not depend on an assignment pass having run."""
+        mesh, pts, q = self._mesh_and_queries(400, 3000, seed=71)
+        before = mesh.locate(q)
+        _, grid = mesh.finalise(as_arrays=True)
+        np.testing.assert_array_equal(before, np.asarray(grid)[q[:, 1], q[:, 0], 2])
+
+    def test_ids_index_get_triangles(self):
+        """locate's ids and get_triangles must agree, or a caller looking up the
+        vertices of a located triangle gets a different triangle."""
+        mesh, pts, q = self._mesh_and_queries(400, 2000, seed=73)
+        tids = mesh.locate(q)
+        tris = mesh.get_triangles()
+        hit = tids >= 0
+        assert hit.any()
+        assert tids[hit].max() < len(tris)
+        # Each located point really is inside the triangle it names.
+        for i in np.flatnonzero(hit)[:200]:
+            a, b, c = (pts[j] for j in tris[tids[i]])
+            p = q[i].astype(np.float64)
+            def z(u, v):                      # 2-D cross, scalar
+                return float(u[0] * v[1] - u[1] * v[0])
+            d1, d2, d3 = z(b - a, p - a), z(c - b, p - b), z(a - c, p - c)
+            assert not ((min(d1, d2, d3) < 0) and (max(d1, d2, d3) > 0)), \
+                f"point {p} is not inside triangle {tids[i]}"
+
+    def test_points_outside_the_hull_report_no_triangle(self):
+        mesh, pts, _ = self._mesh_and_queries(60, 10, seed=77)
+        far = np.array([[0, 0], [W - 1, 0], [0, H - 1], [W - 1, H - 1]],
+                       dtype=np.int32)
+        _, grid = mesh.finalise(as_arrays=True)
+        np.testing.assert_array_equal(
+            mesh.locate(far), np.asarray(grid)[far[:, 1], far[:, 0], 2])
+
+    def test_empty_query(self):
+        mesh, _, _ = self._mesh_and_queries(100, 10, seed=79)
+        assert len(mesh.locate(np.zeros((0, 2), dtype=np.int32))) == 0

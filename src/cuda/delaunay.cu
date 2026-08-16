@@ -450,37 +450,36 @@ static constexpr int WINDOW_SLACK = 3;
 static constexpr int WINDOW_CAP   = 20;
 static constexpr int MAX_NEARBY   = 64;
 
-__global__
-void assign_triangles_kernel(
-    int32_t* __restrict__           t_grid,
-    int W, int H,
-    const int32_t* __restrict__     grid,       // interleaved (seed_id, dist)
-    const RawTriangle* __restrict__ triangles,
-    const int32_t* __restrict__     seed_xs,
-    const int32_t* __restrict__     seed_ys,
-    const int32_t* __restrict__     csr_ptr,
-    const int32_t* __restrict__     csr_idx,
-    int N_seeds, int N_triangles,
-    const int32_t* __restrict__     mask)       // nullptr → all pixels
+//: The triangle containing pixel (x, y), or NO_TRIANGLE.
+//:
+//: Shared by the per-pixel assignment and the point query below, which differ
+//: only in which positions they ask about. Testing every triangle would be
+//: hopeless, so the search narrows first: the distance channel gives the radius
+//: within which a containing triangle's vertices must lie, the seed ids in that
+//: window name the candidates, and the CSR turns each into its few triangles.
+__device__ __forceinline__
+int32_t locate_at(int x, int y, int W, int H,
+                  const int32_t* __restrict__ grid,
+                  const RawTriangle* __restrict__ triangles,
+                  const int32_t* __restrict__ seed_xs,
+                  const int32_t* __restrict__ seed_ys,
+                  const int32_t* __restrict__ csr_ptr,
+                  const int32_t* __restrict__ csr_idx,
+                  int N_seeds)
 {
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= W || y >= H) return;
-    if (mask && !mask[y * W + x]) return;
-
     // Integer pixel convention, matching triangulation.cu and the NumPy
     // reference: pixel (x, y) IS the point (x, y), not its centre.
-    float px = (float)x, py = (float)y;
+    const float px = (float)x, py = (float)y;
     // The distance channel holds SQUARED L2, so take a root to get back a
     // linear search radius in pixels.
-    int dist = grid[(y * W + x) * 2 + 1];
-    int R    = min((int)sqrtf((float)max(dist, 0)) + WINDOW_SLACK, WINDOW_CAP);
+    const int dist = grid[(y * W + x) * 2 + 1];
+    const int R = min((int)sqrtf((float)max(dist, 0)) + WINDOW_SLACK, WINDOW_CAP);
 
     int32_t nearby[MAX_NEARBY];
     int n_nearby = 0;
 
-    int x0 = max(0, x-R), x1 = min(W-1, x+R);
-    int y0 = max(0, y-R), y1 = min(H-1, y+R);
+    const int x0 = max(0, x-R), x1 = min(W-1, x+R);
+    const int y0 = max(0, y-R), y1 = min(H-1, y+R);
 
     for (int sy = y0; sy <= y1; ++sy)
     for (int sx = x0; sx <= x1; ++sx) {
@@ -506,7 +505,61 @@ void assign_triangles_kernel(
                 if (best == NO_TRIANGLE || tid > best) best = tid;
         }
     }
-    t_grid[y * W + x] = best;
+    return best;
+}
+
+__global__
+void assign_triangles_kernel(
+    int32_t* __restrict__           t_grid,
+    int W, int H,
+    const int32_t* __restrict__     grid,       // interleaved (seed_id, dist)
+    const RawTriangle* __restrict__ triangles,
+    const int32_t* __restrict__     seed_xs,
+    const int32_t* __restrict__     seed_ys,
+    const int32_t* __restrict__     csr_ptr,
+    const int32_t* __restrict__     csr_idx,
+    int N_seeds, int N_triangles,
+    const int32_t* __restrict__     mask)       // nullptr → all pixels
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    if (mask && !mask[y * W + x]) return;
+
+    t_grid[y * W + x] = locate_at(x, y, W, H, grid, triangles,
+                                  seed_xs, seed_ys, csr_ptr, csr_idx, N_seeds);
+}
+
+//: Which triangle contains each of a list of points.
+//:
+//: The same search, restricted to the points asked about instead of every
+//: pixel. A caller that wants the containing triangle for a few thousand
+//: positions would otherwise assign the whole canvas and read the answers back
+//: out of it, which is the same work per point over ~20x more points.
+//:
+//: Coordinates are in image space; the padding shift is applied here, since the
+//: grids live on the padded canvas and callers do not know about it.
+__global__
+void locate_points_kernel(const int32_t* __restrict__ qx,
+                          const int32_t* __restrict__ qy,
+                          int n, int P,
+                          int W, int H,
+                          const int32_t* __restrict__ grid,
+                          const RawTriangle* __restrict__ triangles,
+                          const int32_t* __restrict__ seed_xs,
+                          const int32_t* __restrict__ seed_ys,
+                          const int32_t* __restrict__ csr_ptr,
+                          const int32_t* __restrict__ csr_idx,
+                          int N_seeds,
+                          int32_t* __restrict__ out)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int x = qx[i] + P;
+    const int y = qy[i] + P;
+    if (x < 0 || x >= W || y < 0 || y >= H) { out[i] = NO_TRIANGLE; return; }
+    out[i] = locate_at(x, y, W, H, grid, triangles,
+                       seed_xs, seed_ys, csr_ptr, csr_idx, N_seeds);
 }
 
 // ---------------------------------------------------------------------------
@@ -1578,6 +1631,48 @@ void Delaunay::get_seeds(std::vector<int32_t>& out) const
 void Delaunay::get_values(std::vector<float>& out) const
 {
     out.assign(h_values_.begin(), h_values_.end());
+}
+
+void Delaunay::locate(const std::vector<int32_t>& qx,
+                      const std::vector<int32_t>& qy,
+                      std::vector<int32_t>& out)
+{
+    const int n = (int)qx.size();
+    out.assign(n, NO_TRIANGLE);
+    if (n == 0) return;
+    if (qy.size() != qx.size())
+        throw std::invalid_argument("locate: x and y must be the same length");
+
+    // Dense ids, so the answers index get_triangles() and finalise()'s map
+    // alike; and the CSR, which is how a candidate triangle is reached.
+    compact_registry_();
+    ensure_csr_();
+    if (h_triangles_.empty()) return;
+
+    // The queries reuse the seed staging buffer: an insert is the only other
+    // user and cannot be in flight here.
+    int32_t* d_qx = d_seed_stage_;
+    int32_t* d_qy = d_seed_stage_ + max_seeds_;
+    const int chunk = max_seeds_;
+
+    int32_t* d_out = nullptr;
+    cudaMalloc(&d_out, (size_t)std::min(n, chunk) * sizeof(int32_t));
+
+    for (int off = 0; off < n; off += chunk) {
+        const int k = std::min(chunk, n - off);
+        cudaMemcpy(d_qx, qx.data() + off, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyHostToDevice);
+        cudaMemcpy(d_qy, qy.data() + off, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyHostToDevice);
+        locate_points_kernel<<<(k + 255) / 256, 256>>>(
+            d_qx, d_qy, k, P_, W_det_, H_det_, d_grid_,
+            static_cast<const RawTriangle*>(d_raw_buf_),
+            d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, d_out);
+        cudaDeviceSynchronize();
+        cudaMemcpy(out.data() + off, d_out, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
+    }
+    cudaFree(d_out);
 }
 
 void Delaunay::get_edges(std::vector<int32_t>& out) const
