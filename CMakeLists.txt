@@ -28,5 +28,24 @@ if(WITH_CUDA)
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     )
 
+    # Symbols in the optimised build. /Zi emits a PDB and changes no code, so
+    # this is not RelWithDebInfo -- that would drop /Ob2 to /Ob1 and quietly
+    # reduce inlining, which is a different binary from the one we ship. A
+    # sampling profiler can attribute nothing inside this module without a PDB,
+    # so without it the only way to find host cost is to guess where to put a
+    # timer. /DEBUG turns off two link-time optimisations by default; /OPT:REF
+    # and /OPT:ICF put them back.
+    if(MSVC)
+        target_compile_options(_delauney_cuda PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/Zi>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zi>
+        )
+        target_link_options(_delauney_cuda PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+    endif()
+
     install(TARGETS _delauney_cuda DESTINATION delauney)
+    if(MSVC)
+        install(FILES $<TARGET_PDB_FILE:_delauney_cuda>
+                DESTINATION delauney OPTIONAL)
+    endif()
 endif()
