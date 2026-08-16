@@ -5,10 +5,10 @@ along which it changes most. Holding that field beside the coordinates and the
 edge list means scoring an edge moves nothing; the alternative is shipping the
 edge list out, scoring on the host, and shipping a list of chosen indices back.
 
-Selection stays with the caller, expressed as a threshold rather than a list:
-`select_midpoints` takes every edge beating (min_score, tie_index) under
-"higher score first, lower edge index on a tie". Passing the k-th largest such
-key takes exactly k edges, so what crosses the boundary is two numbers.
+Selection happens there too, driven by a count: the edges are ordered by score
+descending and edge index ascending, which is a total order, so taking the front
+`count` of them is exact and needs no threshold with ties to settle. The caller
+still decides how many, but that is all that crosses.
 
 The oracle throughout is the numpy the device code replaced.
 """
@@ -106,17 +106,30 @@ class TestEdgeScores:
                                  np.array([1.0, 2.0], dtype=np.float32))
 
 
-def kth_key(scores, take):
-    """The k-th largest (score, -index) key, as the host computes it."""
-    cand = np.flatnonzero(scores > 0)
-    if len(cand) <= take:
-        weakest = scores[cand].min()
-        return float(weakest), int(cand[scores[cand] == weakest].max())
-    s = scores[cand]
-    ks = float(s[np.argpartition(-s, take - 1)[take - 1]])
-    n_gt = int((s > ks).sum())
-    tied = cand[s == ks]
-    return ks, int(tied[take - n_gt - 1])
+def host_selection(pts, ea, eb, scores, take, threshold=0.0):
+    """The selection the device performs, done in numpy.
+
+    Same total order -- score descending, edge index ascending -- so `take` is
+    exact and there are no ties left to settle. Collisions keep the first
+    survivor in that order, which is the better-scoring edge.
+    """
+    eligible = np.flatnonzero(scores > threshold)
+    if len(eligible) == 0:
+        return []
+    order = eligible[np.lexsort((eligible, -scores[eligible]))][:take]
+    mid = np.rint((pts[ea[order]].astype(np.float64)
+                   + pts[eb[order]].astype(np.float64)) / 2.0).astype(np.int64)
+    np.clip(mid[:, 0], 0, W - 1, out=mid[:, 0])
+    np.clip(mid[:, 1], 0, H - 1, out=mid[:, 1])
+    taken = {(int(x), int(y)) for x, y in pts}
+    seen, out = set(), []
+    for mx, my in mid:
+        t = (int(mx), int(my))
+        if t in taken or t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
 
 
 class TestSelectMidpoints:
@@ -127,76 +140,94 @@ class TestSelectMidpoints:
         e = mesh.get_edges()
         ea, eb = e[:, 0].astype(np.int64), e[:, 1].astype(np.int64)
         scores = mesh.edge_scores(MIN_LEN)
-        ms, ti = kth_key(scores, take)
-
-        idx = np.arange(len(scores))
-        picked = np.flatnonzero((scores > 0)
-                                & ((scores > ms) | ((scores == ms) & (idx <= ti))))
-        mid = np.rint((pts[ea[picked]].astype(np.float64)
-                       + pts[eb[picked]].astype(np.float64)) / 2.0).astype(np.int64)
-        np.clip(mid[:, 0], 0, W - 1, out=mid[:, 0])
-        np.clip(mid[:, 1], 0, H - 1, out=mid[:, 1])
-        taken = {(int(x), int(y)) for x, y in pts}
-        seen, want = set(), []
-        for mx, my in mid:
-            t = (int(mx), int(my))
-            if t in taken or t in seen:
-                continue
-            seen.add(t)
-            want.append(t)
-
-        got = {(int(x), int(y)) for x, y in mesh.select_midpoints(MIN_LEN, ms, ti)}
+        want = host_selection(pts, ea, eb, scores, take)
+        got = {(int(x), int(y)) for x, y in mesh.select_midpoints(MIN_LEN, take)}
         assert got == set(want)
 
-    def test_the_key_takes_exactly_k_edges(self):
-        """The tie-break by index is what makes the count exact."""
+    @pytest.mark.parametrize("take", [5, 50, 200])
+    def test_takes_exactly_the_count_asked_for(self, take):
+        """The order is total, so the count is exact -- no ties to settle.
+
+        Fewer can come back only because a midpoint collided, never because
+        the score boundary was ambiguous.
+        """
         mesh, pts, vals = make_mesh(400, seed=13)
+        e = mesh.get_edges()
+        ea, eb = e[:, 0].astype(np.int64), e[:, 1].astype(np.int64)
         scores = mesh.edge_scores(MIN_LEN)
-        idx = np.arange(len(scores))
-        for take in (5, 50, 200):
-            ms, ti = kth_key(scores, take)
-            n = int(((scores > 0)
-                     & ((scores > ms) | ((scores == ms) & (idx <= ti)))).sum())
-            assert n == take, f"key selected {n} edges, wanted {take}"
+        assert int((scores > 0).sum()) >= take
+        want = host_selection(pts, ea, eb, scores, take)
+        got = mesh.select_midpoints(MIN_LEN, take)
+        assert len(got) == len(want) <= take
+
+    def test_asking_for_more_than_available_returns_what_there_is(self):
+        mesh, pts, vals = make_mesh(120, seed=15)
+        scores = mesh.edge_scores(MIN_LEN)
+        n_eligible = int((scores > 0).sum())
+        got = mesh.select_midpoints(MIN_LEN, n_eligible * 10)
+        assert 0 < len(got) <= n_eligible
+
+    def test_threshold_excludes_weak_edges(self):
+        mesh, pts, vals = make_mesh(400, seed=16)
+        scores = mesh.edge_scores(MIN_LEN)
+        cut = float(np.median(scores[scores > 0]))
+        got = mesh.select_midpoints(MIN_LEN, 10_000, cut)
+        assert len(got) <= int((scores > cut).sum())
+        assert len(mesh.select_midpoints(MIN_LEN, 10_000, float(scores.max()))) == 0
 
     def test_never_returns_a_pixel_that_is_already_a_seed(self):
         """The Voronoi diagram is the record of what has been sampled: a seed
         is a cell at distance zero, so no separate list is needed."""
         mesh, pts, vals = make_mesh(400, seed=17)
-        scores = mesh.edge_scores(MIN_LEN)
-        ms, ti = kth_key(scores, 300)
-        mid = mesh.select_midpoints(MIN_LEN, ms, ti)
+        mid = mesh.select_midpoints(MIN_LEN, 300)
         seeds = {(int(x), int(y)) for x, y in pts}
         assert not ({(int(x), int(y)) for x, y in mid} & seeds)
 
     def test_midpoints_are_unique_and_in_bounds(self):
         mesh, pts, vals = make_mesh(400, seed=19)
-        scores = mesh.edge_scores(MIN_LEN)
-        ms, ti = kth_key(scores, 250)
-        mid = mesh.select_midpoints(MIN_LEN, ms, ti)
+        mid = mesh.select_midpoints(MIN_LEN, 250)
         assert len(np.unique(mid, axis=0)) == len(mid)
         assert (mid >= 0).all()
         assert (mid[:, 0] < W).all() and (mid[:, 1] < H).all()
 
     def test_is_deterministic(self):
         """Emission races on an atomic counter, so the collision pass sorts by
-        (pixel, edge index) to make the survivor a fixed choice."""
+        (pixel, rank) to make the survivor a fixed choice."""
         mesh, pts, vals = make_mesh(400, seed=23)
-        scores = mesh.edge_scores(MIN_LEN)
-        ms, ti = kth_key(scores, 200)
-        first = mesh.select_midpoints(MIN_LEN, ms, ti)
+        first = mesh.select_midpoints(MIN_LEN, 200)
         for _ in range(4):
             np.testing.assert_array_equal(
-                mesh.select_midpoints(MIN_LEN, ms, ti), first)
+                mesh.select_midpoints(MIN_LEN, 200), first)
 
     def test_inserting_them_back_is_accepted(self):
         """Whatever comes out must be legal to insert: no duplicates, in
         bounds. delauney rejects both, so a round trip proves it."""
         mesh, pts, vals = make_mesh(400, seed=29)
-        scores = mesh.edge_scores(MIN_LEN)
-        ms, ti = kth_key(scores, 150)
-        mid = mesh.select_midpoints(MIN_LEN, ms, ti)
+        mid = mesh.select_midpoints(MIN_LEN, 150)
         before = mesh.seed_count
         mesh.insert_deferred(mid.astype(np.int32),
                              np.zeros(len(mid), dtype=np.float32))
         assert mesh.seed_count == before + len(mid)
+
+
+class TestSeedsAndValues:
+    """The mesh is the single record of the point set and the field."""
+
+    def test_seeds_are_insertion_order(self):
+        mesh, pts, vals = make_mesh(200, seed=31)
+        np.testing.assert_array_equal(mesh.get_seeds(), pts)
+
+    def test_values_are_insertion_order(self):
+        mesh, pts, vals = make_mesh(200, seed=33)
+        np.testing.assert_allclose(mesh.get_values(), vals, rtol=0, atol=0)
+
+    def test_both_grow_with_further_inserts(self):
+        mesh, pts, vals = make_mesh(200, seed=35)
+        mid = mesh.select_midpoints(MIN_LEN, 40)
+        new = np.arange(len(mid), dtype=np.float32)
+        mesh.insert_deferred(mid.astype(np.int32), new)
+        seeds, values = mesh.get_seeds(), mesh.get_values()
+        assert len(seeds) == len(pts) + len(mid) == len(values)
+        np.testing.assert_array_equal(seeds[:len(pts)], pts)
+        np.testing.assert_array_equal(seeds[len(pts):], mid)
+        np.testing.assert_allclose(values[len(pts):], new)

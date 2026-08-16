@@ -34,6 +34,7 @@
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
+#include <thrust/count.h>
 #include <thrust/reduce.h>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
@@ -291,6 +292,71 @@ void score_edges_kernel(const int64_t* __restrict__ keys, int n_edges,
     const double dv = fabs((double)values[a] - (double)values[b]);
     scores[e] = (float)(dv * sqrt(len2));
 }
+
+//: Pack (score, edge index) into one key that sorts best-first.
+//:
+//: A score is non-negative, and the IEEE-754 bit pattern of a non-negative
+//: float increases monotonically read as an unsigned integer. Complementing it
+//: reverses that, so ascending order on the key is descending score, and the
+//: index in the low half breaks ties towards the lower edge -- a total order,
+//: which is what makes "the best k" an exact count rather than a threshold with
+//: ties to settle. Edges at or below the threshold get the largest possible
+//: key and sort to the end, out of reach.
+__global__
+void pack_score_keys_kernel(const float* __restrict__ scores, int n,
+                            float threshold, uint64_t* __restrict__ keys)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float s = scores[i];
+    uint32_t bits = 0xFFFFFFFFu;                 // ineligible
+    if (s > threshold && s > 0.f) {
+        uint32_t b;
+        memcpy(&b, &s, sizeof(b));
+        bits = ~b;
+    }
+    keys[i] = ((uint64_t)bits << 32) | (uint32_t)i;
+}
+
+//: Midpoints of the first `take` edges of the sorted key array.
+//:
+//: The sort already chose them, so there is no predicate here -- the caller's
+//: k arrives as a count and the selection is exact by construction.
+__global__
+void midpoints_from_sorted_kernel(const uint64_t* __restrict__ sorted, int take,
+                                  const int64_t* __restrict__ edge_keys,
+                                  int64_t n_seeds,
+                                  const int32_t* __restrict__ sx,
+                                  const int32_t* __restrict__ sy,
+                                  int W_det, int H_det, int P,
+                                  const int32_t* __restrict__ grid,
+                                  int64_t* __restrict__ out,
+                                  int32_t* __restrict__ count)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= take) return;
+    const int32_t e = (int32_t)(sorted[r] & 0xFFFFFFFFu);
+
+    int32_t a, b;
+    unpack_edge(edge_keys[e], n_seeds, a, b);
+    int mx = (int)lrint(0.5 * ((double)sx[a] + sx[b]));
+    int my = (int)lrint(0.5 * ((double)sy[a] + sy[b]));
+    mx = min(max(mx, P), W_det - 1 - P);
+    my = min(max(my, P), H_det - 1 - P);
+
+    if (grid[(my * W_det + mx) * 2 + 1] == 0) return;   // already a seed
+
+    const int64_t pixel = (int64_t)my * W_det + mx;
+    // Rank, not edge index: the sort ordered them, so keeping the lowest rank
+    // among colliding midpoints keeps the better-scoring edge.
+    out[atomicAdd(count, 1)] = pixel * (int64_t)take + r;
+}
+
+//: Count the edges a threshold admits, so `take` never exceeds them.
+struct AboveThreshold {
+    float t;
+    __device__ bool operator()(float s) const { return s > t && s > 0.f; }
+};
 
 //: Take the edges clearing (min_score, tie_index), emit their midpoints.
 //:
@@ -611,6 +677,7 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     cudaMalloc(&d_stale_,        (size_t)max_seeds * 4  * sizeof(uint8_t));
     cudaMalloc(&d_dead_,         (size_t)max_seeds * 4  * sizeof(uint8_t));
     cudaMalloc(&d_values_,       (size_t)max_seeds      * sizeof(float));
+    cudaMalloc(&d_score_keys_,   (size_t)max_seeds * 12 * sizeof(uint64_t));
     cudaMalloc(&d_scores_,       (size_t)max_seeds * 12 * sizeof(float));
     cudaMalloc(&d_mid_keys_,     (size_t)max_seeds      * sizeof(int64_t));
     cudaMalloc(&d_mid_count_,    1                      * sizeof(int32_t));
@@ -632,7 +699,7 @@ Delaunay::~Delaunay()
     cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
     cudaFree(d_edge_keys_);
     cudaFree(d_dead_);
-    cudaFree(d_values_);   cudaFree(d_scores_);
+    cudaFree(d_values_);   cudaFree(d_scores_);  cudaFree(d_score_keys_);
     cudaFree(d_mid_keys_); cudaFree(d_mid_count_);
     cudaFree(d_updated_flag_); cudaFree(d_mask_);
     cudaFree(d_dirty_accum_);  cudaFree(d_tile_dirty_); cudaFree(d_count_);
@@ -1295,6 +1362,7 @@ void Delaunay::insert_deferred(
     if (new_values && !new_values->empty()) {
         cudaMemcpy(d_values_ + seeds_before, new_values->data(),
                    new_values->size() * sizeof(float), cudaMemcpyHostToDevice);
+        h_values_.insert(h_values_.end(), new_values->begin(), new_values->end());
         have_values_ = true;
     }
 
@@ -1411,43 +1479,55 @@ void Delaunay::edge_scores(double min_length, std::vector<float>& out) const
                cudaMemcpyDeviceToHost);
 }
 
-void Delaunay::select_midpoints(double min_length, float min_score,
-                                int32_t tie_index,
+void Delaunay::select_midpoints(double min_length, int count, float threshold,
                                 std::vector<int32_t>& out) const
 {
     ensure_edges_();
     out.clear();
-    if (n_edges_ == 0) return;
+    if (n_edges_ == 0 || count <= 0) return;
     if (!have_values_)
         throw std::logic_error(
             "select_midpoints needs a value per seed; pass values to insert_deferred");
 
-    // Scored again rather than cached from edge_scores: the caller may have
-    // changed min_length between the two, and a pass over the edges is cheaper
-    // than the round trip that would keep them in step.
     score_edges_kernel<<<(n_edges_ + 255) / 256, 256>>>(
         static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
         d_sx_, d_sy_, d_values_, min_length * min_length, d_scores_);
+    cudaDeviceSynchronize();
+
+    // The whole of the selection: order the edges best-first and take the
+    // front. No threshold crosses to the caller and none comes back, because
+    // the key is a total order and `count` is therefore exact.
+    pack_score_keys_kernel<<<(n_edges_ + 255) / 256, 256>>>(
+        d_scores_, n_edges_, threshold, d_score_keys_);
+    cudaDeviceSynchronize();
+
+    thrust::device_ptr<float> sc(d_scores_);
+    const int n_eligible = (int)thrust::count_if(sc, sc + n_edges_,
+                                                 AboveThreshold{threshold});
+    if (n_eligible == 0) return;
+    const int take = std::min(count, n_eligible);
+
+    thrust::device_ptr<uint64_t> kp(d_score_keys_);
+    thrust::sort(kp, kp + n_edges_);
 
     cudaMemset(d_mid_count_, 0, sizeof(int32_t));
-    select_midpoints_kernel<<<(n_edges_ + 255) / 256, 256>>>(
-        static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
-        d_sx_, d_sy_, d_values_, d_scores_, min_score, tie_index,
-        W_det_, H_det_, P_, d_grid_, d_mid_keys_, d_mid_count_);
+    midpoints_from_sorted_kernel<<<(take + 255) / 256, 256>>>(
+        d_score_keys_, take, static_cast<const int64_t*>(d_edge_keys_),
+        (int64_t)N_, d_sx_, d_sy_, W_det_, H_det_, P_, d_grid_,
+        d_mid_keys_, d_mid_count_);
     cudaDeviceSynchronize();
 
     int32_t n = 0;
     cudaMemcpy(&n, d_mid_count_, sizeof(int32_t), cudaMemcpyDeviceToHost);
     if (n == 0) return;
 
-    // Sorting by (pixel, edge index) puts colliding midpoints together with the
-    // lowest edge index first, so uniquing on the pixel keeps a deterministic
-    // one -- the emission order above is not, being an atomic race.
+    // Sorting by (pixel, rank) puts colliding midpoints together with the
+    // best-scoring one first, so uniquing on the pixel keeps a deterministic
+    // choice -- the emission order above is not, being an atomic race.
     thrust::device_ptr<int64_t> p(d_mid_keys_);
     thrust::sort(p, p + n);
-    const int64_t stride = (int64_t)n_edges_;
-    auto end = thrust::unique(p, p + n, SamePixel{stride});
-    const int m = (int)(end - p);
+    auto end_it = thrust::unique(p, p + n, SamePixel{(int64_t)take});
+    const int m = (int)(end_it - p);
 
     std::vector<int64_t> h_keys(m);
     cudaMemcpy(h_keys.data(), d_mid_keys_, (size_t)m * sizeof(int64_t),
@@ -1455,10 +1535,27 @@ void Delaunay::select_midpoints(double min_length, float min_score,
 
     out.resize((size_t)m * 2);
     for (int i = 0; i < m; ++i) {
-        const int64_t pixel = h_keys[i] / stride;
+        const int64_t pixel = h_keys[i] / (int64_t)take;
         out[(size_t)i * 2]     = (int32_t)(pixel % W_det_) - P_;
         out[(size_t)i * 2 + 1] = (int32_t)(pixel / W_det_) - P_;
     }
+}
+
+void Delaunay::get_seeds(std::vector<int32_t>& out) const
+{
+    // Already on the host and in insertion order: the registry keeps them so
+    // rebuild_sorted_rank_ and the outputs can read them, so this is a copy
+    // rather than a transfer.
+    out.resize((size_t)N_ * 2);
+    for (int i = 0; i < N_; ++i) {
+        out[(size_t)i * 2]     = h_sx_[i];
+        out[(size_t)i * 2 + 1] = h_sy_[i];
+    }
+}
+
+void Delaunay::get_values(std::vector<float>& out) const
+{
+    out.assign(h_values_.begin(), h_values_.end());
 }
 
 void Delaunay::get_edges(std::vector<int32_t>& out) const

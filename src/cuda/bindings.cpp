@@ -298,6 +298,28 @@ public:
         impl_.insert_deferred(xs, ys, nullptr, &vals);
     }
 
+    py::array_t<int32_t> get_seeds() const
+    {
+        std::vector<int32_t> flat;
+        impl_.get_seeds(flat);
+        const int n = (int)(flat.size() / 2);
+        py::array_t<int32_t> arr({n, 2});
+        if (n > 0)
+            std::memcpy(arr.mutable_data(), flat.data(),
+                        flat.size() * sizeof(int32_t));
+        return arr;
+    }
+
+    py::array_t<float> get_values() const
+    {
+        std::vector<float> v;
+        impl_.get_values(v);
+        py::array_t<float> arr((py::ssize_t)v.size());
+        if (!v.empty())
+            std::memcpy(arr.mutable_data(), v.data(), v.size() * sizeof(float));
+        return arr;
+    }
+
     py::array_t<float> edge_scores(double min_length) const
     {
         std::vector<float> sc;
@@ -308,11 +330,11 @@ public:
         return arr;
     }
 
-    py::array_t<int32_t> select_midpoints(double min_length, float min_score,
-                                          int32_t tie_index) const
+    py::array_t<int32_t> select_midpoints(double min_length, int count,
+                                          float threshold) const
     {
         std::vector<int32_t> flat;
-        impl_.select_midpoints(min_length, min_score, tie_index, flat);
+        impl_.select_midpoints(min_length, count, threshold, flat);
         const int n = (int)(flat.size() / 2);
         py::array_t<int32_t> arr({n, 2});
         if (n > 0)
@@ -624,17 +646,21 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "onto an endpoint. Needs values to have been supplied to "
              "insert_deferred.")
         .def("select_midpoints", &PyDelaunay::select_midpoints,
-             py::arg("min_length"), py::arg("min_score"), py::arg("tie_index"),
-             "Midpoints of the top-scoring edges, as an (M, 2) int32 array.\n\n"
-             "An edge is taken when its score beats (min_score, tie_index) "
-             "under 'higher score first, lower edge index on a tie'. Passing "
-             "the k-th largest such key takes exactly k edges, "
-             "deterministically, so the caller can choose k without shipping "
-             "an index list back.\n\n"
+             py::arg("min_length"), py::arg("count"), py::arg("threshold") = 0.0f,
+             "Midpoints of the best `count` edges, as an (M, 2) int32 array.\n\n"
+             "Edges are ordered by score descending, edge index ascending -- a "
+             "total order, so `count` is exact rather than a threshold with "
+             "ties to settle, and the whole selection happens on the device. "
+             "threshold excludes edges scoring at or below it, so fewer than "
+             "`count` may come back.\n\n"
              "Midpoints already occupied by a seed are dropped -- a seed is a "
              "cell at distance zero, so no record of taken positions is "
              "needed -- and midpoints colliding with one another collapse to "
-             "the one from the lowest edge index.")
+             "the one from the better-scoring edge.")
+        .def("get_seeds", &PyDelaunay::get_seeds,
+             "Seed positions as an (N, 2) int32 array, in insertion order.")
+        .def("get_values", &PyDelaunay::get_values,
+             "The scalar field as an (N,) float32 array, in insertion order.")
         .def("get_edges", &PyDelaunay::get_edges,
              "The distinct undirected edges as an (N_edges, 2) int32 array,\n"
              "each row (a, b) with a < b.\n\n"

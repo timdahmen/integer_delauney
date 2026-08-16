@@ -119,8 +119,19 @@ public:
     //: needs no separate record of what has been sampled: a seed is exactly a
     //: cell at distance zero in the Voronoi diagram. Midpoints colliding with
     //: each other are dropped down to the one from the lowest edge index.
-    void select_midpoints(double min_length, float min_score, int32_t tie_index,
+    //: `count` is exact, not a threshold: the edges are ordered best-first by
+    //: (score descending, index ascending), which is a total order, and the
+    //: front of it is taken. Nothing about the selection crosses to the caller.
+    //: `threshold` excludes edges scoring at or below it, so fewer than `count`
+    //: may come back.
+    void select_midpoints(double min_length, int count, float threshold,
                           std::vector<int32_t>& out) const;
+
+    // The seed positions in insertion order, as flat (x0, y0, x1, y1, ...),
+    // and the scalar field beside them. The mesh holds both, so a caller has
+    // no reason to keep a second copy that could disagree with it.
+    void get_seeds(std::vector<int32_t>& out) const;
+    void get_values(std::vector<float>& out) const;
 
     // internal insertion-order id -> batch pipeline's sorted (x asc, y asc) id
     const std::vector<int32_t>& sorted_rank() const
@@ -176,6 +187,7 @@ private:
     uint8_t* d_stale_;       // (max triangles) per-triangle invalidation flags
     uint8_t* d_dead_;        // (max triangles) retired-slot flags, mirrors h_dead_
     float*   d_values_;      // (max_seeds) scalar field, one per seed
+    uint64_t* d_score_keys_; // (3 * max triangles) packed (score, edge index)
     float*   d_scores_;      // (3 * max triangles) one per edge
     int64_t* d_mid_keys_;    // (max_seeds) packed midpoint pixel + edge index
     int32_t* d_mid_count_;   // (1)
@@ -217,6 +229,9 @@ private:
 
     // ---- host-side seed registry ----
     std::vector<int32_t>            h_sx_, h_sy_;
+    // Mirrored rather than read back: the values pass through the host on
+    // their way in, so keeping them costs a copy and saves a transfer.
+    std::vector<float>              h_values_;
     std::unordered_set<uint64_t>    h_seed_set_;   // fast duplicate check
 
     // Internal seed ids are assigned in INSERTION order, because previously
