@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 
 if _cuda_available():
     from delauney import _delauney_cuda as _cu
-    from delauney import auto_border_padding
+    from delauney import DEFAULT_BORDER_PADDING
 
 W, H = 64, 64
 MAX_SEEDS = 2048
@@ -95,7 +95,7 @@ class TestPaddingMatchesBatch:
     @pytest.mark.parametrize("n", [20, 60, 200, 400])
     def test_matches_batch_across_densities(self, n):
         seeds = scattered(n, n)
-        pad = auto_border_padding(W, H, len(seeds))
+        pad = DEFAULT_BORDER_PADDING
         i_set, _ = incremental(seeds, pad)
         b_set, _ = batch(seeds, pad)
         assert i_set == b_set
@@ -176,9 +176,17 @@ class TestPaddingApi:
         assert np.asarray(tgrid).shape == (H, W, 3)
         assert np.asarray(inc.get_voronoi_grid()).shape == (H, W, 2)
 
-    def test_default_padding_is_auto_from_max_seeds(self):
+    def test_default_padding_is_the_library_constant(self):
+        """Not a function of max_seeds any more.
+
+        The old default was a density estimate resolved against max_seeds, so a
+        mesh holding far fewer seeds than its capacity was under-padded relative
+        to what the batch path would pick for it. A constant removes that
+        disagreement by construction.
+        """
         inc = _cu.IncrementalDelaunay(W, H, MAX_SEEDS)
-        assert inc.border_padding == auto_border_padding(W, H, MAX_SEEDS)
+        assert inc.border_padding == DEFAULT_BORDER_PADDING
+        assert _cu.IncrementalDelaunay(W, H, MAX_SEEDS * 8).border_padding             == DEFAULT_BORDER_PADDING
 
     def test_explicit_padding_is_reported(self):
         assert _cu.IncrementalDelaunay(W, H, MAX_SEEDS, 5).border_padding == 5

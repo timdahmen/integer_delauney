@@ -2,6 +2,15 @@
 #include <cstdint>
 #include <vector>
 
+//: Pixels of Voronoi canvas added on each side when a caller does not choose.
+//: Must stay in step with delauney.DEFAULT_BORDER_PADDING.
+//:
+//: A fixed value, not a density estimate. Circumcentre excursion depends on
+//: triangle shape rather than on seed count, so no per-call formula bounds it;
+//: it is bounded only when the caller controls how densely the convex hull
+//: boundary is sampled. See BORDER_PADDING_BOUND.md.
+static constexpr int DEFAULT_BORDER_PADDING = 16;
+
 struct TriangleEntry {
     int32_t x, y;
     int32_t id_a, id_b, id_c;

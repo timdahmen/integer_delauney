@@ -500,12 +500,9 @@ IncrementalDelaunay::IncrementalDelaunay(int width, int height, int max_seeds,
     if (width <= 0 || height <= 0 || max_seeds <= 0)
         throw std::invalid_argument("dimensions and max_seeds must be positive");
 
-    // Same rule as delauney.auto_border_padding: sqrt(area / n), which covers
-    // the circumcentre excursion for a seed spacing of 0.5*sqrt(area/n) with
-    // margin. Resolved once, against max_seeds -- see the header.
-    P_ = border_padding >= 0
-       ? border_padding
-       : (int)std::lround(std::sqrt((double)W_ * (double)H_ / (double)max_seeds));
+    // Fixed default rather than a density estimate; see the header and
+    // BORDER_PADDING_BOUND.md.
+    P_ = border_padding >= 0 ? border_padding : DEFAULT_BORDER_PADDING;
     W_det_ = W_ + 2 * P_;
     H_det_ = H_ + 2 * P_;
 

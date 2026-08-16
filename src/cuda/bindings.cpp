@@ -80,16 +80,20 @@ public:
 // GridTriangulation wrapper
 // ---------------------------------------------------------------------------
 
-// A negative border_padding means "pick one scaled to seed density" -- the
-// int-typed spelling of the reference's border_padding=None.  Must stay in
-// step with delauney.auto_border_padding: sqrt(area / n_seeds).
-static int resolve_border_padding(int border_padding, int W, int H, int N_seeds)
+// A negative border_padding means "use the library default" -- the int-typed
+// spelling of the reference's border_padding=None.
+//
+// This used to estimate one per call as sqrt(area / n_seeds), which is a global
+// density argument for a quantity that depends on triangle shape: circumradius
+// grows without limit as three points approach collinearity, at any seed count.
+// Measured on a real frame the estimate was out by 3.5x at the tail. A fixed
+// default is not a better estimate, it is an honest one -- the padding a seed
+// set needs is bounded only when the caller controls how densely the hull
+// boundary is sampled. See BORDER_PADDING_BOUND.md.
+static int resolve_border_padding(int border_padding, int, int, int)
 {
     if (border_padding >= 0) return border_padding;
-    if (N_seeds <= 0) return 0;
-    return static_cast<int>(std::lround(
-        std::sqrt(static_cast<double>(W) * static_cast<double>(H)
-                  / static_cast<double>(N_seeds))));
+    return DEFAULT_BORDER_PADDING;
 }
 
 class PyGridTriangulation {
@@ -448,8 +452,9 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "border_padding: pixels of Voronoi canvas to add on each side\n"
              "before triangle detection, exposing border triangles whose\n"
              "circumcenter lies outside the image. Negative (the default)\n"
-             "scales it to seed density, matching delauney.auto_border_padding\n"
-             "and the reference's border_padding=None; 0 disables padding.\n"
+             "uses delauney.DEFAULT_BORDER_PADDING, matching the reference's\n"
+             "border_padding=None; 0 disables padding. BORDER_PADDING_BOUND.md\n"
+             "gives the boundary spacing a given padding admits.\n"
              "The output grid is always the original (H, W, 3) resolution.\n\n"
              "as_arrays: return the vertex indices as an (N_tri, 3) int32 array\n"
              "instead of a {tid: (x, y, id_a, id_b, id_c)} dict, skipping the\n"
@@ -476,8 +481,8 @@ PYBIND11_MODULE(_delauney_cuda, m)
              py::arg("border_padding") = -1,
              "Create an incremental Delaunay triangulator with device-resident state.\n\n"
              "max_seeds: upper bound on total seeds ever inserted.\n"
-             "border_padding: width of the padded detection canvas; < 0 selects\n"
-             "  delauney.auto_border_padding(width, height, max_seeds).\n\n"
+             "border_padding: width of the padded detection canvas; < 0 uses\n"
+             "  delauney.DEFAULT_BORDER_PADDING.\n\n"
              "  A triangle is registered where three Voronoi regions meet, i.e. at\n"
              "  its circumcentre, and boundary triangles frequently have\n"
              "  circumcentres outside the image, so at 0 they are never detected.\n"

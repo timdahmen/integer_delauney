@@ -45,7 +45,7 @@ class GridTriangulation:
             Pixels of Voronoi canvas to add on each side before triangle
             detection, exposing border triangles whose circumcenter lies
             outside the image.  None (the default) scales it to seed density
-            via ``delauney.auto_border_padding``, which documents the
+            via ``delauney.DEFAULT_BORDER_PADDING``, which documents the
             trade-off; 0 disables padding.  The output grid is always the
             original (H, W, 3) resolution.
         as_arrays:
@@ -72,8 +72,8 @@ class GridTriangulation:
         # so that vertices outside the image become visible.  Shifting seeds by
         # (P, P) preserves lexicographic order, so IDs match sorted_seeds.
         if border_padding is None:
-            from delauney import auto_border_padding
-            border_padding = auto_border_padding(W, H, len(sorted_seeds))
+            from delauney import DEFAULT_BORDER_PADDING
+            border_padding = DEFAULT_BORDER_PADDING
         P = max(0, int(border_padding))
         if P > 0:
             shifted = [(int(x) + P, int(y) + P) for x, y in sorted_seeds]

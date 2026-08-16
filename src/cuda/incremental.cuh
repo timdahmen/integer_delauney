@@ -14,14 +14,16 @@ struct IncrementalTimings {
 
 class IncrementalDelaunay {
 public:
-    // border_padding < 0 selects delauney::auto_border_padding(w, h, max_seeds).
+    // border_padding < 0 uses DEFAULT_BORDER_PADDING.
     //
-    // Unlike the batch API this is fixed at construction, because the padded
-    // canvas is the persistent device state. The auto rule scales as
-    // sqrt(area / n) and so shrinks as seeds are added, meaning a state well
-    // below max_seeds is under-padded relative to what the batch path would
-    // choose for it. Pass a value explicitly when the eventual seed count is
-    // not close to max_seeds.
+    // Fixed at construction, because the padded canvas is the persistent device
+    // state. That used to matter a great deal: the default was a density
+    // estimate that shrank as seeds were added, so a state below max_seeds was
+    // under-padded relative to what the batch path would pick for it. With a
+    // constant default both paths agree by construction.
+    //
+    // The padding a seed set needs is bounded only when the caller controls how
+    // densely the convex hull boundary is sampled. See BORDER_PADDING_BOUND.md.
     IncrementalDelaunay(int width, int height, int max_seeds,
                         int border_padding = -1);
     ~IncrementalDelaunay();

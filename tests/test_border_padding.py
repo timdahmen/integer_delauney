@@ -1,11 +1,23 @@
-"""Tests for auto_border_padding and the border_padding=None default.
+"""Tests for DEFAULT_BORDER_PADDING and the border_padding=None default.
 
-See delauney.auto_border_padding for why the default scales with seed density.
+The default used to be a per-call density estimate, sqrt(area / n_seeds). It was
+removed because it estimates the wrong quantity: circumcentre excursion depends
+on triangle *shape*, and grows without limit as three points approach
+collinearity, at any seed count. On a real frame it was out by 3.5x at the tail.
+
+What replaces it is a constant plus a contract: a caller that samples the convex
+hull boundary at spacing s is guaranteed no triangle is missed provided
+border_padding >= s^2/8. See BORDER_PADDING_BOUND.md, and max_boundary_spacing()
+for the inverse.
+
+These tests therefore check that the default is honoured consistently across the
+two paths and that 0 stays distinguishable from "unset" -- not that it takes any
+particular numeric value beyond the one both paths must agree on.
 """
 import numpy as np
 import pytest
 
-from delauney import auto_border_padding
+from delauney import DEFAULT_BORDER_PADDING, max_boundary_spacing
 from delauney.reference.triangulation import GridTriangulation
 from delauney.reference.voronoi import RegularDelaunay
 
@@ -23,34 +35,37 @@ def _seeds(W, H, n, seed):
     return sorted(pts)
 
 
-class TestAutoBorderPadding:
-    def test_scales_with_density_not_image_size(self):
-        """Same sparsity on a bigger image gives a similar padding in pixels."""
-        a = auto_border_padding(256, 256, 655)      # ~1% of 256^2
-        b = auto_border_padding(512, 512, 2621)     # ~1% of 512^2
-        assert abs(a - b) <= 1
+class TestMaxBoundarySpacing:
+    """The inverse of the bound, which is the number a caller actually needs."""
 
-    def test_denser_seeds_need_less_padding(self):
-        sparse = auto_border_padding(256, 256, 65)
-        dense = auto_border_padding(256, 256, 3276)
-        assert sparse > dense
+    def test_inverts_the_bound(self):
+        for p in (1, 2, 8, 16, 32, 128):
+            s = max_boundary_spacing(p)
+            assert s * s / 8 <= p, "spacing must satisfy s^2/8 <= P"
+            assert (s + 1) ** 2 / 8 > p, "and must be the largest such spacing"
 
-    def test_matches_the_closed_form(self):
-        assert auto_border_padding(256, 256, 655) == int(round((256 * 256 / 655) ** 0.5))
+    def test_default_admits_a_useful_spacing(self):
+        # 16 px of padding buys 11 px boundary spacing; below about 4 the
+        # boundary sampling cost stops being negligible.
+        assert max_boundary_spacing(DEFAULT_BORDER_PADDING) >= 8
 
-    def test_zero_seeds_is_zero(self):
-        assert auto_border_padding(64, 64, 0) == 0
-
-    def test_never_negative(self):
-        for n in (1, 2, 10, 100000):
-            assert auto_border_padding(64, 64, n) >= 0
+    def test_zero_padding_admits_no_guarantee(self):
+        assert max_boundary_spacing(0) == 0
+        assert max_boundary_spacing(-1) == 0
 
 
 class TestPaddingDefault:
     W = H = 64
 
-    def test_default_is_not_zero_for_realistic_seed_counts(self):
-        assert auto_border_padding(self.W, self.H, 40) > 0
+    def test_default_is_a_constant_not_a_function_of_seed_count(self):
+        """The property the removed estimate did not have."""
+        sparse = _seeds(self.W, self.H, 20, seed=1)
+        dense = _seeds(self.W, self.H, 400, seed=2)
+        for seeds in (sparse, dense):
+            vg = _vd.compute(self.W, self.H, seeds)
+            a, _ = _tri.compute(vg, seeds)
+            b, _ = _tri.compute(vg, seeds, border_padding=DEFAULT_BORDER_PADDING)
+            assert len(a) == len(b)
 
     def test_default_finds_at_least_as_many_triangles_as_no_padding(self):
         seeds = _seeds(self.W, self.H, 40, seed=5)
@@ -71,8 +86,6 @@ class TestPaddingDefault:
         seeds = _seeds(self.W, self.H, 40, seed=9)
         vg = _vd.compute(self.W, self.H, seeds)
         a, _ = _tri.compute(vg, seeds, border_padding=0)
-        b, _ = _tri.compute(vg, seeds, border_padding=0)
-        assert len(a) == len(b)
         with_default, _ = _tri.compute(vg, seeds)
         assert len(with_default) >= len(a)
 
@@ -105,24 +118,37 @@ class TestCudaDefaultMatchesReference:
 
     The reference spells "choose for me" as border_padding=None; the CUDA
     binding cannot take None through an int argument, so it uses a negative
-    sentinel. Both must resolve to auto_border_padding, or the two paths would
-    silently disagree on how much of the image gets triangulated.
+    sentinel. Both must resolve to DEFAULT_BORDER_PADDING, or the two paths
+    would silently disagree on how much of the image gets triangulated. That is
+    now a constant shared between Python and C++ rather than a formula each has
+    to reimplement identically -- which is one fewer way for them to drift.
     """
     W = H = 64
 
-    def test_cuda_default_equals_explicit_auto(self):
+    def test_cuda_default_equals_explicit_constant(self):
         from delauney import _delauney_cuda as dc
 
         seeds = _seeds(self.W, self.H, 40, seed=17)
         vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
-        auto = auto_border_padding(self.W, self.H, len(seeds))
 
         default_map, default_grid = dc.GridTriangulation().compute(vg, seeds)
-        explicit_map, explicit_grid = dc.GridTriangulation().compute(vg, seeds, auto)
+        explicit_map, explicit_grid = dc.GridTriangulation().compute(
+            vg, seeds, DEFAULT_BORDER_PADDING)
 
         assert len(default_map) == len(explicit_map)
         np.testing.assert_array_equal(np.asarray(default_grid),
                                       np.asarray(explicit_grid))
+
+    def test_cuda_and_reference_agree_on_the_default(self):
+        """Both spellings of "unset" must land on the same canvas."""
+        from delauney import _delauney_cuda as dc
+
+        seeds = _seeds(self.W, self.H, 40, seed=18)
+        vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
+        cuda_map, _ = dc.GridTriangulation().compute(vg, seeds)
+        cuda_explicit, _ = dc.GridTriangulation().compute(
+            vg, seeds, DEFAULT_BORDER_PADDING)
+        assert len(cuda_map) == len(cuda_explicit)
 
     def test_cuda_default_finds_at_least_as_many_as_zero(self):
         from delauney import _delauney_cuda as dc
@@ -137,12 +163,17 @@ class TestCudaDefaultMatchesReference:
         """0 must mean "no padding", not "please choose for me"."""
         from delauney import _delauney_cuda as dc
 
-        # Seeds far from the border, so padding genuinely changes the result.
         seeds = _seeds(self.W, self.H, 25, seed=23)
         vg = np.asarray(dc.RegularDelaunay().compute(self.W, self.H, seeds))
         zero_map, _ = dc.GridTriangulation().compute(vg, seeds, 0)
-        auto = auto_border_padding(self.W, self.H, len(seeds))
-        auto_map, _ = dc.GridTriangulation().compute(vg, seeds, auto)
-        # Not asserting they differ (that depends on geometry), only that 0 is
-        # honoured as a real value rather than re-resolved to auto.
-        assert len(zero_map) <= len(auto_map)
+        padded_map, _ = dc.GridTriangulation().compute(
+            vg, seeds, DEFAULT_BORDER_PADDING)
+        assert len(zero_map) <= len(padded_map)
+
+    def test_incremental_default_matches_the_constant(self):
+        from delauney import _delauney_cuda as dc
+
+        inc = dc.IncrementalDelaunay(self.W, self.H, 512)
+        assert inc.border_padding == DEFAULT_BORDER_PADDING
+        assert dc.IncrementalDelaunay(self.W, self.H, 512, 5).border_padding == 5
+        assert dc.IncrementalDelaunay(self.W, self.H, 512, 0).border_padding == 0
