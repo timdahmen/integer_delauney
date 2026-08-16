@@ -14,6 +14,7 @@
 
 #include "triangulation.cuh"
 #include "voronoi.cuh"
+#include "triangle_detect.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -30,27 +31,9 @@
 // Shared structs
 // ---------------------------------------------------------------------------
 
-static constexpr int32_t UNDEF = -1;
-
-struct RawTriangle {
-    int32_t x, y;
-    int32_t a, b, c;           // sorted dedup key  (a <= b <= c)
-    int32_t orig_a, orig_b, orig_c;
-};
-
-struct RawLess {
-    __device__ bool operator()(const RawTriangle& x, const RawTriangle& y) const {
-        if (x.a != y.a) return x.a < y.a;
-        if (x.b != y.b) return x.b < y.b;
-        return x.c < y.c;
-    }
-};
-
-struct RawEqual {
-    __device__ bool operator()(const RawTriangle& x, const RawTriangle& y) const {
-        return x.a == y.a && x.b == y.b && x.c == y.c;
-    }
-};
+// RawTriangle, RawLess, RawEqual, UNDEF_SEED and the detection rule itself all
+// live in triangle_detect.cuh, shared with the incremental path.
+static constexpr int32_t UNDEF = UNDEF_SEED;
 
 // ---------------------------------------------------------------------------
 // Kernel 1: detect triangle seeds via 2x2 block scan
@@ -69,98 +52,17 @@ void find_triangle_seeds_kernel(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W - 1 || y >= H - 1) return;   // 2x2 block must be in bounds
 
-    int32_t a = n_grid[ y      * W + x    ];  // top-left
-    int32_t b = n_grid[ y      * W + x + 1];  // top-right
-    int32_t c = n_grid[(y + 1) * W + x    ];  // bottom-left
-    int32_t d = n_grid[(y + 1) * W + x + 1];  // bottom-right
-
-    // Sort three seed IDs and atomically write one RawTriangle entry.
-    auto register_tri = [&](int32_t oa, int32_t ob, int32_t oc) {
-        int32_t sa = oa, sb = ob, sc = oc;
-        if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
-        if (sb > sc) { int32_t t = sb; sb = sc; sc = t; }
-        if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
-        int32_t pos = atomicAdd(counter, 1);
-        raw_buf[pos] = {x, y, sa, sb, sc, oa, ob, oc};
-    };
-
-    // Collect distinct seed IDs from the 2x2 block.
-    int32_t quad[4] = {a, b, c, d};
-    int32_t s[4];
-    int n = 0;
-    for (int i = 0; i < 4; ++i) {
-        bool dup = false;
-        for (int j = 0; j < n; ++j) if (s[j] == quad[i]) { dup = true; break; }
-        if (!dup) s[n++] = quad[i];
-    }
-
-    if (n == 3) {
-        // Three cells meet at this corner: one Delaunay triangle.
-        register_tri(s[0], s[1], s[2]);
-        return;
-    }
-    if (n != 4) return;   // at most two distinct cells, no triangle
-
-    // Four cells meet: a degree-4 Voronoi vertex, i.e. four cocircular seeds.
-    // The quad has two equally valid Delaunay triangulations, one per diagonal,
-    // and registering both would overlap.  This mirrors the rule in
-    // reference/triangulation.py exactly, so the two paths agree; splitting on
-    // the pixel block's anti-diagonal instead would make the result depend on
-    // image orientation rather than on the seed geometry.
-    const int32_t q[4] = {a, b, c, d};   // order matches the reference's ids[]
-
-    // Cyclic order around the centroid, so "diagonal" means opposite corners
-    // rather than adjacent ones.  Double precision, and a stable sort, to match
-    // the reference's np.arctan2 + sorted().
-    double cx = 0.0, cy = 0.0;
-    for (int i = 0; i < 4; ++i) { cx += seed_xs[q[i]]; cy += seed_ys[q[i]]; }
-    cx *= 0.25; cy *= 0.25;
-
-    double ang[4];
-    for (int i = 0; i < 4; ++i)
-        ang[i] = atan2((double)seed_ys[q[i]] - cy, (double)seed_xs[q[i]] - cx);
-
-    int ord[4] = {0, 1, 2, 3};
-    for (int i = 1; i < 4; ++i) {                 // insertion sort, stable
-        int k = ord[i];
-        int j = i - 1;
-        while (j >= 0 && ang[ord[j]] > ang[k]) { ord[j + 1] = ord[j]; --j; }
-        ord[j + 1] = k;
-    }
-
-    // Exact integer lengths: seed coordinates are integral, so this reproduces
-    // the reference's float comparison without any rounding risk.
-    auto len2 = [&](int i, int j) -> long long {
-        long long dx = (long long)seed_xs[q[i]] - seed_xs[q[j]];
-        long long dy = (long long)seed_ys[q[i]] - seed_ys[q[j]];
-        return dx * dx + dy * dy;
-    };
-
-    const int d0a = ord[0], d0b = ord[2];
-    const int d1a = ord[1], d1b = ord[3];
-    const long long l0 = len2(d0a, d0b), l1 = len2(d1a, d1b);
-
-    int pa, pb;                                    // the chosen diagonal
-    if (l0 < l1)      { pa = d0a; pb = d0b; }
-    else if (l1 < l0) { pa = d1a; pb = d1b; }
-    else {
-        // Exact tie, the usual case for cocircular points: take the diagonal
-        // that does NOT contain the lowest seed id.
-        int lowest = 0;
-        for (int i = 1; i < 4; ++i) if (q[i] < q[lowest]) lowest = i;
-        if (lowest == d0a || lowest == d0b) { pa = d1a; pb = d1b; }
-        else                                { pa = d0a; pb = d0b; }
-    }
-
-    // The two triangles sharing that diagonal.
-    int ra = -1, rb = -1;
-    for (int i = 0; i < 4; ++i) {
-        if (i == pa || i == pb) continue;
-        if (ra < 0) ra = i; else rb = i;
-    }
-
-    register_tri(q[pa], q[pb], q[ra]);
-    register_tri(q[pa], q[pb], q[rb]);
+    // Plain seed-id grid here; the incremental path's is interleaved with
+    // distance. That layout difference is the only thing this kernel adds.
+    detect_block_triangles(
+        n_grid[ y      * W + x    ],        // top-left
+        n_grid[ y      * W + x + 1],        // top-right
+        n_grid[(y + 1) * W + x    ],        // bottom-left
+        n_grid[(y + 1) * W + x + 1],        // bottom-right
+        seed_xs, seed_ys,
+        [&](int32_t oa, int32_t ob, int32_t oc) {
+            append_raw_triangle(raw_buf, counter, x, y, oa, ob, oc);
+        });
 }
 
 // ---------------------------------------------------------------------------

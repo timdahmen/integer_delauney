@@ -29,6 +29,7 @@
 //   7. Materialise tri_map and the (H,W,3) grid.
 
 #include "delaunay.cuh"
+#include "triangle_detect.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -44,31 +45,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
-// ---------------------------------------------------------------------------
-// Internal types (parallel to triangulation.cu internals)
-// ---------------------------------------------------------------------------
-
-static constexpr int32_t UNDEF_SEED = -1;
-
-struct RawTriangle {
-    int32_t x, y;
-    int32_t a, b, c;            // sorted key
-    int32_t orig_a, orig_b, orig_c;
-};
-
-struct RawLess {
-    __device__ bool operator()(const RawTriangle& p, const RawTriangle& q) const {
-        if (p.a != q.a) return p.a < q.a;
-        if (p.b != q.b) return p.b < q.b;
-        return p.c < q.c;
-    }
-};
-
-struct RawEqual {
-    __device__ bool operator()(const RawTriangle& p, const RawTriangle& q) const {
-        return p.a == q.a && p.b == q.b && p.c == q.c;
-    }
-};
+// UNDEF_SEED, RawTriangle, RawLess, RawEqual and the detection rule are shared
+// with the batch path; see triangle_detect.cuh.
 
 // ---------------------------------------------------------------------------
 // Device helpers
@@ -201,89 +179,20 @@ void find_triangle_seeds_kernel(
     if (x >= W - 1 || y >= H - 1) return;   // 2x2 block must be in bounds
     if (mask && !mask[y * W + x]) return;
 
+    // Interleaved (seed_id, distance) grid here; the batch path's is a plain
+    // seed-id array. That layout difference, and the mask above, are the only
+    // things this kernel adds to the shared rule.
     auto sid = [&](int cx, int cy) -> int32_t { return grid[(cy * W + cx) * 2]; };
 
-    int32_t a = sid(x,     y    );   // top-left
-    int32_t b = sid(x + 1, y    );   // top-right
-    int32_t c = sid(x,     y + 1);   // bottom-left
-    int32_t d = sid(x + 1, y + 1);   // bottom-right
-
-    auto register_tri = [&](int32_t oa, int32_t ob, int32_t oc) {
-        int32_t sa = oa, sb = ob, sc = oc;
-        if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
-        if (sb > sc) { int32_t t = sb; sb = sc; sc = t; }
-        if (sa > sb) { int32_t t = sa; sa = sb; sb = t; }
-        int32_t pos = atomicAdd(counter, 1);
-        raw_buf[pos] = {x, y, sa, sb, sc, oa, ob, oc};
-    };
-
-    // Distinct seed ids in the block. UNDEF cells cannot form a triangle, and
-    // the incremental grid can still hold them before the BFS has reached
-    // everywhere, which the batch path never sees.
-    int32_t quad[4] = {a, b, c, d};
-    int32_t s[4];
-    int n = 0;
-    for (int i = 0; i < 4; ++i) {
-        if (quad[i] == UNDEF_SEED) return;
-        bool dup = false;
-        for (int j = 0; j < n; ++j) if (s[j] == quad[i]) { dup = true; break; }
-        if (!dup) s[n++] = quad[i];
-    }
-
-    if (n == 3) { register_tri(s[0], s[1], s[2]); return; }
-    if (n != 4) return;   // at most two distinct cells, no triangle
-
-    // Four cells meet: a degree-4 Voronoi vertex, i.e. four cocircular seeds.
-    // The quad has two equally valid Delaunay triangulations, one per diagonal,
-    // and registering both would overlap. Mirrors reference/triangulation.py.
-    const int32_t q[4] = {a, b, c, d};
-
-    double cx = 0.0, cy = 0.0;
-    for (int i = 0; i < 4; ++i) { cx += seed_xs[q[i]]; cy += seed_ys[q[i]]; }
-    cx *= 0.25; cy *= 0.25;
-
-    double ang[4];
-    for (int i = 0; i < 4; ++i)
-        ang[i] = atan2((double)seed_ys[q[i]] - cy, (double)seed_xs[q[i]] - cx);
-
-    int ord[4] = {0, 1, 2, 3};
-    for (int i = 1; i < 4; ++i) {                 // insertion sort, stable
-        int k = ord[i];
-        int j = i - 1;
-        while (j >= 0 && ang[ord[j]] > ang[k]) { ord[j + 1] = ord[j]; --j; }
-        ord[j + 1] = k;
-    }
-
-    auto len2 = [&](int i, int j) -> long long {
-        long long dx = (long long)seed_xs[q[i]] - seed_xs[q[j]];
-        long long dy = (long long)seed_ys[q[i]] - seed_ys[q[j]];
-        return dx * dx + dy * dy;
-    };
-
-    const int d0a = ord[0], d0b = ord[2];
-    const int d1a = ord[1], d1b = ord[3];
-    const long long l0 = len2(d0a, d0b), l1 = len2(d1a, d1b);
-
-    int pa, pb;                                    // the chosen diagonal
-    if (l0 < l1)      { pa = d0a; pb = d0b; }
-    else if (l1 < l0) { pa = d1a; pb = d1b; }
-    else {
-        // Exact tie, the usual case for cocircular points: take the diagonal
-        // that does NOT contain the lowest seed id.
-        int lowest = 0;
-        for (int i = 1; i < 4; ++i) if (q[i] < q[lowest]) lowest = i;
-        if (lowest == d0a || lowest == d0b) { pa = d1a; pb = d1b; }
-        else                                { pa = d0a; pb = d0b; }
-    }
-
-    int ra = -1, rb = -1;
-    for (int i = 0; i < 4; ++i) {
-        if (i == pa || i == pb) continue;
-        if (ra < 0) ra = i; else rb = i;
-    }
-
-    register_tri(q[pa], q[pb], q[ra]);
-    register_tri(q[pa], q[pb], q[rb]);
+    detect_block_triangles(
+        sid(x,     y    ),                  // top-left
+        sid(x + 1, y    ),                  // top-right
+        sid(x,     y + 1),                  // bottom-left
+        sid(x + 1, y + 1),                  // bottom-right
+        seed_xs, seed_ys,
+        [&](int32_t oa, int32_t ob, int32_t oc) {
+            append_raw_triangle(raw_buf, counter, x, y, oa, ob, oc);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +423,16 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     cudaMalloc(&d_changed_,      (size_t)N              * sizeof(int32_t));
     cudaMalloc(&d_sx_,           (size_t)max_seeds      * sizeof(int32_t));
     cudaMalloc(&d_sy_,           (size_t)max_seeds      * sizeof(int32_t));
-    cudaMalloc(&d_raw_buf_,      (size_t)N * 4          * sizeof(RawTriangle));
+    // This buffer serves two purposes and must satisfy both bounds. Detection
+    // writes at most two triangles per 2x2 block over (W-1)*(H-1) blocks -- the
+    // same exact bound the batch path uses, and half the 4-per-pixel it was
+    // allocated at before, which is 200 MB at a real frame size against 100 MB.
+    // It then also holds the deduplicated triangle list, under 2n for n seeds
+    // by planarity, which only exceeds the detection bound on a canvas smaller
+    // than the seed budget.
+    const size_t raw_capacity = std::max(max_raw_triangles(W_det_, H_det_),
+                                         (size_t)max_seeds * 4);
+    cudaMalloc(&d_raw_buf_, raw_capacity * sizeof(RawTriangle));
     cudaMalloc(&d_t_grid_,       (size_t)N              * sizeof(int32_t));
     cudaMalloc(&d_csr_ptr_,      (size_t)(max_seeds + 1)* sizeof(int32_t));
     cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 8  * sizeof(int32_t));
