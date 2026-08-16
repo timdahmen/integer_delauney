@@ -716,6 +716,15 @@ Delaunay::~Delaunay()
 // run_bfs_: write new seeds already in d_grid_, BFS until stable
 // ---------------------------------------------------------------------------
 
+//: BFS passes to run between convergence checks.
+//:
+//: A pass costs about 23us of kernel; asking whether it changed anything costs
+//: a device synchronisation and two 4-byte transfers, which together run
+//: longer. Batching trades up to BFS_CHECK_EVERY - 1 passes that find nothing
+//: for one check instead of that many. Runs are 6 to 51 passes, so 8 keeps the
+//: waste under a fifth while removing seven eighths of the checks.
+static constexpr int BFS_CHECK_EVERY = 8;
+
 void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
 {
     dim3 block(16, 16);
@@ -730,18 +739,32 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
     int32_t zero = 0;
     int iters = 0;
     for (;;) {
-        ++iters;
         cudaMemcpy(d_updated_flag_, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
-        voronoi_step_kernel<<<grid_dim, block>>>(
-            d_grid_, d_tmp_, W_det_, H_det_, d_updated_flag_, d_changed_,
-            d_sx_, d_sy_);
-        cudaDeviceSynchronize();
-        std::swap(d_grid_, d_tmp_);
+
+        // The flag accumulates across the batch, so one read answers "did
+        // anything move in any of these". Asking after every pass instead cost
+        // a device synchronisation and two 4-byte transfers per pass, around a
+        // kernel of 23us -- the question was dearer than the work.
+        //
+        // No synchronise between passes: the launches are ordered on one
+        // stream, so each sees the previous one's output, and the pointer swap
+        // is on the host and takes effect at the next launch. The memcpy below
+        // blocks until the batch has drained, which is the only wait needed.
+        for (int i = 0; i < BFS_CHECK_EVERY; ++i) {
+            ++iters;
+            voronoi_step_kernel<<<grid_dim, block>>>(
+                d_grid_, d_tmp_, W_det_, H_det_, d_updated_flag_, d_changed_,
+                d_sx_, d_sy_);
+            std::swap(d_grid_, d_tmp_);
+        }
 
         int32_t flag = 0;
         cudaMemcpy(&flag, d_updated_flag_, sizeof(int32_t), cudaMemcpyDeviceToHost);
         if (!flag) break;
     }
+    // Passes performed, not passes needed: convergence is noticed at the end of
+    // a batch, so up to BFS_CHECK_EVERY - 1 of them found nothing to do. That
+    // is the cost being reported.
     if (iters_out) *iters_out = iters;
 
     if (bfs_ms_out) {
