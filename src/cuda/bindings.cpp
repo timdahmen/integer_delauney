@@ -370,6 +370,7 @@ private:
     {
         py::dict d;
         d["bfs_ms"]    = t.bfs_ms;
+        d["bfs_iters"] = t.bfs_iters;
         d["detect_ms"] = t.detect_ms;
         d["dedup_ms"]  = t.dedup_ms;
         d["assign_ms"] = t.assign_ms;

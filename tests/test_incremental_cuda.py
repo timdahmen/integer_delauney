@@ -375,7 +375,18 @@ class TestTimedInsert:
     def test_timed_timings_keys(self):
         inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
         _, _, t = inc.insert_timed(self.SEEDS)
-        assert set(t.keys()) == {"bfs_ms", "detect_ms", "dedup_ms", "assign_ms"}
+        assert set(t.keys()) == {"bfs_ms", "bfs_iters",
+                                 "detect_ms", "dedup_ms", "assign_ms"}
+
+    def test_bfs_iters_counts_full_canvas_passes(self):
+        """One BFS trip is a pass over the whole padded canvas, so the trip
+        count is what decides the cost of an insert, not the batch size."""
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        _, _, t = inc.insert_timed(self.SEEDS)
+        assert t["bfs_iters"] >= 1
+        assert t["bfs_iters"] <= W + H, (
+            "a converging BFS cannot need more trips than the canvas is wide "
+            "plus tall; more means it is filling seedless space")
 
     def test_timed_timings_non_negative(self):
         inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)

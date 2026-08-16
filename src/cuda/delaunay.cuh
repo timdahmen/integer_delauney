@@ -7,6 +7,7 @@
 
 struct InsertTimings {
     float bfs_ms    = 0.f;
+    int   bfs_iters = 0;     // BFS trip count; each trip is a full-canvas pass
     float detect_ms = 0.f;
     float dedup_ms  = 0.f;
     float assign_ms = 0.f;
@@ -149,7 +150,7 @@ private:
     void rebuild_sorted_rank_() const;
     void ensure_sorted_rank_() const;
     void ensure_csr_();
-    void run_bfs_(float* bfs_ms_out);
+    void run_bfs_(float* bfs_ms_out, int* iters_out = nullptr);
     // Topology only: detect + dedup + registry + CSR. Pixel assignment is
     // separate so it can be deferred across several inserts and run once.
     void full_topology_(float* detect_ms, float* dedup_ms);
@@ -157,7 +158,7 @@ private:
     // Registration + seed write + BFS, shared by insert() and insert_deferred().
     void apply_batch_(const std::vector<int32_t>& new_xs,
                       const std::vector<int32_t>& new_ys,
-                      float* bfs_ms_out);
+                      float* bfs_ms_out, int* iters_out = nullptr);
     // Pixel assignment over d_dirty_accum_, masked or full by measured cost.
     void assign_pending_(float* assign_ms);
     void build_reassign_mask_();

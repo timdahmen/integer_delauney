@@ -473,7 +473,7 @@ Delaunay::~Delaunay()
 // run_bfs_: write new seeds already in d_grid_, BFS until stable
 // ---------------------------------------------------------------------------
 
-void Delaunay::run_bfs_(float* bfs_ms_out)
+void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
 {
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
@@ -485,7 +485,9 @@ void Delaunay::run_bfs_(float* bfs_ms_out)
     }
 
     int32_t zero = 0;
+    int iters = 0;
     for (;;) {
+        ++iters;
         cudaMemcpy(d_updated_flag_, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
         voronoi_step_kernel<<<grid_dim, block>>>(
             d_grid_, d_tmp_, W_det_, H_det_, d_updated_flag_, d_changed_,
@@ -497,6 +499,7 @@ void Delaunay::run_bfs_(float* bfs_ms_out)
         cudaMemcpy(&flag, d_updated_flag_, sizeof(int32_t), cudaMemcpyDeviceToHost);
         if (!flag) break;
     }
+    if (iters_out) *iters_out = iters;
 
     if (bfs_ms_out) {
         cudaEventRecord(ev1);
@@ -936,7 +939,7 @@ void Delaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 void Delaunay::apply_batch_(
     const std::vector<int32_t>& new_xs,
     const std::vector<int32_t>& new_ys,
-    float* bfs_ms_out)
+    float* bfs_ms_out, int* iters_out)
 {
     int k = (int)new_xs.size();
 
@@ -1011,7 +1014,7 @@ void Delaunay::apply_batch_(
     cudaFree(d_kxs); cudaFree(d_kys); cudaFree(d_kids);
 
     // BFS
-    run_bfs_(bfs_ms_out);
+    run_bfs_(bfs_ms_out, iters_out);
 
     // Fold this insert's changes into the set awaiting assignment.
     const int N = W_det_ * H_det_;
@@ -1034,8 +1037,10 @@ void Delaunay::insert_deferred(
     bool is_first = (N_ == 0);
 
     float bfs_ms = 0.f;
-    apply_batch_(new_xs, new_ys, timings ? &bfs_ms : nullptr);
-    if (timings) timings->bfs_ms = bfs_ms;
+    int bfs_iters = 0;
+    apply_batch_(new_xs, new_ys, timings ? &bfs_ms : nullptr,
+                 timings ? &bfs_iters : nullptr);
+    if (timings) { timings->bfs_ms = bfs_ms; timings->bfs_iters = bfs_iters; }
 
     float det_ms = 0.f, dup_ms = 0.f;
     if (is_first)
