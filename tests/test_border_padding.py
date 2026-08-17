@@ -1,14 +1,13 @@
 """Tests for DEFAULT_BORDER_PADDING and the border_padding=None default.
 
-The default used to be a per-call density estimate, sqrt(area / n_seeds). It was
-removed because it estimates the wrong quantity: circumcentre excursion depends
-on triangle *shape*, and grows without limit as three points approach
-collinearity, at any seed count. On a real frame it was out by 3.5x at the tail.
+The default is a constant, not a per-call density estimate such as
+sqrt(area / n_seeds): circumcentre excursion depends on triangle *shape*, and
+grows without limit as three points approach collinearity, at any seed count.
 
-What replaces it is a constant plus a contract: a caller that samples the convex
-hull boundary at spacing s is guaranteed no triangle is missed provided
-border_padding >= s^2/8. See BORDER_PADDING_BOUND.md, and max_boundary_spacing()
-for the inverse.
+In place of a density estimate is a constant plus a contract: a caller that
+samples the convex hull boundary at spacing s is guaranteed no triangle is
+missed provided border_padding >= s^2/8. See BORDER_PADDING_BOUND.md, and
+max_boundary_spacing() for the inverse.
 
 These tests therefore check that the default is honoured consistently across the
 two paths and that 0 stays distinguishable from "unset" -- not that it takes any
@@ -58,7 +57,7 @@ class TestPaddingDefault:
     W = H = 64
 
     def test_default_is_a_constant_not_a_function_of_seed_count(self):
-        """The property the removed estimate did not have."""
+        """The property a per-call density estimate would not have."""
         sparse = _seeds(self.W, self.H, 20, seed=1)
         dense = _seeds(self.W, self.H, 400, seed=2)
         for seeds in (sparse, dense):

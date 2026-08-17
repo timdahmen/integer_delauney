@@ -54,8 +54,9 @@ def tri_set(tri_map):
 
 
 def batch_triangulate(seeds):
-    """Stateless batch pipeline. border_padding pinned to 0, as incremental
-    has no padding support and would otherwise be a different feature set."""
+    """Stateless batch pipeline. border_padding pinned to 0 for both paths:
+    comparing each path's own default padding would test padding equivalence,
+    not the topology matching this suite is about."""
     vgrid = _cu.Voronoi().compute(W, H, seeds)
     tri_map, tgrid = _cu.GridTriangulation().compute(vgrid, seeds, 0)
     return tri_set(tri_map), tgrid

@@ -44,10 +44,11 @@ class GridTriangulation:
         border_padding:
             Pixels of Voronoi canvas to add on each side before triangle
             detection, exposing border triangles whose circumcenter lies
-            outside the image.  None (the default) scales it to seed density
-            via ``delauney.DEFAULT_BORDER_PADDING``, which documents the
-            trade-off; 0 disables padding.  The output grid is always the
-            original (H, W, 3) resolution.
+            outside the image.  None (the default) uses the fixed
+            ``delauney.DEFAULT_BORDER_PADDING`` -- see its docstring for why a
+            density-based estimate would be the wrong quantity; 0 disables
+            padding.  The output grid is always the original (H, W, 3)
+            resolution.
         as_arrays:
             Return the vertex indices as an (N_tri, 3) int32 array instead of
             a {tid: (x, y, id_a, id_b, id_c)} dict, skipping the per-triangle

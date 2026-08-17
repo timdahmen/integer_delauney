@@ -6,13 +6,13 @@ Run with:
 Sections
 --------
 1. Seed generation
-2. RegularDelaunay   -- NumPy reference  (BFS only)
-3. RegularDelaunay   -- CUDA
+2. Voronoi           -- NumPy reference  (BFS only)
+3. Voronoi           -- CUDA
 4. GridTriangulation -- NumPy reference  (detection + dedup; assignment skipped
                         because T triangles x W*H pixels is billions of
                         containment tests, i.e. hours in a Python loop)
 5. GridTriangulation -- CUDA             (full pipeline)
-6. IncrementalDelaunay -- CUDA           (cold insert + warm single-seed insert)
+6. Delaunay          -- CUDA             (cold insert + warm single-seed insert)
 7. Summary table
 """
 
@@ -194,24 +194,24 @@ with timer("Generate unique positions"):
         coords.update(zip(xs, ys))
     seeds = list(coords)[:N]
 
-# -- 2. RegularDelaunay -- reference -----------------------------------------
-section("2. RegularDelaunay -- NumPy reference")
+# -- 2. Voronoi -- reference --------------------------------------------------
+section("2. Voronoi -- NumPy reference")
 with timer("compute()  (full BFS)"):
     ref_vgrid, n_iter = _ref_voronoi_timed(W, H, seeds)
 print(f"    {'BFS convergence iterations':<52} {n_iter:>10}")
 print(f"    {'Max squared L2 distance in grid':<52} {int(ref_vgrid[:,:,1].max()):>10}")
 
-# -- 3. RegularDelaunay -- CUDA ----------------------------------------------
-section("3. RegularDelaunay -- CUDA")
+# -- 3. Voronoi -- CUDA --------------------------------------------------------
+section("3. Voronoi -- CUDA")
 if cuda_available():
-    from delauney._delauney_cuda import RegularDelaunay as CudaVD
+    from delauney._delauney_cuda import Voronoi as CudaVD
     cuda_vd = CudaVD()
     _ = cuda_vd.compute(32, 32, [(0, 0), (31, 31)])   # warm-up
     with timer("compute()  (warm-up excluded)"):
         cuda_vgrid = cuda_vd.compute(W, H, seeds)
     # Seed ids may legitimately differ at ties, so only distances are compared.
     # A nonzero count is the known CUDA local-propagation shortfall, not noise
-    # -- see RegularDelaunay in reference/voronoi.py.
+    # -- see Voronoi in reference/voronoi.py.
     n_diff = int((cuda_vgrid[:, :, 1] != ref_vgrid[:, :, 1]).sum())
     print(f"    {'Distance cells differing from NumPy reference':<52} "
           f"{'%d (%.4f%%)' % (n_diff, 100.0 * n_diff / (W * H)):>10}")
@@ -251,10 +251,10 @@ else:
     print("    [CUDA extension not available -- skipped]")
     gpu_timings = None
 
-# -- 6. IncrementalDelaunay -- CUDA ------------------------------------------
-section("6. IncrementalDelaunay -- CUDA")
+# -- 6. Delaunay -- CUDA --------------------------------------------------------
+section("6. Delaunay -- CUDA")
 if cuda_available():
-    from delauney._delauney_cuda import IncrementalDelaunay as CudaInc
+    from delauney._delauney_cuda import Delaunay as CudaInc
 
     # Cold insert: all N seeds in one shot (exercises full_triangulate_)
     inc = CudaInc(W, H, N + 20)
@@ -310,8 +310,8 @@ section("7. Summary")
 COL = 46
 labels = [
     ("Generate seeds",               "Generate unique positions"),
-    ("RegularDelaunay  (NumPy ref)", "compute()  (full BFS)"),
-    ("RegularDelaunay  (CUDA)",      "compute()  (warm-up excluded)"),
+    ("Voronoi  (NumPy ref)",         "compute()  (full BFS)"),
+    ("Voronoi  (CUDA)",              "compute()  (warm-up excluded)"),
     ("GridTriang. detect (NumPy)",   "Triangle detection + deduplication"),
     ("GridTriang. full   (CUDA)",    "compute_timed()  (detection + dedup + assignment)"),
     ("Incremental cold   (CUDA)",    "insert_timed()  cold  (all seeds, full triangulate)"),

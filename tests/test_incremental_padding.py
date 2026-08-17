@@ -177,11 +177,11 @@ class TestPaddingApi:
         assert np.asarray(inc.get_voronoi_grid()).shape == (H, W, 2)
 
     def test_default_padding_is_the_library_constant(self):
-        """Not a function of max_seeds any more.
+        """Not a function of max_seeds.
 
-        The old default was a density estimate resolved against max_seeds, so a
-        mesh holding far fewer seeds than its capacity was under-padded relative
-        to what the batch path would pick for it. A constant removes that
+        A density estimate resolved against max_seeds would leave a mesh
+        holding far fewer seeds than its capacity under-padded relative to
+        what the batch path would pick for it. A constant removes that
         disagreement by construction.
         """
         inc = _cu.Delaunay(W, H, MAX_SEEDS)

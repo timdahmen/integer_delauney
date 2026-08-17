@@ -11,9 +11,7 @@ struct Seed {
 //: The batch path never exposes one -- it runs the BFS to completion before
 //: anything reads the grid -- but the incremental path detects into a partially
 //: filled grid, so consumers must tolerate it. Lives here rather than beside the
-//: triangulation code because it is a property of the Voronoi grid itself; it
-//: previously existed under three names (UNDEF_SEED, UNDEF, UNDEFINED) in three
-//: files, all meaning this.
+//: triangulation code because it is a property of the Voronoi grid itself.
 static constexpr int32_t UNDEF_SEED = -1;
 
 //: Byte value for cudaMemset when filling an int32 buffer with a -1 sentinel.

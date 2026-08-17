@@ -9,8 +9,7 @@ window of the padded diagram, so the caller's copy was pure waste.
 
 The whole claim therefore rests on that interior window being identical to an
 unpadded diagram, which is why the equivalence tests below sweep sizes,
-densities and paddings rather than checking one case. Measured at 1510x1018
-with 30000 seeds: 157.0 ms for the pair against 116.8 ms for triangulate.
+densities and paddings rather than checking one case.
 """
 import numpy as np
 import pytest

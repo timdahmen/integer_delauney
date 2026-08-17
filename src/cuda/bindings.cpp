@@ -83,13 +83,12 @@ public:
 // A negative border_padding means "use the library default" -- the int-typed
 // spelling of the reference's border_padding=None.
 //
-// This used to estimate one per call as sqrt(area / n_seeds), which is a global
-// density argument for a quantity that depends on triangle shape: circumradius
-// grows without limit as three points approach collinearity, at any seed count.
-// Measured on a real frame the estimate was out by 3.5x at the tail. A fixed
-// default is not a better estimate, it is an honest one -- the padding a seed
-// set needs is bounded only when the caller controls how densely the hull
-// boundary is sampled. See BORDER_PADDING_BOUND.md.
+// DEFAULT_BORDER_PADDING is a fixed constant rather than a per-call density
+// estimate such as sqrt(area / n_seeds): circumradius depends on triangle
+// shape, not seed count, and grows without limit as three points approach
+// collinearity, at any seed count. The padding a seed set needs is bounded
+// only when the caller controls how densely the hull boundary is sampled.
+// See BORDER_PADDING_BOUND.md.
 static int resolve_border_padding(int border_padding, int, int, int)
 {
     if (border_padding >= 0) return border_padding;
@@ -103,9 +102,9 @@ static int resolve_border_padding(int border_padding, int, int, int)
 //: per triangle; as_arrays hands back the (N_tri, 3) indices instead, skipping
 //: the per-triangle Python objects.
 //:
-//: One definition for all three entry points. The two classes carried a copy
-//: each -- semantically identical, differing only in how they wrote the vertex
-//: array -- which is the same drift risk the detection kernel already had.
+//: One definition shared by all three entry points, avoiding the same kind of
+//: drift the detection kernel guards against by sharing its rule (see
+//: triangle_detect.cuh).
 static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
                                const std::vector<int32_t>& flat_out,
                                int H, int W, bool as_arrays = false)
@@ -472,9 +471,9 @@ public:
     }
 
     // As finalise(as_arrays=True), except the (H,W,3) raster never comes back
-    // to the host: the three channels TriangulationAdapter used to slice out
-    // of it are returned as __cuda_array_interface__ views straight onto the
-    // Delaunay object's own device memory instead. Returns
+    // to the host: pixel_tids, pixel_seed_ids and outside_hull_mask are
+    // returned as __cuda_array_interface__ views straight onto the Delaunay
+    // object's own device memory instead. Returns
     // (triangle_verts, pixel_tids, pixel_seed_ids, outside_hull_mask).
     py::tuple finalise_device()
     {

@@ -10,15 +10,11 @@ __all__ = list(_CUDA_EXPORTS) + ["DEFAULT_BORDER_PADDING", "max_boundary_spacing
 #: the image, so at padding 0 they are never registered and the pixels they
 #: cover degrade to nearest-seed with no error raised.
 #:
-#: This used to be estimated per call as ``sqrt(area / n_seeds)``, on the
-#: argument that circumcentre excursion scales with mean seed spacing. That is a
-#: global density argument, and the quantity it estimates is not the one that
-#: matters: circumradius depends on triangle *shape*, and grows without limit as
-#: three points approach collinearity, at any seed count. Measured on a real
-#: 1510x1018 frame with 30694 seeds, for which the formula returned 7, the
-#: largest circumradius was 24.6 -- out by 3.5x, and worse under clustered
-#: sampling, where the density estimate is dominated by the dense bands while
-#: the triangles needing padding span the sparse gaps.
+#: A density-based estimate (e.g. sqrt(area / n_seeds)) is the wrong quantity:
+#: circumradius depends on triangle *shape*, and grows without limit as three
+#: points approach collinearity, at any seed count -- worst under clustered
+#: sampling, where density is dominated by the dense bands while the triangles
+#: needing padding span the sparse gaps.
 #:
 #: A fixed default is not a better estimate; it is an honest one. The padding a
 #: seed set actually needs is bounded only if the caller controls how densely

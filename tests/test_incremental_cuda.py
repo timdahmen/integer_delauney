@@ -47,9 +47,10 @@ PADDING = 0
 def batch_triangulate(seeds):
     """Run the stateless batch pipeline and return (tri_set, tgrid, vgrid).
 
-    border_padding is pinned to 0: Delaunay has no padding support,
-    so at the batch default these equivalence tests would compare two different
-    feature sets rather than two implementations of the same one.
+    border_padding is pinned to 0 for both paths here: comparing each path's
+    own default padding would test padding equivalence, not the topology
+    matching this suite is about. Padding equivalence has its own tests
+    (test_incremental_padding.py).
     """
     rd = _cu.Voronoi()
     vgrid = rd.compute(W, H, seeds)
@@ -460,8 +461,9 @@ class TestRandomSmoke:
 class TestGetEdges:
     """Undirected edges, deduplicated on the device.
 
-    The oracle is the triangle list this same object reports: deriving edges
-    from it in numpy is what callers did before, so the two must agree exactly.
+    The oracle is the triangle list this same object reports: a caller could
+    derive edges from it in numpy, so the device result must agree exactly
+    with that derivation.
     """
 
     @staticmethod

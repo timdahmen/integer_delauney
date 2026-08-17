@@ -24,7 +24,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.collections import LineCollection
-from delauney import RegularDelaunay, GridTriangulation
+from delauney import Voronoi, GridTriangulation
 
 rng = np.random.default_rng(RNG_SEED)
 
@@ -47,7 +47,7 @@ if CREATE_NEIGHBOURS:
 
 
 # Compute Voronoi diagram
-vgrid = RegularDelaunay().compute(W, H, seeds)   # int32 (H, W, 2)
+vgrid = Voronoi().compute(W, H, seeds)   # int32 (H, W, 2)
 
 BORDER_PADDING = 128
 

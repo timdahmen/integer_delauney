@@ -165,10 +165,7 @@ class TestCocircularAgreement:
         assert len(c) == 2, f"expected 2 triangles for a cocircular quad, got {len(c)}"
 
     def test_random_grids_agree(self, cuda_tri, ref_vd, ref_tri):
-        """Integer coordinates make cocircular quads common, so sweep for them.
-
-        Before the CUDA split was made geometric this failed on 8 of 40.
-        """
+        """Integer coordinates make cocircular quads common, so sweep for them."""
         rng = np.random.default_rng(0)
         W = H = 24
         for trial in range(40):

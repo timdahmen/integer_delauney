@@ -18,10 +18,9 @@ public:
     // border_padding < 0 uses DEFAULT_BORDER_PADDING.
     //
     // Fixed at construction, because the padded canvas is the persistent device
-    // state. That used to matter a great deal: the default was a density
-    // estimate that shrank as seeds were added, so a state below max_seeds was
-    // under-padded relative to what the batch path would pick for it. With a
-    // constant default both paths agree by construction.
+    // state, and DEFAULT_BORDER_PADDING is a constant rather than a per-call
+    // density estimate -- so this and the batch path agree by construction,
+    // regardless of how far below max_seeds the state currently sits.
     //
     // The padding a seed set needs is bounded only when the caller controls how
     // densely the convex hull boundary is sampled. See BORDER_PADDING_BOUND.md.
@@ -243,10 +242,10 @@ private:
     int32_t* d_dirty_accum_; // (H*W)   union of d_changed_ since last finalise
     int32_t* d_tile_dirty_;  // (tiles) tile-level dirty flags, mask prefilter
     int32_t* d_count_;       // (1)     dirty-pixel counter for the cost switch
-    // Scratch that used to be cudaMalloc'd and freed inside the calls that use
-    // it. All are bounded by max_seeds or the triangle bound, so they are
-    // allocated once; a cudaFree synchronises the device, which is a steep
-    // price for a buffer whose size was known at construction.
+    // Persistent scratch, allocated once here rather than cudaMalloc'd and
+    // freed per call: all are bounded by max_seeds or the triangle bound, so
+    // the size is known at construction, and a cudaFree synchronises the
+    // device -- a steep price to pay per call for a fixed-size buffer.
     int32_t* d_tri_count_;   // (1)     detection output counter
     int32_t* d_seed_stage_;  // (3 * max_seeds) staged x, y, id for an insert
     int32_t* d_remap_;       // (max triangles) old id -> new, for compaction
@@ -290,9 +289,6 @@ private:
     std::vector<uint8_t>                   h_dead_;      // parallel to above
     int                                    n_live_;      // live slot count
     std::unordered_map<uint64_t,int32_t>   h_triplet_to_tid_;
-    // (A canonical-pixel -> tid map used to live here. It was written on every
-    // registry rebuild and never read; with the 2x2 detection two triangles can
-    // share a canonical pixel anyway, so it could not have been a key.)
 
     // ---- host-side seed registry ----
     std::vector<int32_t>            h_sx_, h_sy_;

@@ -5,17 +5,15 @@
 // Voronoi seed-id grid, and where three or four distinct regions meet, the
 // block witnesses a Voronoi vertex and therefore a Delaunay triangle.
 //
-// The two used to carry separate copies of that rule, and they drifted. The
-// geometric cocircular tie-break was added to the batch copy in 0f79a7d and the
-// incremental copy kept splitting on the pixel block's anti-diagonal, so at a
-// degree-4 vertex the two paths cut the quad differently -- and because
-// different blocks around one vertex then chose different diagonals, the
-// incremental path registered both, emitting four overlapping triangles where
-// the quad admits two. It ran at 5.2% excess triangles on a real frame.
+// The rule lives here once, shared by both pipelines, rather than as separate
+// copies that could drift apart: at a degree-4 vertex the tie-break must stay
+// geometric (see detect_block_triangles below), because a purely pixel-based
+// rule can make the two paths cut the same cocircular quad differently and
+// register overlapping triangles.
 //
-// The rule lives here once so that cannot recur. What differs between the
-// callers is only how a seed id is fetched from their grid layout and whether a
-// mask applies; neither is part of the rule, so both stay in the kernels.
+// What differs between the callers is only how a seed id is fetched from
+// their grid layout and whether a mask applies; neither is part of the rule,
+// so both stay in the kernels.
 // ---------------------------------------------------------------------------
 #pragma once
 
@@ -55,9 +53,7 @@ struct RawEqual {
 //: Upper bound on raw detections for a W x H detection canvas.
 //:
 //: Each 2x2 block emits at most two triangles and there are (W-1)*(H-1) blocks,
-//: so this is exact rather than a guess. Worth stating once: the incremental
-//: path used to allocate 4 per *pixel*, which is twice this and 200 MB at a
-//: real frame size.
+//: so this is exact rather than a guess.
 __host__ __device__ inline size_t max_raw_triangles(int W, int H)
 {
     if (W < 2 || H < 2) return 0;
@@ -110,9 +106,9 @@ __device__ inline void detect_block_triangles(
     // produce overlapping triangles. This mirrors reference/triangulation.py,
     // so all three implementations cut a given quad identically.
     //
-    // Splitting on the pixel block's anti-diagonal instead, as this code once
-    // did, makes the result depend on image orientation rather than on the seed
-    // geometry: rotating the input 90 degrees could change the answer.
+    // Splitting on the pixel block's anti-diagonal instead would make the
+    // result depend on image orientation rather than on the seed geometry:
+    // rotating the input 90 degrees could change the answer.
 
     // Cyclic order around the centroid, so "diagonal" means opposite corners
     // rather than adjacent ones. Double precision and a stable sort, to match

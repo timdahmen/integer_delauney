@@ -158,9 +158,8 @@ void voronoi_step_kernel(
 // Kernel: 2x2-block triangle detection with optional mask
 //
 // The rule itself is shared with the batch path -- see triangle_detect.cuh,
-// which also records why: this file once scanned four L-shaped stencils per
-// pixel and emitted four overlapping triangles at a cocircular vertex where the
-// quad admits two.
+// which explains why: a purely pixel-based tie-break can make the two paths
+// cut a cocircular quad differently and register overlapping triangles.
 //
 // What stays here is only what genuinely differs. The grid is interleaved
 // (seed_id, distance) rather than plain seed ids, and detection can be scoped
@@ -655,9 +654,9 @@ void locate_points_kernel(const int32_t* __restrict__ qx,
 // ---------------------------------------------------------------------------
 // Kernels: mask construction
 //
-// These replace a serial host double loop over all W*H pixels that copied
-// d_changed_ down, dilated it on the CPU, and copied two masks back -- 18 MB of
-// traffic and a megapixel scan per insert, whatever the batch size.
+// All GPU-side rather than a host double loop over all W*H pixels: dilating on
+// the CPU would need d_changed_ downloaded, processed, and two masks uploaded
+// again -- every insert, whatever the batch size.
 // ---------------------------------------------------------------------------
 
 //: Tile edge for the dirty prefilter below. Small enough that a tile rarely
@@ -732,8 +731,8 @@ void build_tile_dirty_kernel(const int32_t* __restrict__ src,
 
 // Which pixels need their triangle re-assigned.
 //
-// Dilating by the uniform WINDOW_CAP, as the host version did, is far wider
-// than necessary: assign_triangles_kernel searches a window of
+// Dilating by the uniform WINDOW_CAP would be far wider than necessary:
+// assign_triangles_kernel searches a window of
 // R = min(sqrt(dist) + SLACK, CAP), which at realistic seed densities is
 // nearer 7 than 20 -- roughly nine times the area. Each pixel is therefore
 // tested against its OWN R, via a tile prefilter so the scan stays cheap.
@@ -798,11 +797,10 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     cudaMalloc(&d_sy_,           (size_t)max_seeds      * sizeof(int32_t));
     // This buffer serves two purposes and must satisfy both bounds. Detection
     // writes at most two triangles per 2x2 block over (W-1)*(H-1) blocks -- the
-    // same exact bound the batch path uses, and half the 4-per-pixel it was
-    // allocated at before, which is 200 MB at a real frame size against 100 MB.
-    // It then also holds the deduplicated triangle list, under 2n for n seeds
-    // by planarity, which only exceeds the detection bound on a canvas smaller
-    // than the seed budget.
+    // same exact bound the batch path uses. It then also holds the
+    // deduplicated triangle list, under 2n for n seeds by planarity, which
+    // only exceeds the detection bound on a canvas smaller than the seed
+    // budget.
     cudaMalloc(&d_raw_buf_, (size_t)max_seeds * 4 * sizeof(RawTriangle));
     cudaMalloc(&d_detect_buf_,
                max_raw_triangles(W_det_, H_det_) * sizeof(RawTriangle));
@@ -1301,9 +1299,9 @@ void Delaunay::assign_pending_(float* asgn_ms)
 // ---------------------------------------------------------------------------
 // Lazy rebuilds of the derived structures
 //
-// Both used to run on every insert. The CSR is read only by
-// assign_triangles_kernel and the sorted ranks only by the two output
-// builders, so a deferred round paid for neither.
+// The CSR is read only by assign_triangles_kernel and the sorted ranks only
+// by the two output builders, so a deferred round pays for neither until one
+// is actually needed.
 // ---------------------------------------------------------------------------
 
 void Delaunay::ensure_csr_()
@@ -1409,8 +1407,8 @@ void Delaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
 //: image pixel, reading the padded d_grid_/d_t_grid_ exactly as the host loop
 //: does and writing straight into the three finalise_device() buffers instead
 //: of a host vector. Also bakes in the outside-hull substitution
-//: (NO_TRIANGLE -> 0) that TriangulationAdapter used to do in NumPy, since the
-//: mask is already known at the pixel that needs it.
+//: (NO_TRIANGLE -> 0) at the pixel that needs it, since the mask is already
+//: known there and a host-side consumer would otherwise redo it in NumPy.
 __global__
 void crop_pixel_arrays_kernel(const int32_t* __restrict__ grid,
                               const int32_t* __restrict__ t_grid,
@@ -1498,10 +1496,10 @@ void Delaunay::apply_batch_(
         if (new_xs[i] < 0 || new_xs[i] >= W_ || new_ys[i] < 0 || new_ys[i] >= H_)
             throw std::invalid_argument("seed coordinate out of bounds");
 
-    // Duplicate checks, within the batch and against existing seeds. Both go
-    // through a hash set: the intra-batch check used to be O(k^2), which is
-    // invisible for the handful of seeds the tests insert and quadratic for the
-    // thousands a refinement round adds.
+    // Duplicate checks, within the batch and against existing seeds, both
+    // through a hash set: an O(k^2) pairwise check would be invisible for the
+    // handful of seeds the tests insert but quadratic for the thousands a
+    // refinement round adds.
     {
         std::unordered_set<uint64_t> batch_seen;
         batch_seen.reserve(k * 2);

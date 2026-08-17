@@ -16,7 +16,7 @@ from matplotlib.colors import hsv_to_rgb
 from matplotlib.patches import Polygon, Rectangle
 from matplotlib.collections import LineCollection
 from scipy.spatial import Voronoi
-from delauney import RegularDelaunay, GridTriangulation
+from delauney import Voronoi as DelauneyVoronoi, GridTriangulation
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 W, H     = 64, 64
@@ -72,7 +72,7 @@ hsv  = np.stack([hues, np.full(N, 0.55), np.full(N, 0.90)], axis=1)
 rgb_palette = hsv_to_rgb(hsv)   # (N, 3)
 
 # ── Discretized Voronoi: 64×64 → 2048×2048 nearest-neighbour upscale ─────────
-vgrid        = RegularDelaunay().compute(W, H, seeds)
+vgrid        = DelauneyVoronoi().compute(W, H, seeds)
 seed_id_grid = vgrid[:, :, 0]                     # (H, W)
 rgb_small    = rgb_palette[seed_id_grid]           # (H, W, 3)
 rgb_large    = np.repeat(np.repeat(rgb_small, SCALE, axis=0), SCALE, axis=1)
