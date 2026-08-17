@@ -511,8 +511,6 @@ class TestGetEdges:
         inc = self._mesh(60, seed=11)
         before = len(inc.get_edges())
         rng = np.random.default_rng(12)
-        seen = {(int(x), int(y)) for x, y in
-                np.asarray(inc.get_voronoi_grid())[:0, :0].reshape(0, 2)}  # empty
         pts = []
         used = set()
         while len(pts) < 20:

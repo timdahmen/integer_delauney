@@ -74,7 +74,6 @@ def _ref_detect_triangles(voronoi_grid: np.ndarray,
     blocking, so at a degree-4 Voronoi vertex it registers all four triples
     where GridTriangulation keeps two.  Counts are an upper bound, not a match.
     """
-    seeds_arr = np.array(seeds, dtype=np.int32)
     n_grid = voronoi_grid[:, :, 0]
 
     seen: dict[frozenset, int] = {}
@@ -243,7 +242,7 @@ if cuda_available():
     print(f"    {'Triangles found (vs detect-only upper bound)':<52} "
           f"{'%d / %d' % (len(cuda_tri_map), T):>10}")
     print()
-    print(f"    GPU sub-phase breakdown:")
+    print("    GPU sub-phase breakdown:")
     print(f"    {'  detect (find_triangle_seeds kernel)':<52} {gpu_timings['detect_ms']:>9.1f} ms")
     print(f"    {'  dedup  (thrust sort + unique)':<52} {gpu_timings['dedup_ms']:>9.1f} ms")
     print(f"    {'  assign (assign_triangles kernel)':<52} {gpu_timings['assign_ms']:>9.1f} ms")
@@ -263,7 +262,7 @@ if cuda_available():
     print(f"    {'  Seeds inserted':<52} {inc.seed_count:>10,}")
     print(f"    {'  Triangles found':<52} {len(inc_tri_map):>10,}")
     print()
-    print(f"    GPU sub-phase breakdown (cold):")
+    print("    GPU sub-phase breakdown (cold):")
     print(f"    {'  bfs    (BFS until convergence)':<52} {inc_t0['bfs_ms']:>9.1f} ms")
     print(f"    {'  detect (find_triangle_seeds kernel)':<52} {inc_t0['detect_ms']:>9.1f} ms")
     print(f"    {'  dedup  (thrust sort + unique)':<52} {inc_t0['dedup_ms']:>9.1f} ms")
@@ -298,7 +297,7 @@ if cuda_available():
     print()
     print(f"    {'insert_timed()  warm  (single seed, avg over ' + str(WARM_N) + ')':<52} {warm_wall_avg:>9.1f} ms")
     print()
-    print(f"    GPU sub-phase breakdown (warm, avg):")
+    print("    GPU sub-phase breakdown (warm, avg):")
     for k in ("bfs_ms", "detect_ms", "dedup_ms", "assign_ms"):
         label = k.replace("_ms", "").ljust(6)
         print(f"    {'  ' + label:<52} {warm_totals[k]/WARM_N:>9.1f} ms")
@@ -332,13 +331,13 @@ for display, key in labels:
         speedup = f"{ref_bfs_s / ms:.1f}x"
     print(f"    {display:<{COL}}  {ms*1000:>10.1f}ms  {speedup:>10}")
 
-print(f"\n    Complexity note:")
+print("\n    Complexity note:")
 print(f"      Voronoi BFS:      O(W x H x iters)  -- iters = {n_iter} here")
-print(f"      Tri. detection:   O(W x H x 4)      -- vectorised NumPy")
+print("      Tri. detection:   O(W x H x 4)      -- vectorised NumPy")
 print(f"      Tri. assignment:  O(W x H x T)      -- T <= {T:,} triangles")
 print(f"        Reference Python: ~{hours_est:.1f} h")
 if cuda_available() and gpu_timings is not None:
-    print(f"        CUDA kernel breakdown:")
+    print("        CUDA kernel breakdown:")
     print(f"          detect: {gpu_timings['detect_ms']:.1f} ms")
     print(f"          dedup:  {gpu_timings['dedup_ms']:.1f} ms  (Thrust sort+unique on device)")
     print(f"          assign: {gpu_timings['assign_ms']:.1f} ms")
