@@ -15,6 +15,7 @@
 // that changes a cell; the loop stops when no thread sets it.
 
 #include "voronoi.cuh"
+#include "geometry_device.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -26,23 +27,8 @@
 // Device helpers
 // ---------------------------------------------------------------------------
 
-// UNDEF_SEED comes from voronoi.cuh.
-
-// Compare two (seed_id, distance) candidates; return true if b beats a.
-// Lower distance wins; on tie, higher seed_id wins.
-//
-// Only among the candidates this cell actually sees: propagation is local and
-// this kernel advances one cell per iteration, so it can settle at a fixed
-// point that is not nearest-seed (rare, grows with seed density -- measured
-// 2/16384 pixels at 128x128 with 400 seeds, off by 1-3 in squared distance).
-// See Voronoi's docstring in reference/voronoi.py.
-__device__ __forceinline__
-bool beats(int32_t a_id, int32_t a_d, int32_t b_id, int32_t b_d)
-{
-    if (b_d < a_d) return true;
-    if (b_d == a_d && b_id > a_id) return true;
-    return false;
-}
+// UNDEF_SEED comes from voronoi.cuh; beats() from geometry_device.cuh, shared
+// with the incremental path's own BFS step.
 
 // ---------------------------------------------------------------------------
 // Voronoi step kernel

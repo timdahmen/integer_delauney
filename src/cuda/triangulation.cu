@@ -15,6 +15,7 @@
 #include "triangulation.cuh"
 #include "voronoi.cuh"
 #include "triangle_detect.cuh"
+#include "geometry_device.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -65,29 +66,8 @@ void find_triangle_seeds_kernel(
         });
 }
 
-// ---------------------------------------------------------------------------
-// Geometry helpers
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__
-float cross2d(float ox, float oy, float ax, float ay, float bx, float by)
-{
-    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
-}
-
-__device__ __forceinline__
-bool point_in_triangle(float px, float py,
-                       float ax, float ay,
-                       float bx, float by,
-                       float cx, float cy)
-{
-    float d1 = cross2d(px, py, ax, ay, bx, by);
-    float d2 = cross2d(px, py, bx, by, cx, cy);
-    float d3 = cross2d(px, py, cx, cy, ax, ay);
-    bool has_neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
-    bool has_pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
-    return !(has_neg && has_pos);
-}
+// cross2d() and point_in_triangle() are shared with the incremental path;
+// see geometry_device.cuh.
 
 // ---------------------------------------------------------------------------
 // Kernel 2: seed-position-scan triangle assignment

@@ -31,6 +31,7 @@
 
 #include "delaunay.cuh"
 #include "triangle_detect.cuh"
+#include "geometry_device.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -48,43 +49,15 @@
 #include <unordered_set>
 
 // UNDEF_SEED, RawTriangle, RawLess, RawEqual and the detection rule are shared
-// with the batch path; see triangle_detect.cuh.
+// with the batch path; see triangle_detect.cuh. beats(), cross2d() and
+// point_in_triangle() are shared with both the batch triangulation and
+// Voronoi paths; see geometry_device.cuh.
 
 //: An entry in the old->new remap for a triangle that did not survive
 //: compaction. Distinct from NO_TRIANGLE, which is what the *pixel* grid then
 //: receives for those triangles: this one says "this id is gone", the other
 //: says "no triangle covers this pixel".
 static constexpr int32_t TID_DELETED = -1;
-
-// ---------------------------------------------------------------------------
-// Device helpers
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__
-bool beats(int32_t a_id, int32_t a_d, int32_t b_id, int32_t b_d)
-{
-    if (b_d < a_d) return true;
-    if (b_d == a_d && b_id > a_id) return true;
-    return false;
-}
-
-__device__ __forceinline__
-float cross2d(float ox, float oy, float ax, float ay, float bx, float by)
-{
-    return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
-}
-
-__device__ __forceinline__
-bool point_in_triangle(float px, float py,
-                       float ax, float ay, float bx, float by, float cx, float cy)
-{
-    float d1 = cross2d(px, py, ax, ay, bx, by);
-    float d2 = cross2d(px, py, bx, by, cx, cy);
-    float d3 = cross2d(px, py, cx, cy, ax, ay);
-    bool neg = (d1 < 0.f) || (d2 < 0.f) || (d3 < 0.f);
-    bool pos = (d1 > 0.f) || (d2 > 0.f) || (d3 > 0.f);
-    return !(neg && pos);
-}
 
 // ---------------------------------------------------------------------------
 // Kernel: write new seeds into the interleaved grid
@@ -356,48 +329,6 @@ struct AboveThreshold {
     float t;
     __device__ bool operator()(float s) const { return s > t && s > 0.f; }
 };
-
-//: Take the edges clearing (min_score, tie_index), emit their midpoints.
-//:
-//: The ordering is score descending, edge index ascending on a tie, so the key
-//: is unique and exactly as many edges clear it as the caller intended.
-//:
-//: A midpoint on a cell at distance zero is already a seed and is dropped here:
-//: the Voronoi diagram is the record of what has been sampled, so no parallel
-//: list of taken positions is needed. Survivors are packed with their edge
-//: index so the collision pass that follows can keep a deterministic one.
-__global__
-void select_midpoints_kernel(const int64_t* __restrict__ keys, int n_edges,
-                             int64_t n_seeds,
-                             const int32_t* __restrict__ sx,
-                             const int32_t* __restrict__ sy,
-                             const float* __restrict__ values,
-                             const float* __restrict__ scores,
-                             float min_score, int32_t tie_index,
-                             int W_det, int H_det, int P,
-                             const int32_t* __restrict__ grid,
-                             int64_t* __restrict__ out, int32_t* __restrict__ count)
-{
-    int e = blockIdx.x * blockDim.x + threadIdx.x;
-    if (e >= n_edges) return;
-
-    const float s = scores[e];
-    if (s <= 0.f) return;
-    if (!(s > min_score || (s == min_score && e <= tie_index))) return;
-
-    int32_t a, b;
-    unpack_edge(keys[e], n_seeds, a, b);
-    // Padded coordinates throughout, like every other kernel here.
-    int mx = (int)lrint(0.5 * ((double)sx[a] + sx[b]));
-    int my = (int)lrint(0.5 * ((double)sy[a] + sy[b]));
-    mx = min(max(mx, P), W_det - 1 - P);
-    my = min(max(my, P), H_det - 1 - P);
-
-    if (grid[(my * W_det + mx) * 2 + 1] == 0) return;   // already a seed
-
-    const int64_t pixel = (int64_t)my * W_det + mx;
-    out[atomicAdd(count, 1)] = pixel * (int64_t)n_edges + e;
-}
 
 //: Clear pixels whose triangle has been retired.
 //:
