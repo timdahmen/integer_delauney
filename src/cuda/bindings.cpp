@@ -16,6 +16,8 @@
 #include "triangulation.cuh"
 #include "delaunay.cuh"
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -289,6 +291,31 @@ public:
         d["strides"] = py::none();
         d["version"] = 3;
         return d;
+    }
+
+    // A plain host numpy array with this view's contents -- for a debug/
+    // inspection consumer that cannot take a __cuda_array_interface__ (no
+    // cupy/torch dependency), not the interpolation hot path, which reads
+    // the device pointer directly instead. Same staleness check as above.
+    py::array to_host() const
+    {
+        if (mesh_->generation() != generation_)
+            throw std::runtime_error(
+                "device view is stale: the mesh was mutated after "
+                "finalise_device() produced this view");
+        if (typestr_ == "<i4") {
+            py::array_t<int32_t> out(count_);
+            cudaMemcpy(out.mutable_data(), ptr_,
+                       (size_t)count_ * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            return out;
+        }
+        if (typestr_ == "|u1") {
+            py::array_t<uint8_t> out(count_);
+            cudaMemcpy(out.mutable_data(), ptr_,
+                       (size_t)count_ * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+            return out;
+        }
+        throw std::runtime_error("to_host(): unsupported typestr '" + typestr_ + "'");
     }
 
 private:
@@ -714,7 +741,11 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def_property_readonly("__cuda_array_interface__",
              &PyDeviceArrayView::cuda_array_interface,
              "CUDA Array Interface (v3), read-only. Raises RuntimeError if the\n"
-             "owning Delaunay object has been mutated since this view was made.");
+             "owning Delaunay object has been mutated since this view was made.")
+        .def("to_host", &PyDeviceArrayView::to_host,
+             "Download this view into a plain host numpy array. Raises\n"
+             "RuntimeError under the same staleness condition as\n"
+             "__cuda_array_interface__.");
 
     py::class_<PyDelaunay>(m, "Delaunay")
         .def(py::init<int, int, int, int>(),

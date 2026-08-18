@@ -160,6 +160,54 @@ def test_stale_view_raises_after_mutation():
             view.__cuda_array_interface__
 
 
+@pytest.mark.parametrize("n_seeds", [10, 40, 150])
+def test_to_host_matches_finalise(n_seeds):
+    """to_host()'s own D2H copy against the same host reference as
+    __cuda_array_interface__ above -- the two must agree since they read the
+    same buffers, just via a different route (no cudart ctypes call needed
+    here, to_host() does its own memcpy)."""
+    rng = np.random.default_rng(n_seeds)
+    seeds = _random_seeds(rng, n_seeds)
+
+    d = Delaunay(W, H, MAX_SEEDS, -1)
+    d.insert_deferred(seeds, None)
+    verts, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
+
+    tids_host = pixel_tids.to_host()
+    sids_host = pixel_seed_ids.to_host()
+    mask_host = outside_mask.to_host()
+
+    verts_ref, sids_ref, mask_ref, tids_ref = _host_reference(seeds)
+
+    assert tids_host.dtype == np.int32
+    assert sids_host.dtype == np.int32
+    assert mask_host.dtype == np.uint8
+    np.testing.assert_array_equal(tids_host, tids_ref)
+    np.testing.assert_array_equal(sids_host, sids_ref)
+    np.testing.assert_array_equal(mask_host, mask_ref)
+
+
+def test_stale_view_to_host_raises_after_mutation():
+    """to_host()'s own staleness check, exercised the same way as the
+    __cuda_array_interface__ property's above -- it is a separate code path
+    (own generation comparison) and needs its own coverage."""
+    rng = np.random.default_rng(4)
+    seeds = _random_seeds(rng, 20)
+    d = Delaunay(W, H, MAX_SEEDS, -1)
+    d.insert_deferred(seeds, None)
+    _, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
+
+    more = _random_seeds(rng, 5)
+    more = [s for s in more if s not in set(seeds)]
+    if not more:
+        pytest.skip("random seeds collided with the original set")
+    d.insert_deferred(more, None)  # mutates -> must invalidate the views above
+
+    for view in (pixel_tids, pixel_seed_ids, outside_mask):
+        with pytest.raises(RuntimeError):
+            view.to_host()
+
+
 def test_second_finalise_device_invalidates_the_first():
     """Two finalise_device() calls in a row on the same mesh, with nothing
     inserted between them, still bump the generation -- the second call's
