@@ -23,6 +23,9 @@ void write_seeds_kernel(int32_t* grid, int32_t* changed_mask, int W,
     atomicOr(&changed_mask[ys[i] * W + xs[i]], 1);
 }
 
+//: voronoi.cu's step, plus marking each changed pixel in `changed_mask` so the
+//: topology stage (delaunay_topology.cu) knows which detection tiles to
+//: rescope to instead of rescanning the whole canvas.
 __global__
 void voronoi_step_kernel(
     const int32_t* __restrict__ src,
@@ -37,32 +40,14 @@ void voronoi_step_kernel(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
 
+    int32_t best_id, best_d;
+    bool changed = voronoi_bfs_step(x, y, W, H, src, seed_xs, seed_ys, best_id, best_d);
+
     int base = (y * W + x) * 2;
-    int32_t cur_id = src[base], cur_d = src[base + 1];
-    int32_t best_id = cur_id, best_d = cur_d;
-
-    const int dx[4] = {-1, 1,  0, 0};
-    const int dy[4] = { 0, 0, -1, 1};
-    for (int k = 0; k < 4; ++k) {
-        int nx = x + dx[k], ny = y + dy[k];
-        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
-        int nb = (ny * W + nx) * 2;
-        int32_t n_id = src[nb];
-        if (n_id == UNDEF_SEED) continue;
-        // Recomputed from the neighbour's owning seed, never accumulated along
-        // the BFS path -- that would give a Manhattan metric.
-        int32_t sdx = x - seed_xs[n_id];
-        int32_t sdy = y - seed_ys[n_id];
-        int32_t n_d = sdx * sdx + sdy * sdy;
-        if (best_id == UNDEF_SEED || beats(best_id, best_d, n_id, n_d)) {
-            best_id = n_id; best_d = n_d;
-        }
-    }
-
     dst[base]     = best_id;
     dst[base + 1] = best_d;
 
-    if (best_id != cur_id || best_d != cur_d) {
+    if (changed) {
         atomicOr(updated_flag, 1);
         atomicOr(&changed_mask[y * W + x], 1);
     }

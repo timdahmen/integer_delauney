@@ -23,17 +23,10 @@
 #include <stdexcept>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// Device helpers
-// ---------------------------------------------------------------------------
-
-// UNDEF_SEED comes from voronoi.cuh; beats() from geometry_device.cuh, shared
-// with the incremental path's own BFS step.
-
-// ---------------------------------------------------------------------------
-// Voronoi step kernel
-// ---------------------------------------------------------------------------
-
+//: One synchronous BFS pass over the whole canvas: every pixel takes the best
+//: (seed_id, distance) among itself and its 4 neighbours (voronoi_bfs_step,
+//: geometry_device.cuh), and any pixel that changed sets `updated_flag` so
+//: the host knows to loop again.
 __global__
 void voronoi_step_kernel(
     const int32_t* __restrict__ src,
@@ -47,43 +40,14 @@ void voronoi_step_kernel(
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
 
+    int32_t best_id, best_d;
+    bool changed = voronoi_bfs_step(x, y, W, H, src, seed_xs, seed_ys, best_id, best_d);
+
     int base = (y * W + x) * 2;
-    int32_t cur_id  = src[base];
-    int32_t cur_d   = src[base + 1];
-
-    int32_t best_id = cur_id;
-    int32_t best_d  = cur_d;
-
-    const int dx[4] = {-1, 1, 0, 0};
-    const int dy[4] = { 0, 0,-1, 1};
-
-    for (int k = 0; k < 4; ++k) {
-        int nx = x + dx[k];
-        int ny = y + dy[k];
-        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
-
-        int nb = (ny * W + nx) * 2;
-        int32_t n_id = src[nb];
-        if (n_id == UNDEF_SEED) continue;
-
-        // Recomputed from the seed position, never accumulated through
-        // neighbours -- that would give a Manhattan metric.
-        int32_t ddx = x - seed_xs[n_id];
-        int32_t ddy = y - seed_ys[n_id];
-        int32_t n_d = ddx * ddx + ddy * ddy;
-
-        if (best_id == UNDEF_SEED || beats(best_id, best_d, n_id, n_d)) {
-            best_id = n_id;
-            best_d  = n_d;
-        }
-    }
-
     dst[base]     = best_id;
     dst[base + 1] = best_d;
 
-    if (best_id != cur_id || best_d != cur_d) {
-        atomicOr(updated_flag, 1);
-    }
+    if (changed) atomicOr(updated_flag, 1);
 }
 
 // ---------------------------------------------------------------------------
