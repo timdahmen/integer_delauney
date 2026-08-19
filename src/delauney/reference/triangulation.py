@@ -157,37 +157,30 @@ class GridTriangulation:
                 triangle_map[next_id] = (gx - P, gy - P, a, b, c)
                 next_id += 1
 
+        def _scan_lshape(a: np.ndarray, b: np.ndarray, c: np.ndarray,
+                        gx_offset: int, gy_offset: int) -> None:
+            """Register a triangle at every position where a, b, c differ pairwise.
+
+            The four call sites below differ only in which three corners of the
+            2x2 block they compare and where the detection pixel lands -- the
+            comparison and registration are the same at each.
+            """
+            mask = (a != b) & (a != c) & (b != c)
+            for ry, rx in zip(*np.where(mask)):
+                _register(rx + gx_offset, ry + gy_offset,
+                          int(a[ry, rx]), int(b[ry, rx]), int(c[ry, rx]))
+
         # left+down: cell=(x,y), left=(x-1,y), down=(x,y+1)
-        s_cell = n_grid[:-1, 1:]
-        s_left = n_grid[:-1, :-1]
-        s_down = n_grid[1:, 1:]
-        mask = (s_cell != s_left) & (s_cell != s_down) & (s_left != s_down)
-        for ry, rx in zip(*np.where(mask)):
-            _register(rx + 1, ry, int(s_left[ry, rx]), int(s_cell[ry, rx]), int(s_down[ry, rx]))
+        _scan_lshape(n_grid[:-1, :-1], n_grid[:-1, 1:], n_grid[1:, 1:], 1, 0)
 
         # right+down: cell=(x,y), right=(x+1,y), down=(x,y+1)
-        s_cell = n_grid[:-1, :-1]
-        s_right = n_grid[:-1, 1:]
-        s_down = n_grid[1:, :-1]
-        mask = (s_cell != s_right) & (s_cell != s_down) & (s_right != s_down)
-        for ry, rx in zip(*np.where(mask)):
-            _register(rx, ry, int(s_cell[ry, rx]), int(s_right[ry, rx]), int(s_down[ry, rx]))
+        _scan_lshape(n_grid[:-1, :-1], n_grid[:-1, 1:], n_grid[1:, :-1], 0, 0)
 
         # right+up: cell=(x,y), right=(x+1,y), up=(x,y-1)
-        s_cell = n_grid[1:, :-1]
-        s_right = n_grid[1:, 1:]
-        s_up = n_grid[:-1, :-1]
-        mask = (s_cell != s_right) & (s_cell != s_up) & (s_right != s_up)
-        for ry, rx in zip(*np.where(mask)):
-            _register(rx, ry + 1, int(s_cell[ry, rx]), int(s_right[ry, rx]), int(s_up[ry, rx]))
+        _scan_lshape(n_grid[1:, :-1], n_grid[1:, 1:], n_grid[:-1, :-1], 0, 1)
 
         # left+up: cell=(x,y), left=(x-1,y), up=(x,y-1)
-        s_cell = n_grid[1:, 1:]
-        s_left = n_grid[1:, :-1]
-        s_up = n_grid[:-1, 1:]
-        mask = (s_cell != s_left) & (s_cell != s_up) & (s_left != s_up)
-        for ry, rx in zip(*np.where(mask)):
-            _register(rx + 1, ry + 1, int(s_left[ry, rx]), int(s_cell[ry, rx]), int(s_up[ry, rx]))
+        _scan_lshape(n_grid[1:, :-1], n_grid[1:, 1:], n_grid[:-1, 1:], 1, 1)
 
         # Assign each cell by testing its integer coordinate (see class
         # docstring).  Every triangle is tested, not just those sharing the
