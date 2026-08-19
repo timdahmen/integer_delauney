@@ -16,6 +16,8 @@
 #include "voronoi.cuh"
 #include "triangle_detect.cuh"
 #include "geometry_device.cuh"
+#include "triangle_csr.cuh"
+#include "phase_timer.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -40,6 +42,9 @@
 // Kernel 1: detect triangle seeds via 2x2 block scan
 // ---------------------------------------------------------------------------
 
+//: Detect the raw (pre-dedup) triangles a 2x2 block scan of the detection grid
+//: witnesses. One thread per block position; see detect_block_triangles for
+//: the rule and the file header above for the phase this belongs to.
 __global__
 void find_triangle_seeds_kernel(
     const int32_t* __restrict__ n_grid,
@@ -88,7 +93,8 @@ void find_triangle_seeds_kernel(
 // density, not total N.
 // ---------------------------------------------------------------------------
 
-static constexpr int WINDOW_SLACK = 3;    // extra radius beyond max_side
+static constexpr int WINDOW_SLACK = 3;      // extra radius beyond max_side
+static constexpr int MIN_WINDOW_CAP = 20;   // floor, so tiny triangles still get a searchable window
 
 __global__
 void assign_triangles_kernel(
@@ -153,20 +159,9 @@ void cuda_compute_triangulation(
     const int H_det = H + 2 * P;
     const int N_det = W_det * H_det;
 
-    auto make_event = [](cudaEvent_t* e) { cudaEventCreate(e); };
-    auto record     = [](cudaEvent_t e)  { cudaEventRecord(e); };
-    auto elapsed_ms = [](cudaEvent_t a, cudaEvent_t b) -> float {
-        cudaEventSynchronize(b);
-        float ms = 0.f;
-        cudaEventElapsedTime(&ms, a, b);
-        return ms;
-    };
-
-    cudaEvent_t ev0, ev1, ev2, ev3, ev4, ev5;
-    if (timings) {
-        make_event(&ev0); make_event(&ev1); make_event(&ev2);
-        make_event(&ev3); make_event(&ev4); make_event(&ev5);
-    }
+    // Marks 0/1 bound detect, 2/3 dedup, 4/5 assign -- see the timings block
+    // near the end of this function.
+    PhaseTimer<6> timer(timings != nullptr);
 
     // -----------------------------------------------------------------------
     // Build h_n: seed_id channel for the detection grid.
@@ -240,7 +235,7 @@ void cuda_compute_triangulation(
     cudaMalloc(&d_counter, sizeof(int32_t));
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
-    if (timings) record(ev0);
+    timer.mark(0);
 
     find_triangle_seeds_kernel<<<grid_det, block>>>(
         d_n, W_det, H_det, d_sx, d_sy, d_raw, d_counter);
@@ -250,7 +245,7 @@ void cuda_compute_triangulation(
     cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
     cudaFree(d_counter);
 
-    if (timings) record(ev1);
+    timer.mark(1);
 
     // -----------------------------------------------------------------------
     // Dedup: on device with Thrust sort + unique
@@ -258,13 +253,13 @@ void cuda_compute_triangulation(
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
 
-    if (timings) record(ev2);
+    timer.mark(2);
 
     thrust::sort(d_ptr, d_ptr + raw_count, RawLess{});
     auto new_end   = thrust::unique(d_ptr, d_ptr + raw_count, RawEqual{});
     int N_triangles = (int)(new_end - d_ptr);
 
-    if (timings) record(ev3);
+    timer.mark(3);
 
     // Copy deduplicated entries to host.
     // Shift detection pixel (x,y) back from padded space to original space;
@@ -281,31 +276,12 @@ void cuda_compute_triangulation(
 
     // -----------------------------------------------------------------------
     // Build CSR: seed → triangle list  (host, then upload)
-    //
-    // csr_ptr[s]   = start index in csr_idx for seed s
-    // csr_ptr[s+1] = end   index
-    // csr_idx[i]   = triangle ID
     // -----------------------------------------------------------------------
 
-    std::vector<int32_t> h_csr_ptr(N_seeds + 1, 0);
-    for (int tid = 0; tid < N_triangles; ++tid) {
-        h_csr_ptr[h_dedup[tid].orig_a + 1]++;
-        h_csr_ptr[h_dedup[tid].orig_b + 1]++;
-        h_csr_ptr[h_dedup[tid].orig_c + 1]++;
-    }
-    for (int s = 1; s <= N_seeds; ++s)
-        h_csr_ptr[s] += h_csr_ptr[s - 1];
-
-    const int csr_size = h_csr_ptr[N_seeds];  // == 3 * N_triangles
-    std::vector<int32_t> h_csr_idx(csr_size);
-    std::vector<int32_t> fill(N_seeds, 0);
-
-    for (int tid = 0; tid < N_triangles; ++tid) {
-        for (int32_t s : {h_dedup[tid].orig_a, h_dedup[tid].orig_b, h_dedup[tid].orig_c}) {
-            h_csr_idx[h_csr_ptr[s] + fill[s]] = tid;
-            fill[s]++;
-        }
-    }
+    std::vector<int32_t> h_csr_ptr, h_csr_idx;
+    build_seed_triangle_csr(h_dedup, N_seeds, [](int) { return false; },
+                            h_csr_ptr, h_csr_idx);
+    const int csr_size = (int)h_csr_idx.size();  // == 3 * N_triangles
 
     int32_t *d_csr_ptr = nullptr, *d_csr_idx = nullptr;
     cudaMalloc(&d_csr_ptr, (N_seeds + 1) * sizeof(int32_t));
@@ -324,7 +300,7 @@ void cuda_compute_triangulation(
     int32_t* d_t = nullptr;
     cudaMalloc(&d_t, N * sizeof(int32_t));
 
-    if (timings) record(ev4);
+    timer.mark(4);
 
     int max_side = 0;
     for (int tid = 0; tid < N_triangles; ++tid) {
@@ -339,7 +315,7 @@ void cuda_compute_triangulation(
         int s3 = l2(r.orig_b, r.orig_c);
         max_side = max(max_side, max(s1, max(s2, s3)));
     }
-    const int window_cap = max(20, max_side + WINDOW_SLACK);
+    const int window_cap = max(MIN_WINDOW_CAP, max_side + WINDOW_SLACK);
 
     if (N_triangles > 0) {
         assign_triangles_kernel<<<grid_out, block>>>(
@@ -352,7 +328,7 @@ void cuda_compute_triangulation(
         cudaMemset(d_t, -1, N * sizeof(int32_t));
     }
 
-    if (timings) record(ev5);
+    timer.mark(5);
 
     // -----------------------------------------------------------------------
     // Output: build the (H * W * 3) grid and fill timings
@@ -385,11 +361,9 @@ void cuda_compute_triangulation(
     }
 
     if (timings) {
-        timings->detect_ms = elapsed_ms(ev0, ev1);
-        timings->dedup_ms  = elapsed_ms(ev2, ev3);
-        timings->assign_ms = elapsed_ms(ev4, ev5);
-        cudaEventDestroy(ev0); cudaEventDestroy(ev1); cudaEventDestroy(ev2);
-        cudaEventDestroy(ev3); cudaEventDestroy(ev4); cudaEventDestroy(ev5);
+        timings->detect_ms = timer.elapsed_ms(0, 1);
+        timings->dedup_ms  = timer.elapsed_ms(2, 3);
+        timings->assign_ms = timer.elapsed_ms(4, 5);
     }
 
     cudaFree(d_raw);

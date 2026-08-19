@@ -10,6 +10,8 @@
 // rationale on both counts.
 #include "delaunay.cuh"
 #include "triangle_detect.cuh"
+#include "triangle_csr.cuh"
+#include "phase_timer.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -231,34 +233,16 @@ void Delaunay::compact_registry_()
 
 void Delaunay::rebuild_csr_and_upload_()
 {
-    int N_tri = (int)h_triangles_.size();
-    std::vector<int32_t> h_csr_ptr(N_ + 1, 0);
-    // Retired slots are skipped throughout: assign_triangles_kernel reaches a
-    // triangle only through this index, so leaving them out is what keeps a
-    // dead slot from ever being tested against a pixel.
-    for (int tid = 0; tid < N_tri; ++tid) {
-        if (h_dead_[tid]) continue;
-        const auto& t = h_triangles_[tid];
-        h_csr_ptr[t.orig_a + 1]++;
-        h_csr_ptr[t.orig_b + 1]++;
-        h_csr_ptr[t.orig_c + 1]++;
-    }
-    for (int s = 1; s <= N_; ++s) h_csr_ptr[s] += h_csr_ptr[s-1];
+    // Retired slots are skipped: assign_triangles_kernel reaches a triangle
+    // only through this index, so leaving them out is what keeps a dead slot
+    // from ever being tested against a pixel.
+    std::vector<int32_t> h_csr_ptr, h_csr_idx;
+    build_seed_triangle_csr(h_triangles_, N_,
+        [this](int tid) { return h_dead_[tid] != 0; },
+        h_csr_ptr, h_csr_idx);
 
-    int csr_size = h_csr_ptr[N_];
-    std::vector<int32_t> h_csr_idx(csr_size);
-    std::vector<int32_t> fill(N_, 0);
-    for (int tid = 0; tid < N_tri; ++tid) {
-        if (h_dead_[tid]) continue;
-        for (int32_t s : {h_triangles_[tid].orig_a,
-                          h_triangles_[tid].orig_b,
-                          h_triangles_[tid].orig_c}) {
-            h_csr_idx[h_csr_ptr[s] + fill[s]] = tid;
-            fill[s]++;
-        }
-    }
     cudaMemcpy(d_csr_ptr_, h_csr_ptr.data(), (N_+1)*sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_csr_idx_, h_csr_idx.data(),  csr_size*sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_csr_idx_, h_csr_idx.data(), h_csr_idx.size()*sizeof(int32_t), cudaMemcpyHostToDevice);
 }
 
 // ---------------------------------------------------------------------------
@@ -266,37 +250,9 @@ void Delaunay::rebuild_csr_and_upload_()
 // identically, aside from the mask they scope detection to.
 // ---------------------------------------------------------------------------
 
-//: Up to two independently gated event intervals, active only when a caller
-//: asks to be timed. full_topology_/partial_topology_ report a detect and a
-//: dedup phase this way; run_bfs_/assign_pending_ use a single interval of
-//: their own, being simple enough not to need this.
-struct DualPhaseTimer {
-    cudaEvent_t e0{}, e1{}, e2{}, e3{};
-    bool active;
-    explicit DualPhaseTimer(bool active_) : active(active_)
-    {
-        if (active) { cudaEventCreate(&e0); cudaEventCreate(&e1);
-                      cudaEventCreate(&e2); cudaEventCreate(&e3); }
-    }
-    void mark_phase1_start() { if (active) cudaEventRecord(e0); }
-    void mark_phase1_end()   { if (active) cudaEventRecord(e1); }
-    void mark_phase2_start() { if (active) cudaEventRecord(e2); }
-    void mark_phase2_end()   { if (active) cudaEventRecord(e3); }
-    void finish(float* phase1_ms, float* phase2_ms)
-    {
-        if (!active) return;
-        cudaEventSynchronize(e1);
-        cudaEventElapsedTime(phase1_ms, e0, e1);
-        cudaEventSynchronize(e3);
-        cudaEventElapsedTime(phase2_ms, e2, e3);
-        cudaEventDestroy(e0); cudaEventDestroy(e1);
-        cudaEventDestroy(e2); cudaEventDestroy(e3);
-    }
-};
-
 int Delaunay::detect_and_dedup_(const int32_t* mask, float* detect_ms, float* dedup_ms)
 {
-    DualPhaseTimer timer(detect_ms != nullptr);
+    PhaseTimer<4> timer(detect_ms != nullptr);
 
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
@@ -305,21 +261,22 @@ int Delaunay::detect_and_dedup_(const int32_t* mask, float* detect_ms, float* de
     int32_t* d_counter = d_tri_count_;
     cudaMemset(d_counter, 0, sizeof(int32_t));
 
-    timer.mark_phase1_start();
+    timer.mark(0);
     find_triangle_seeds_kernel<<<grid_dim, block>>>(
         d_grid_, W_det_, H_det_, d_sx_, d_sy_, d_raw, d_counter, mask);
     cudaDeviceSynchronize();
     int32_t raw_count = 0;
     cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    timer.mark_phase1_end();
+    timer.mark(1);
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
-    timer.mark_phase2_start();
+    timer.mark(2);
     thrust::sort(d_ptr, d_ptr + raw_count, RawLess{});
     auto new_end = thrust::unique(d_ptr, d_ptr + raw_count, RawEqual{});
-    timer.mark_phase2_end();
+    timer.mark(3);
 
-    timer.finish(detect_ms, dedup_ms);
+    if (detect_ms) *detect_ms = timer.elapsed_ms(0, 1);
+    if (dedup_ms)  *dedup_ms  = timer.elapsed_ms(2, 3);
     return (int)(new_end - d_ptr);
 }
 

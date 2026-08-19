@@ -4,6 +4,7 @@
 // -- see delaunay.cu's file comment for why it is decoupled from topology.
 #include "delaunay.cuh"
 #include "delaunay_locate.cuh"
+#include "phase_timer.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -149,8 +150,8 @@ void Delaunay::assign_pending_(float* asgn_ms)
     const int dirty = count_mask_();
     const bool use_mask = dirty < (int)(ASSIGN_FULL_FRACTION * (float)N);
 
-    cudaEvent_t e0, e1;
-    if (asgn_ms) { cudaEventCreate(&e0); cudaEventCreate(&e1); cudaEventRecord(e0); }
+    PhaseTimer<2> timer(asgn_ms != nullptr);
+    timer.mark(0);
 
     assign_triangles_kernel<<<grid_dim, block>>>(
         d_t_grid_, W_det_, H_det_, d_grid_,
@@ -159,9 +160,6 @@ void Delaunay::assign_pending_(float* asgn_ms)
         use_mask ? d_mask_ : nullptr);
     cudaDeviceSynchronize();
 
-    if (asgn_ms) {
-        cudaEventRecord(e1); cudaEventSynchronize(e1);
-        cudaEventElapsedTime(asgn_ms, e0, e1);
-        cudaEventDestroy(e0); cudaEventDestroy(e1);
-    }
+    timer.mark(1);
+    if (asgn_ms) *asgn_ms = timer.elapsed_ms(0, 1);
 }

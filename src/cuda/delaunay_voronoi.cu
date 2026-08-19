@@ -3,6 +3,7 @@
 #include "delaunay.cuh"
 #include "voronoi.cuh"           // UNDEF_SEED
 #include "geometry_device.cuh"   // beats
+#include "phase_timer.cuh"
 
 #include <cuda_runtime.h>
 #include <utility>
@@ -81,11 +82,8 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
 
-    cudaEvent_t ev0 = nullptr, ev1 = nullptr;
-    if (bfs_ms_out) {
-        cudaEventCreate(&ev0); cudaEventCreate(&ev1);
-        cudaEventRecord(ev0);
-    }
+    PhaseTimer<2> timer(bfs_ms_out != nullptr);
+    timer.mark(0);
 
     int32_t zero = 0;
     int iters = 0;
@@ -118,10 +116,6 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
     // is the cost being reported.
     if (iters_out) *iters_out = iters;
 
-    if (bfs_ms_out) {
-        cudaEventRecord(ev1);
-        cudaEventSynchronize(ev1);
-        cudaEventElapsedTime(bfs_ms_out, ev0, ev1);
-        cudaEventDestroy(ev0); cudaEventDestroy(ev1);
-    }
+    timer.mark(1);
+    if (bfs_ms_out) *bfs_ms_out = timer.elapsed_ms(0, 1);
 }
