@@ -1,0 +1,8 @@
+TODO
+
+- voronoi.cu: cuda_compute_voronoi() allocates and frees its device buffers
+  (d_a, d_b, d_flag, d_sx, d_sy) on every call, unlike the incremental
+  Delaunay class, which pre-allocates persistent buffers once and reuses
+  them for the object's lifetime. Not a bug, but an unflagged asymmetry
+  in cost model between the batch and incremental APIs -- worth either
+  documenting as a deliberate tradeoff or reworking to match.

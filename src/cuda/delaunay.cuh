@@ -216,54 +216,57 @@ private:
     int P_, W_det_, H_det_;
 
     // ---- persistent device buffers, all sized on the padded canvas ----
-    int32_t* d_grid_;        // (H*W*2) Voronoi: interleaved (seed_id, distance)
-    int32_t* d_tmp_;         // (H*W*2) BFS ping-pong
-    int32_t* d_changed_;     // (H*W)   cells updated during BFS (accumulated)
-    int32_t* d_sx_;          // (max_seeds) seed x
-    int32_t* d_sy_;          // (max_seeds) seed y
+    // Default-initialised to null so a mid-construction cudaMalloc failure
+    // (see the constructor) can safely free whatever was allocated before it
+    // -- cudaFree(nullptr) is a documented no-op, an uninitialised pointer is not.
+    int32_t* d_grid_ = nullptr;        // (H*W*2) Voronoi: interleaved (seed_id, distance)
+    int32_t* d_tmp_ = nullptr;         // (H*W*2) BFS ping-pong
+    int32_t* d_changed_ = nullptr;     // (H*W)   cells updated during BFS (accumulated)
+    int32_t* d_sx_ = nullptr;          // (max_seeds) seed x
+    int32_t* d_sy_ = nullptr;          // (max_seeds) seed y
     // The persistent triangle list, kept in step with h_triangles_.
-    void*    d_raw_buf_;
+    void*    d_raw_buf_ = nullptr;
     // Detection scratch, written from index 0 on every detect. Separate from
     // the list above because detection would otherwise overwrite it, which is
     // only survivable if the whole list is re-uploaded afterwards -- exactly
     // the O(total triangles) work per insert this design removes.
-    void*    d_detect_buf_;  // see max_raw_triangles()
+    void*    d_detect_buf_ = nullptr;  // see max_raw_triangles()
     // (3 * max triangles) packed undirected edge keys for get_edges(). Sized
     // like d_stale_, off the planarity bound of under 2n triangles for n seeds.
-    void*    d_edge_keys_;
-    int32_t* d_t_grid_;      // (H*W)   triangle_id per pixel
+    void*    d_edge_keys_ = nullptr;
+    int32_t* d_t_grid_ = nullptr;      // (H*W)   triangle_id per pixel
     // ---- device-resident finalise_device() outputs, see the header above ----
-    int32_t* d_sorted_rank_;    // (max_seeds) device mirror of h_sorted_rank_
-    int32_t* d_pixel_tids_;     // (H*W) triangle id per pixel, NO_TRIANGLE -> 0
-    int32_t* d_pixel_seed_ids_; // (H*W) nearest seed id per pixel, sorted numbering
-    uint8_t* d_outside_mask_;   // (H*W) 1 where the pixel has no containing triangle
+    int32_t* d_sorted_rank_ = nullptr;    // (max_seeds) device mirror of h_sorted_rank_
+    int32_t* d_pixel_tids_ = nullptr;     // (H*W) triangle id per pixel, NO_TRIANGLE -> 0
+    int32_t* d_pixel_seed_ids_ = nullptr; // (H*W) nearest seed id per pixel, sorted numbering
+    uint8_t* d_outside_mask_ = nullptr;   // (H*W) 1 where the pixel has no containing triangle
     uint64_t generation_;       // see generation() above
-    int32_t* d_csr_ptr_;     // (max_seeds+1) CSR row starts
-    int32_t* d_csr_idx_;     // (max_seeds*8) CSR triangle IDs
-    int32_t* d_updated_flag_;// (1)     BFS convergence flag
-    int32_t* d_mask_;        // (H*W)   reused for border / reassign masks
+    int32_t* d_csr_ptr_ = nullptr;     // (max_seeds+1) CSR row starts
+    int32_t* d_csr_idx_ = nullptr;     // (max_seeds*8) CSR triangle IDs
+    int32_t* d_updated_flag_ = nullptr;// (1)     BFS convergence flag
+    int32_t* d_mask_ = nullptr;        // (H*W)   reused for border / reassign masks
     // Changes since the last finalise, as opposed to d_changed_, which holds
     // only the current insert's.  Detection is scoped by the latter so a
     // deferred round does not re-detect earlier rounds' regions; assignment is
     // scoped by the former because it has not run for any of them yet.
-    int32_t* d_dirty_accum_; // (H*W)   union of d_changed_ since last finalise
-    int32_t* d_tile_dirty_;  // (tiles) tile-level dirty flags, mask prefilter
-    int32_t* d_count_;       // (1)     dirty-pixel counter for the cost switch
+    int32_t* d_dirty_accum_ = nullptr; // (H*W)   union of d_changed_ since last finalise
+    int32_t* d_tile_dirty_ = nullptr;  // (tiles) tile-level dirty flags, mask prefilter
+    int32_t* d_count_ = nullptr;       // (1)     dirty-pixel counter for the cost switch
     // Persistent scratch, allocated once here rather than cudaMalloc'd and
     // freed per call: all are bounded by max_seeds or the triangle bound, so
     // the size is known at construction, and a cudaFree synchronises the
     // device -- a steep price to pay per call for a fixed-size buffer.
-    int32_t* d_tri_count_;   // (1)     detection output counter
-    int32_t* d_seed_stage_;  // (3 * max_seeds) staged x, y, id for an insert
-    int32_t* d_remap_;       // (max triangles) old id -> new, for compaction
-    int32_t* d_edge_out_;    // (2 * 3 * max triangles) unpacked edge pairs
-    uint8_t* d_stale_;       // (max triangles) per-triangle invalidation flags
-    uint8_t* d_dead_;        // (max triangles) retired-slot flags, mirrors h_dead_
-    float*   d_values_;      // (max_seeds) scalar field, one per seed
-    uint64_t* d_score_keys_; // (3 * max triangles) packed (score, edge index)
-    float*   d_scores_;      // (3 * max triangles) one per edge
-    int64_t* d_mid_keys_;    // (max_seeds) packed midpoint pixel + edge index
-    int32_t* d_mid_count_;   // (1)
+    int32_t* d_tri_count_ = nullptr;   // (1)     detection output counter
+    int32_t* d_seed_stage_ = nullptr;  // (3 * max_seeds) staged x, y, id for an insert
+    int32_t* d_remap_ = nullptr;       // (max triangles) old id -> new, for compaction
+    int32_t* d_edge_out_ = nullptr;    // (2 * 3 * max triangles) unpacked edge pairs
+    uint8_t* d_stale_ = nullptr;       // (max triangles) per-triangle invalidation flags
+    uint8_t* d_dead_ = nullptr;        // (max triangles) retired-slot flags, mirrors h_dead_
+    float*   d_values_ = nullptr;      // (max_seeds) scalar field, one per seed
+    uint64_t* d_score_keys_ = nullptr; // (3 * max triangles) packed (score, edge index)
+    float*   d_scores_ = nullptr;      // (3 * max triangles) one per edge
+    int64_t* d_mid_keys_ = nullptr;    // (max_seeds) packed midpoint pixel + edge index
+    int32_t* d_mid_count_ = nullptr;   // (1)
     int      tiles_x_, tiles_y_;
     bool     pending_;       // deferred inserts awaiting a finalise
     // Derived structures whose only consumers run at assignment or output
@@ -313,6 +316,12 @@ private:
     mutable std::vector<int32_t>    h_sorted_rank_;
 
     // ---- private helpers ----
+    // Frees every buffer above via CUDA_CHECK_NOTHROW and is safe to call on a
+    // partially-populated set (unallocated members are still null, and
+    // cudaFree(nullptr) is a no-op). Shared by the destructor and by the
+    // constructor's catch block, so a cudaMalloc failure partway through
+    // construction frees what already succeeded instead of leaking it.
+    void free_device_buffers_() noexcept;
     void rebuild_sorted_rank_() const;
     void ensure_sorted_rank_() const;
     void ensure_csr_();

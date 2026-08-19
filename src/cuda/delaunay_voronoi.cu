@@ -4,6 +4,7 @@
 #include "voronoi.cuh"           // UNDEF_SEED
 #include "geometry_device.cuh"   // beats
 #include "phase_timer.cuh"
+#include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
 #include <utility>
@@ -73,7 +74,7 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
     int32_t zero = 0;
     int iters = 0;
     for (;;) {
-        cudaMemcpy(d_updated_flag_, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_updated_flag_, &zero, sizeof(int32_t), cudaMemcpyHostToDevice));
 
         // The flag accumulates across the batch, so one read answers "did
         // anything move in any of these". Asking after every pass instead cost
@@ -89,11 +90,12 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
             voronoi_step_kernel<<<grid_dim, block>>>(
                 d_grid_, d_tmp_, W_det_, H_det_, d_updated_flag_, d_changed_,
                 d_sx_, d_sy_);
+            CUDA_CHECK_LAST_ERROR();
             std::swap(d_grid_, d_tmp_);
         }
 
         int32_t flag = 0;
-        cudaMemcpy(&flag, d_updated_flag_, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(&flag, d_updated_flag_, sizeof(int32_t), cudaMemcpyDeviceToHost));
         if (!flag) break;
     }
     // Passes performed, not passes needed: convergence is noticed at the end of

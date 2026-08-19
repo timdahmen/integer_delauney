@@ -5,6 +5,8 @@
 // is cheaper than reading the answers back out of a full assignment.
 #include "delaunay.cuh"
 #include "delaunay_locate.cuh"
+#include "cuda_check.cuh"
+#include "device_buffer.cuh"
 
 #include <cuda_runtime.h>
 
@@ -157,33 +159,30 @@ void Delaunay::in_circumsphere(const std::vector<int32_t>& qx,
     int32_t* d_qy = d_seed_stage_ + max_seeds_;
     const int chunk = max_seeds_;
 
-    double*  d_qt = nullptr;
-    uint8_t* d_m  = nullptr;
-    int32_t* d_t  = nullptr;
     const int cap = std::min(n, chunk);
-    cudaMalloc(&d_qt, (size_t)cap * sizeof(double));
-    cudaMalloc(&d_m,  (size_t)cap * sizeof(uint8_t));
-    cudaMalloc(&d_t,  (size_t)cap * sizeof(int32_t));
+    DeviceBuffer<double>  d_qt(cap);
+    DeviceBuffer<uint8_t> d_m(cap);
+    DeviceBuffer<int32_t> d_t(cap);
 
     for (int off = 0; off < n; off += chunk) {
         const int k = std::min(chunk, n - off);
-        cudaMemcpy(d_qx, qx.data() + off, (size_t)k * sizeof(int32_t),
-                   cudaMemcpyHostToDevice);
-        cudaMemcpy(d_qy, qy.data() + off, (size_t)k * sizeof(int32_t),
-                   cudaMemcpyHostToDevice);
-        cudaMemcpy(d_qt, qt.data() + off, (size_t)k * sizeof(double),
-                   cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_qx, qx.data() + off, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_qy, qy.data() + off, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_qt, qt.data() + off, (size_t)k * sizeof(double),
+                   cudaMemcpyHostToDevice));
         in_circumsphere_kernel<<<(k + 255) / 256, 256>>>(
             d_qx, d_qy, d_qt, k, P_, W_det_, H_det_, d_grid_,
             static_cast<const RawTriangle*>(d_raw_buf_),
             d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, d_m, d_t);
-        cudaDeviceSynchronize();
-        cudaMemcpy(mask_out.data() + off, d_m, (size_t)k * sizeof(uint8_t),
-                   cudaMemcpyDeviceToHost);
-        cudaMemcpy(tid_out.data() + off, d_t, (size_t)k * sizeof(int32_t),
-                   cudaMemcpyDeviceToHost);
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(mask_out.data() + off, d_m, (size_t)k * sizeof(uint8_t),
+                   cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(tid_out.data() + off, d_t, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost));
     }
-    cudaFree(d_qt); cudaFree(d_m); cudaFree(d_t);
 }
 
 void Delaunay::locate(const std::vector<int32_t>& qx,
@@ -208,22 +207,21 @@ void Delaunay::locate(const std::vector<int32_t>& qx,
     int32_t* d_qy = d_seed_stage_ + max_seeds_;
     const int chunk = max_seeds_;
 
-    int32_t* d_out = nullptr;
-    cudaMalloc(&d_out, (size_t)std::min(n, chunk) * sizeof(int32_t));
+    DeviceBuffer<int32_t> d_out(std::min(n, chunk));
 
     for (int off = 0; off < n; off += chunk) {
         const int k = std::min(chunk, n - off);
-        cudaMemcpy(d_qx, qx.data() + off, (size_t)k * sizeof(int32_t),
-                   cudaMemcpyHostToDevice);
-        cudaMemcpy(d_qy, qy.data() + off, (size_t)k * sizeof(int32_t),
-                   cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_qx, qx.data() + off, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_qy, qy.data() + off, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyHostToDevice));
         locate_points_kernel<<<(k + 255) / 256, 256>>>(
             d_qx, d_qy, k, P_, W_det_, H_det_, d_grid_,
             static_cast<const RawTriangle*>(d_raw_buf_),
             d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, d_out);
-        cudaDeviceSynchronize();
-        cudaMemcpy(out.data() + off, d_out, (size_t)k * sizeof(int32_t),
-                   cudaMemcpyDeviceToHost);
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(out.data() + off, d_out, (size_t)k * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost));
     }
-    cudaFree(d_out);
 }

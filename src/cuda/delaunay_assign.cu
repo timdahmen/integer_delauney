@@ -5,6 +5,7 @@
 #include "delaunay.cuh"
 #include "delaunay_locate.cuh"
 #include "phase_timer.cuh"
+#include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -111,15 +112,17 @@ void Delaunay::build_reassign_mask_()
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
 
-    cudaMemset(d_tile_dirty_, 0,
-               (size_t)tiles_x_ * tiles_y_ * sizeof(int32_t));
+    CUDA_CHECK(cudaMemset(d_tile_dirty_, 0,
+               (size_t)tiles_x_ * tiles_y_ * sizeof(int32_t)));
     build_tile_dirty_kernel<<<grid_dim, block>>>(
         d_dirty_accum_, d_tile_dirty_, W_det_, H_det_, tiles_x_);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     build_reassign_mask_kernel<<<grid_dim, block>>>(
         d_grid_, d_t_grid_, d_tile_dirty_, d_mask_, W_det_, H_det_, tiles_x_);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 int Delaunay::count_mask_()
@@ -136,7 +139,7 @@ void Delaunay::assign_pending_(float* asgn_ms)
 
     int N_tri = (int)h_triangles_.size();
     if (N_tri == 0) {
-        cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N * sizeof(int32_t));
+        CUDA_CHECK(cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N * sizeof(int32_t)));
         if (asgn_ms) *asgn_ms = 0.f;
         return;
     }
@@ -158,7 +161,8 @@ void Delaunay::assign_pending_(float* asgn_ms)
         static_cast<RawTriangle*>(d_raw_buf_),
         d_sx_, d_sy_, d_csr_ptr_, d_csr_idx_, N_, N_tri,
         use_mask ? d_mask_ : nullptr);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     timer.mark(1);
     if (asgn_ms) *asgn_ms = timer.elapsed_ms(0, 1);

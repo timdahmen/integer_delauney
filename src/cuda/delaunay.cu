@@ -38,6 +38,8 @@
 #include "delaunay.cuh"
 #include "triangle_detect.cuh"
 
+#include "cuda_check.cuh"
+
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -75,75 +77,104 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
     const int N = W_det_ * H_det_;
     tiles_x_ = (W_det_ + MASK_TILE - 1) / MASK_TILE;
     tiles_y_ = (H_det_ + MASK_TILE - 1) / MASK_TILE;
-    cudaMalloc(&d_grid_,         (size_t)N * 2          * sizeof(int32_t));
-    cudaMalloc(&d_tmp_,          (size_t)N * 2          * sizeof(int32_t));
-    cudaMalloc(&d_changed_,      (size_t)N              * sizeof(int32_t));
-    cudaMalloc(&d_sx_,           (size_t)max_seeds      * sizeof(int32_t));
-    cudaMalloc(&d_sy_,           (size_t)max_seeds      * sizeof(int32_t));
-    // This buffer serves two purposes and must satisfy both bounds. Detection
-    // writes at most two triangles per 2x2 block over (W-1)*(H-1) blocks -- the
-    // same exact bound the batch path uses. It then also holds the
-    // deduplicated triangle list, under 2n for n seeds by planarity, which
-    // only exceeds the detection bound on a canvas smaller than the seed
-    // budget.
-    cudaMalloc(&d_raw_buf_, (size_t)max_seeds * 4 * sizeof(RawTriangle));
-    cudaMalloc(&d_detect_buf_,
-               max_raw_triangles(W_det_, H_det_) * sizeof(RawTriangle));
-    cudaMalloc(&d_t_grid_,       (size_t)N              * sizeof(int32_t));
-    // Sized on the unpadded image, unlike the buffers above: these are the
-    // finalise_device() outputs, addressed in image space by the crop kernel.
-    cudaMalloc(&d_sorted_rank_,     (size_t)max_seeds       * sizeof(int32_t));
-    cudaMalloc(&d_pixel_tids_,      (size_t)W_ * H_         * sizeof(int32_t));
-    cudaMalloc(&d_pixel_seed_ids_,  (size_t)W_ * H_         * sizeof(int32_t));
-    cudaMalloc(&d_outside_mask_,    (size_t)W_ * H_         * sizeof(uint8_t));
-    cudaMalloc(&d_csr_ptr_,      (size_t)(max_seeds + 1)* sizeof(int32_t));
-    cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 8  * sizeof(int32_t));
-    cudaMalloc(&d_updated_flag_, 1                      * sizeof(int32_t));
-    cudaMalloc(&d_mask_,         (size_t)N              * sizeof(int32_t));
-    cudaMalloc(&d_dirty_accum_,  (size_t)N              * sizeof(int32_t));
-    cudaMalloc(&d_tile_dirty_,
-               (size_t)tiles_x_ * tiles_y_ * sizeof(int32_t));
-    cudaMalloc(&d_count_,        1                      * sizeof(int32_t));
-    // A planar triangulation of n points has under 2n triangles; the detection
-    // buffer is sized the same way the CSR is, so match that bound.
-    cudaMalloc(&d_stale_,        (size_t)max_seeds * 4  * sizeof(uint8_t));
-    cudaMalloc(&d_dead_,         (size_t)max_seeds * 4  * sizeof(uint8_t));
-    cudaMalloc(&d_values_,       (size_t)max_seeds      * sizeof(float));
-    cudaMalloc(&d_score_keys_,   (size_t)max_seeds * 12 * sizeof(uint64_t));
-    cudaMalloc(&d_tri_count_,    1                      * sizeof(int32_t));
-    cudaMalloc(&d_seed_stage_,   (size_t)max_seeds * 3  * sizeof(int32_t));
-    cudaMalloc(&d_remap_,        (size_t)max_seeds * 4  * sizeof(int32_t));
-    cudaMalloc(&d_edge_out_,     (size_t)max_seeds * 24 * sizeof(int32_t));
-    cudaMalloc(&d_scores_,       (size_t)max_seeds * 12 * sizeof(float));
-    cudaMalloc(&d_mid_keys_,     (size_t)max_seeds      * sizeof(int64_t));
-    cudaMalloc(&d_mid_count_,    1                      * sizeof(int32_t));
-    cudaMemset(d_dead_, 0,       (size_t)max_seeds * 4  * sizeof(uint8_t));
-    // Three edge keys per triangle, over the same triangle bound as d_stale_.
-    cudaMalloc(&d_edge_keys_,    (size_t)max_seeds * 4 * 3 * sizeof(int64_t));
 
-    cudaMemset(d_grid_,   SENTINEL_BYTE, (size_t)N * 2 * sizeof(int32_t));
-    cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N     * sizeof(int32_t));
-    cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t));
-    cudaMemset(d_dirty_accum_, 0, (size_t)N  * sizeof(int32_t));
+    // Every member pointer above defaults to nullptr, so on a mid-construction
+    // failure free_device_buffers_() can safely free whichever of these
+    // succeeded before the one that threw -- cudaFree(nullptr) is a no-op.
+    try {
+        CUDA_CHECK(cudaMalloc(&d_grid_,         (size_t)N * 2          * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_tmp_,          (size_t)N * 2          * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_changed_,      (size_t)N              * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_sx_,           (size_t)max_seeds      * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_sy_,           (size_t)max_seeds      * sizeof(int32_t)));
+        // This buffer serves two purposes and must satisfy both bounds. Detection
+        // writes at most two triangles per 2x2 block over (W-1)*(H-1) blocks -- the
+        // same exact bound the batch path uses. It then also holds the
+        // deduplicated triangle list, under 2n for n seeds by planarity, which
+        // only exceeds the detection bound on a canvas smaller than the seed
+        // budget.
+        CUDA_CHECK(cudaMalloc(&d_raw_buf_, (size_t)max_seeds * 4 * sizeof(RawTriangle)));
+        CUDA_CHECK(cudaMalloc(&d_detect_buf_,
+                   max_raw_triangles(W_det_, H_det_) * sizeof(RawTriangle)));
+        CUDA_CHECK(cudaMalloc(&d_t_grid_,       (size_t)N              * sizeof(int32_t)));
+        // Sized on the unpadded image, unlike the buffers above: these are the
+        // finalise_device() outputs, addressed in image space by the crop kernel.
+        CUDA_CHECK(cudaMalloc(&d_sorted_rank_,     (size_t)max_seeds       * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_pixel_tids_,      (size_t)W_ * H_         * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_pixel_seed_ids_,  (size_t)W_ * H_         * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_outside_mask_,    (size_t)W_ * H_         * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMalloc(&d_csr_ptr_,      (size_t)(max_seeds + 1)* sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 8  * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_updated_flag_, 1                      * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_mask_,         (size_t)N              * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_dirty_accum_,  (size_t)N              * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_tile_dirty_,
+                   (size_t)tiles_x_ * tiles_y_ * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_count_,        1                      * sizeof(int32_t)));
+        // A planar triangulation of n points has under 2n triangles; the detection
+        // buffer is sized the same way the CSR is, so match that bound.
+        CUDA_CHECK(cudaMalloc(&d_stale_,        (size_t)max_seeds * 4  * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMalloc(&d_dead_,         (size_t)max_seeds * 4  * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMalloc(&d_values_,       (size_t)max_seeds      * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_score_keys_,   (size_t)max_seeds * 12 * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_tri_count_,    1                      * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_seed_stage_,   (size_t)max_seeds * 3  * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_remap_,        (size_t)max_seeds * 4  * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_edge_out_,     (size_t)max_seeds * 24 * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_scores_,       (size_t)max_seeds * 12 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_mid_keys_,     (size_t)max_seeds      * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&d_mid_count_,    1                      * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_dead_, 0,       (size_t)max_seeds * 4  * sizeof(uint8_t)));
+        // Three edge keys per triangle, over the same triangle bound as d_stale_.
+        CUDA_CHECK(cudaMalloc(&d_edge_keys_,    (size_t)max_seeds * 4 * 3 * sizeof(int64_t)));
+
+        CUDA_CHECK(cudaMemset(d_grid_,   SENTINEL_BYTE, (size_t)N * 2 * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N     * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d_dirty_accum_, 0, (size_t)N  * sizeof(int32_t)));
+    } catch (...) {
+        free_device_buffers_();
+        throw;
+    }
 }
 
 Delaunay::~Delaunay()
 {
-    cudaFree(d_grid_);    cudaFree(d_tmp_);      cudaFree(d_changed_);
-    cudaFree(d_sx_);      cudaFree(d_sy_);        cudaFree(d_raw_buf_);
-    cudaFree(d_detect_buf_);
-    cudaFree(d_t_grid_);  cudaFree(d_csr_ptr_);  cudaFree(d_csr_idx_);
-    cudaFree(d_sorted_rank_);    cudaFree(d_pixel_tids_);
-    cudaFree(d_pixel_seed_ids_); cudaFree(d_outside_mask_);
-    cudaFree(d_edge_keys_);
-    cudaFree(d_dead_);
-    cudaFree(d_values_);   cudaFree(d_scores_);  cudaFree(d_score_keys_);
-    cudaFree(d_mid_keys_); cudaFree(d_mid_count_);
-    cudaFree(d_updated_flag_); cudaFree(d_mask_);
-    cudaFree(d_dirty_accum_);  cudaFree(d_tile_dirty_); cudaFree(d_count_);
-    cudaFree(d_stale_);
-    cudaFree(d_tri_count_);  cudaFree(d_seed_stage_);
-    cudaFree(d_remap_);      cudaFree(d_edge_out_);
+    free_device_buffers_();
+}
+
+void Delaunay::free_device_buffers_() noexcept
+{
+    CUDA_CHECK_NOTHROW(cudaFree(d_grid_));    CUDA_CHECK_NOTHROW(cudaFree(d_tmp_));      CUDA_CHECK_NOTHROW(cudaFree(d_changed_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_sx_));      CUDA_CHECK_NOTHROW(cudaFree(d_sy_));        CUDA_CHECK_NOTHROW(cudaFree(d_raw_buf_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_detect_buf_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_t_grid_));  CUDA_CHECK_NOTHROW(cudaFree(d_csr_ptr_));  CUDA_CHECK_NOTHROW(cudaFree(d_csr_idx_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_sorted_rank_));    CUDA_CHECK_NOTHROW(cudaFree(d_pixel_tids_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_pixel_seed_ids_)); CUDA_CHECK_NOTHROW(cudaFree(d_outside_mask_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_edge_keys_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_dead_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_values_));   CUDA_CHECK_NOTHROW(cudaFree(d_scores_));  CUDA_CHECK_NOTHROW(cudaFree(d_score_keys_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_mid_keys_)); CUDA_CHECK_NOTHROW(cudaFree(d_mid_count_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_updated_flag_)); CUDA_CHECK_NOTHROW(cudaFree(d_mask_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_dirty_accum_));  CUDA_CHECK_NOTHROW(cudaFree(d_tile_dirty_)); CUDA_CHECK_NOTHROW(cudaFree(d_count_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_stale_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_tri_count_));  CUDA_CHECK_NOTHROW(cudaFree(d_seed_stage_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_remap_));      CUDA_CHECK_NOTHROW(cudaFree(d_edge_out_));
+
+    d_grid_ = d_tmp_ = d_changed_ = d_sx_ = d_sy_ = nullptr;
+    d_raw_buf_ = d_detect_buf_ = d_edge_keys_ = nullptr;
+    d_t_grid_ = d_csr_ptr_ = d_csr_idx_ = nullptr;
+    d_sorted_rank_ = d_pixel_tids_ = d_pixel_seed_ids_ = nullptr;
+    d_outside_mask_ = nullptr;
+    d_dead_ = nullptr;
+    d_values_ = nullptr;
+    d_scores_ = nullptr;
+    d_score_keys_ = nullptr;
+    d_mid_keys_ = nullptr;
+    d_mid_count_ = d_updated_flag_ = d_mask_ = nullptr;
+    d_dirty_accum_ = d_tile_dirty_ = d_count_ = nullptr;
+    d_stale_ = nullptr;
+    d_tri_count_ = d_seed_stage_ = d_remap_ = d_edge_out_ = nullptr;
 }
 
 // ---------------------------------------------------------------------------
@@ -205,25 +236,26 @@ void Delaunay::apply_batch_(
         padded_xs[i] = new_xs[i] + P_;
         padded_ys[i] = new_ys[i] + P_;
     }
-    cudaMemcpy(d_sx_ + N_ - k, padded_xs.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sy_ + N_ - k, padded_ys.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_sx_ + N_ - k, padded_xs.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sy_ + N_ - k, padded_ys.data(), k * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     // Reset change accumulator before writing seeds (so seed positions
     // are the first entries in d_changed_ — necessary for partial_topology_
     // to cover detection positions that touch the seed cell directly).
     // d_changed_ is per-insert and scopes detection; d_dirty_accum_ below is
     // the union since the last finalise and scopes assignment.
-    cudaMemset(d_changed_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t));
+    CUDA_CHECK(cudaMemset(d_changed_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t)));
 
     // Write seeds into grid (also marks seed cells in d_changed_)
     int32_t* d_kxs  = d_seed_stage_;
     int32_t* d_kys  = d_seed_stage_ + max_seeds_;
     int32_t* d_kids = d_seed_stage_ + 2 * max_seeds_;
-    cudaMemcpy(d_kxs,  padded_xs.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kys,  padded_ys.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kids, new_ids.data(),    k * sizeof(int32_t), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_kxs,  padded_xs.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kys,  padded_ys.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_kids, new_ids.data(),    k * sizeof(int32_t), cudaMemcpyHostToDevice));
     write_seeds_kernel<<<(k+255)/256, 256>>>(d_grid_, d_changed_, W_det_, d_kxs, d_kys, d_kids, k);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // BFS
     run_bfs_(bfs_ms_out, iters_out);
@@ -231,7 +263,8 @@ void Delaunay::apply_batch_(
     // Fold this insert's changes into the set awaiting assignment.
     const int N = W_det_ * H_det_;
     or_mask_kernel<<<(N + 255) / 256, 256>>>(d_changed_, d_dirty_accum_, N);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // ---------------------------------------------------------------------------
@@ -270,8 +303,8 @@ void Delaunay::insert_deferred(
         partial_topology_(timings ? &det_ms : nullptr, timings ? &dup_ms : nullptr);
 
     if (new_values && !new_values->empty()) {
-        cudaMemcpy(d_values_ + seeds_before, new_values->data(),
-                   new_values->size() * sizeof(float), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_values_ + seeds_before, new_values->data(),
+                   new_values->size() * sizeof(float), cudaMemcpyHostToDevice));
         h_values_.insert(h_values_.end(), new_values->begin(), new_values->end());
         have_values_ = true;
     }
@@ -303,7 +336,7 @@ void Delaunay::finalise(
         float asgn_ms = 0.f;
         assign_pending_(timings ? &asgn_ms : nullptr);
         if (timings) timings->assign_ms = asgn_ms;
-        cudaMemset(d_dirty_accum_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t));
+        CUDA_CHECK(cudaMemset(d_dirty_accum_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t)));
         pending_ = false;
         // The grids finalise_device()'s buffers were cropped from just moved.
         ++generation_;
@@ -320,7 +353,7 @@ void Delaunay::finalise_device(std::vector<TriangleEntry>& tri_map_out)
     compact_registry_();
     if (pending_) {
         assign_pending_(nullptr);
-        cudaMemset(d_dirty_accum_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t));
+        CUDA_CHECK(cudaMemset(d_dirty_accum_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t)));
         pending_ = false;
     }
     build_outputs_device_(tri_map_out);

@@ -12,6 +12,7 @@
 #include "triangle_detect.cuh"
 #include "triangle_csr.cuh"
 #include "phase_timer.cuh"
+#include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -167,15 +168,15 @@ void Delaunay::upload_triangles_range_(int first, int count)
         const auto& h = h_triangles_[first + i];
         h_raw[i] = {h.x, h.y, h.a, h.b, h.c, h.orig_a, h.orig_b, h.orig_c};
     }
-    cudaMemcpy(static_cast<RawTriangle*>(d_raw_buf_) + first, h_raw.data(),
-               (size_t)count * sizeof(RawTriangle), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(static_cast<RawTriangle*>(d_raw_buf_) + first, h_raw.data(),
+               (size_t)count * sizeof(RawTriangle), cudaMemcpyHostToDevice));
 }
 
 void Delaunay::upload_dead_flags_()
 {
     if (h_dead_.empty()) return;
-    cudaMemcpy(d_dead_, h_dead_.data(), h_dead_.size() * sizeof(uint8_t),
-               cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_dead_, h_dead_.data(), h_dead_.size() * sizeof(uint8_t),
+               cudaMemcpyHostToDevice));
 }
 
 //: Compact once the retired slots outnumber the live ones, or the slot count
@@ -220,11 +221,12 @@ void Delaunay::compact_registry_()
     edges_dirty_ = true;
 
     const int N = W_det_ * H_det_;
-    cudaMemcpy(d_remap_, remap.data(), (size_t)old_count * sizeof(int32_t),
-               cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_remap_, remap.data(), (size_t)old_count * sizeof(int32_t),
+               cudaMemcpyHostToDevice));
     remap_tgrid_kernel<<<(N+255)/256, 256>>>(d_t_grid_, N, d_remap_, old_count,
                                              NO_TRIANGLE);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // ---------------------------------------------------------------------------
@@ -241,8 +243,8 @@ void Delaunay::rebuild_csr_and_upload_()
         [this](int tid) { return h_dead_[tid] != 0; },
         h_csr_ptr, h_csr_idx);
 
-    cudaMemcpy(d_csr_ptr_, h_csr_ptr.data(), (N_+1)*sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_csr_idx_, h_csr_idx.data(), h_csr_idx.size()*sizeof(int32_t), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_csr_ptr_, h_csr_ptr.data(), (N_+1)*sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_csr_idx_, h_csr_idx.data(), h_csr_idx.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
 }
 
 // ---------------------------------------------------------------------------
@@ -259,14 +261,15 @@ int Delaunay::detect_and_dedup_(const int32_t* mask, float* detect_ms, float* de
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_detect_buf_);
     int32_t* d_counter = d_tri_count_;
-    cudaMemset(d_counter, 0, sizeof(int32_t));
+    CUDA_CHECK(cudaMemset(d_counter, 0, sizeof(int32_t)));
 
     timer.mark(0);
     find_triangle_seeds_kernel<<<grid_dim, block>>>(
         d_grid_, W_det_, H_det_, d_sx_, d_sy_, d_raw, d_counter, mask);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
     int32_t raw_count = 0;
-    cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost));
     timer.mark(1);
 
     thrust::device_ptr<RawTriangle> d_ptr(d_raw);
@@ -290,7 +293,7 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     int N_tri = detect_and_dedup_(nullptr, det_ms, dedup_ms);
 
     std::vector<RawTriangle> h_dedup(N_tri);
-    cudaMemcpy(h_dedup.data(), d_raw, N_tri * sizeof(RawTriangle), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_dedup.data(), d_raw, N_tri * sizeof(RawTriangle), cudaMemcpyDeviceToHost));
 
     h_triangles_.clear(); h_triplet_to_tid_.clear();
     h_triangles_.reserve(N_tri);
@@ -306,8 +309,8 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     // Detection wrote to the scratch buffer, so the list gets its own copy.
     // Device to device, and the order already matches h_triangles_.
     if (N_tri > 0)
-        cudaMemcpy(d_raw_buf_, d_raw, (size_t)N_tri * sizeof(RawTriangle),
-                   cudaMemcpyDeviceToDevice);
+        CUDA_CHECK(cudaMemcpy(d_raw_buf_, d_raw, (size_t)N_tri * sizeof(RawTriangle),
+                   cudaMemcpyDeviceToDevice));
 
     // The CSR is not built here. Its only reader is assign_triangles_kernel,
     // which runs in assign_pending_, so building it per insert was O(N_tri +
@@ -317,7 +320,7 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     // Every pixel's assignment is now stale. Marking them invalidated rather
     // than assigning here lets assign_pending_ pick the mask up like any other
     // dirty region, and makes a first insert behave like the rest.
-    cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)W_det_ * H_det_ * sizeof(int32_t));
+    CUDA_CHECK(cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)W_det_ * H_det_ * sizeof(int32_t)));
 }
 
 // ---------------------------------------------------------------------------
@@ -334,7 +337,8 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     // d_changed_ rather than the accumulator so a deferred round does not
     // re-detect regions earlier rounds already handled.
     dilate_fixed_kernel<<<grid_dim, block>>>(d_changed_, d_mask_, W_det_, H_det_, 2);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Which existing triangles the border invalidates. Sampling the mask at the
     // triangles' own canonical pixels moves N_tri flags instead of the whole
@@ -347,9 +351,10 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
         mark_stale_kernel<<<(old_count + 255) / 256, 256>>>(
             static_cast<RawTriangle*>(d_raw_buf_), old_count,
             d_mask_, W_det_, H_det_, d_stale_);
-        cudaDeviceSynchronize();
-        cudaMemcpy(h_stale.data(), d_stale_, old_count * sizeof(uint8_t),
-                   cudaMemcpyDeviceToHost);
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_stale.data(), d_stale_, old_count * sizeof(uint8_t),
+                   cudaMemcpyDeviceToHost));
     }
     auto is_stale = [&h_stale](int tid) { return h_stale[tid] != 0; };
 
@@ -358,7 +363,7 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
 
     std::vector<RawTriangle> h_new(n_new);
     if (n_new > 0)
-        cudaMemcpy(h_new.data(), d_raw, n_new * sizeof(RawTriangle), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(h_new.data(), d_raw, n_new * sizeof(RawTriangle), cudaMemcpyDeviceToHost));
 
     // Retire the invalidated triangles. Their ids are not reused and nothing
     // else is renumbered, so this touches only the entries that changed --
@@ -400,7 +405,8 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     const int N = W_det_ * H_det_;
     invalidate_dead_tgrid_kernel<<<(N+255)/256, 256>>>(
         d_t_grid_, N, d_dead_, (int)h_triangles_.size());
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // Amortised: holes are cheap to carry but not free to carry forever, and
     // the device buffers are sized for a bounded slot count.

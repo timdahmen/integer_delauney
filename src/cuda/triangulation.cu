@@ -18,6 +18,8 @@
 #include "geometry_device.cuh"
 #include "triangle_csr.cuh"
 #include "phase_timer.cuh"
+#include "cuda_check.cuh"
+#include "device_buffer.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -210,14 +212,11 @@ void cuda_compute_triangulation(
     // Upload inputs: detection seed_id grid, seed positions (always original)
     // -----------------------------------------------------------------------
 
-    int32_t *d_n = nullptr;
-    int32_t *d_sx = nullptr, *d_sy = nullptr;
-    cudaMalloc(&d_n,    N_det   * sizeof(int32_t));
-    cudaMalloc(&d_sx,   N_seeds * sizeof(int32_t));
-    cudaMalloc(&d_sy,   N_seeds * sizeof(int32_t));
-    cudaMemcpy(d_n,  h_n.data(),       N_det   * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sx, seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sy, seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+    DeviceBuffer<int32_t> d_n(N_det);
+    DeviceBuffer<int32_t> d_sx(N_seeds), d_sy(N_seeds);
+    CUDA_CHECK(cudaMemcpy(d_n,  h_n.data(),       N_det   * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sx, seed_xs.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sy, seed_ys.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     dim3 block(16, 16);
     dim3 grid_det((W_det + 15) / 16, (H_det + 15) / 16);
@@ -228,22 +227,19 @@ void cuda_compute_triangulation(
     // -----------------------------------------------------------------------
 
     const int max_raw = 2 * (W_det - 1) * (H_det - 1);
-    RawTriangle* d_raw = nullptr;
-    cudaMalloc(&d_raw, max_raw * sizeof(RawTriangle));
-
-    int32_t* d_counter = nullptr;
-    cudaMalloc(&d_counter, sizeof(int32_t));
-    cudaMemset(d_counter, 0, sizeof(int32_t));
+    DeviceBuffer<RawTriangle> d_raw(max_raw);
+    DeviceBuffer<int32_t> d_counter(1);
+    CUDA_CHECK(cudaMemset(d_counter, 0, sizeof(int32_t)));
 
     timer.mark(0);
 
     find_triangle_seeds_kernel<<<grid_det, block>>>(
         d_n, W_det, H_det, d_sx, d_sy, d_raw, d_counter);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     int32_t raw_count = 0;
-    cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost);
-    cudaFree(d_counter);
+    CUDA_CHECK(cudaMemcpy(&raw_count, d_counter, sizeof(int32_t), cudaMemcpyDeviceToHost));
 
     timer.mark(1);
 
@@ -251,7 +247,7 @@ void cuda_compute_triangulation(
     // Dedup: on device with Thrust sort + unique
     // -----------------------------------------------------------------------
 
-    thrust::device_ptr<RawTriangle> d_ptr(d_raw);
+    thrust::device_ptr<RawTriangle> d_ptr(d_raw.get());
 
     timer.mark(2);
 
@@ -266,8 +262,8 @@ void cuda_compute_triangulation(
     // border triangles will have x or y outside [0,W-1]/[0,H-1] which is correct
     // (their Voronoi vertex lies outside the original image).
     std::vector<RawTriangle> h_dedup(N_triangles);
-    cudaMemcpy(h_dedup.data(), d_raw, N_triangles * sizeof(RawTriangle),
-               cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_dedup.data(), d_raw, N_triangles * sizeof(RawTriangle),
+               cudaMemcpyDeviceToHost));
 
     triangle_map_out.clear();
     triangle_map_out.reserve(N_triangles);
@@ -283,11 +279,10 @@ void cuda_compute_triangulation(
                             h_csr_ptr, h_csr_idx);
     const int csr_size = (int)h_csr_idx.size();  // == 3 * N_triangles
 
-    int32_t *d_csr_ptr = nullptr, *d_csr_idx = nullptr;
-    cudaMalloc(&d_csr_ptr, (N_seeds + 1) * sizeof(int32_t));
-    cudaMalloc(&d_csr_idx,  csr_size     * sizeof(int32_t));
-    cudaMemcpy(d_csr_ptr, h_csr_ptr.data(), (N_seeds + 1) * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_csr_idx, h_csr_idx.data(),  csr_size     * sizeof(int32_t), cudaMemcpyHostToDevice);
+    DeviceBuffer<int32_t> d_csr_ptr(N_seeds + 1);
+    DeviceBuffer<int32_t> d_csr_idx(csr_size);
+    CUDA_CHECK(cudaMemcpy(d_csr_ptr, h_csr_ptr.data(), (N_seeds + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_csr_idx, h_csr_idx.data(),  csr_size     * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     // -----------------------------------------------------------------------
     // Assign: pixels to triangles (seed-position scan)
@@ -297,8 +292,7 @@ void cuda_compute_triangulation(
     // because their seed vertices are inside the original image.
     // -----------------------------------------------------------------------
 
-    int32_t* d_t = nullptr;
-    cudaMalloc(&d_t, N * sizeof(int32_t));
+    DeviceBuffer<int32_t> d_t(N);
 
     timer.mark(4);
 
@@ -323,9 +317,10 @@ void cuda_compute_triangulation(
             d_raw, d_sx, d_sy,
             d_csr_ptr, d_csr_idx,
             N_seeds, window_cap);
-        cudaDeviceSynchronize();
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
     } else {
-        cudaMemset(d_t, -1, N * sizeof(int32_t));
+        CUDA_CHECK(cudaMemset(d_t, -1, N * sizeof(int32_t)));
     }
 
     timer.mark(5);
@@ -335,7 +330,7 @@ void cuda_compute_triangulation(
     // -----------------------------------------------------------------------
 
     std::vector<int32_t> h_t(N);
-    cudaMemcpy(h_t.data(), d_t, N * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_t.data(), d_t, N * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
     // Channels 0 and 1 are the seed id and distance. At P > 0 they come from the
     // interior window of the padded diagram, which equals an unpadded one
@@ -365,12 +360,6 @@ void cuda_compute_triangulation(
         timings->dedup_ms  = timer.elapsed_ms(2, 3);
         timings->assign_ms = timer.elapsed_ms(4, 5);
     }
-
-    cudaFree(d_raw);
-    cudaFree(d_n);
-    cudaFree(d_t);
-    cudaFree(d_sx);
-    cudaFree(d_sy);
-    cudaFree(d_csr_ptr);
-    cudaFree(d_csr_idx);
+    // Device buffers free themselves here, in reverse declaration order
+    // (DeviceBuffer's destructor), including on any exception path above.
 }

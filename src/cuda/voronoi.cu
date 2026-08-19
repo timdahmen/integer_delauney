@@ -16,6 +16,8 @@
 
 #include "voronoi.cuh"
 #include "geometry_device.cuh"
+#include "cuda_check.cuh"
+#include "device_buffer.cuh"
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -50,6 +52,7 @@ void voronoi_step_kernel(
     if (changed) atomicOr(updated_flag, 1);
 }
 
+
 // ---------------------------------------------------------------------------
 // Host entry point
 // ---------------------------------------------------------------------------
@@ -78,42 +81,37 @@ void cuda_compute_voronoi(
         h_sy[i] = seeds[i].y;
     }
 
-    // Allocate double buffers + seed position arrays on device
-    int32_t *d_a = nullptr, *d_b = nullptr, *d_flag = nullptr;
-    int32_t *d_sx = nullptr, *d_sy = nullptr;
-    cudaMalloc(&d_a,    bytes);
-    cudaMalloc(&d_b,    bytes);
-    cudaMalloc(&d_flag, sizeof(int32_t));
-    cudaMalloc(&d_sx,   N_seeds * sizeof(int32_t));
-    cudaMalloc(&d_sy,   N_seeds * sizeof(int32_t));
+    // Allocate double buffers + seed position arrays on device. Per-call
+    // alloc/free rather than persistent buffers -- see todo.txt for that
+    // design tradeoff, which this change does not revisit.
+    DeviceBuffer<int32_t> d_a_buf(N * 2), d_b_buf(N * 2);
+    DeviceBuffer<int32_t> d_flag(1);
+    DeviceBuffer<int32_t> d_sx(N_seeds), d_sy(N_seeds);
+    int32_t* d_a = d_a_buf;
+    int32_t* d_b = d_b_buf;
 
-    cudaMemcpy(d_a,  h_grid.data(), bytes,                     cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sx, h_sx.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sy, h_sy.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice);
+    CUDA_CHECK(cudaMemcpy(d_a,  h_grid.data(), bytes,                     cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sx, h_sx.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_sy, h_sy.data(),   N_seeds * sizeof(int32_t), cudaMemcpyHostToDevice));
 
     dim3 block(16, 16);
     dim3 grid((W + 15) / 16, (H + 15) / 16);
 
     for (;;) {
         int32_t zero = 0;
-        cudaMemcpy(d_flag, &zero, sizeof(int32_t), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_flag, &zero, sizeof(int32_t), cudaMemcpyHostToDevice));
 
         voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, d_sx, d_sy, d_flag);
-        cudaDeviceSynchronize();
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
 
         int32_t* tmp = d_a; d_a = d_b; d_b = tmp;
 
         int32_t flag = 0;
-        cudaMemcpy(&flag, d_flag, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(&flag, d_flag, sizeof(int32_t), cudaMemcpyDeviceToHost));
         if (!flag) break;
     }
 
     out_grid.resize(N * 2);
-    cudaMemcpy(out_grid.data(), d_a, bytes, cudaMemcpyDeviceToHost);
-
-    cudaFree(d_a);
-    cudaFree(d_b);
-    cudaFree(d_flag);
-    cudaFree(d_sx);
-    cudaFree(d_sy);
+    CUDA_CHECK(cudaMemcpy(out_grid.data(), d_a, bytes, cudaMemcpyDeviceToHost));
 }

@@ -4,6 +4,7 @@
 // why this lives beside the coordinates rather than on the host.
 #include "delaunay.cuh"
 #include "triangle_detect.cuh"
+#include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
@@ -188,7 +189,8 @@ void Delaunay::ensure_edges_() const
 
     build_edge_keys_kernel<<<(n_tri + 255) / 256, 256>>>(
         d_tris, n_tri, (int64_t)N_, d_dead_, d_keys);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     thrust::device_ptr<int64_t> p(d_keys);
     thrust::sort(p, p + (size_t)n_tri * 3);
@@ -198,8 +200,8 @@ void Delaunay::ensure_edges_() const
     // to the single trailing entry dropped here.
     if (n > 0) {
         int64_t last = 0;
-        cudaMemcpy(&last, d_keys + (n - 1), sizeof(int64_t),
-                   cudaMemcpyDeviceToHost);
+        CUDA_CHECK(cudaMemcpy(&last, d_keys + (n - 1), sizeof(int64_t),
+                   cudaMemcpyDeviceToHost));
         if (last == EDGE_KEY_DEAD) --n;
     }
     n_edges_ = n;
@@ -217,11 +219,12 @@ void Delaunay::edge_scores(double min_length, std::vector<float>& out) const
     score_edges_kernel<<<(n_edges_ + 255) / 256, 256>>>(
         static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
         d_sx_, d_sy_, d_values_, min_length * min_length, d_scores_);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     out.resize(n_edges_);
-    cudaMemcpy(out.data(), d_scores_, (size_t)n_edges_ * sizeof(float),
-               cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(out.data(), d_scores_, (size_t)n_edges_ * sizeof(float),
+               cudaMemcpyDeviceToHost));
 }
 
 void Delaunay::select_midpoints(double min_length, int count, float threshold,
@@ -237,14 +240,16 @@ void Delaunay::select_midpoints(double min_length, int count, float threshold,
     score_edges_kernel<<<(n_edges_ + 255) / 256, 256>>>(
         static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
         d_sx_, d_sy_, d_values_, min_length * min_length, d_scores_);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     // The whole of the selection: order the edges best-first and take the
     // front. No threshold crosses to the caller and none comes back, because
     // the key is a total order and `count` is therefore exact.
     pack_score_keys_kernel<<<(n_edges_ + 255) / 256, 256>>>(
         d_scores_, n_edges_, threshold, d_score_keys_);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     thrust::device_ptr<float> sc(d_scores_);
     const int n_eligible = (int)thrust::count_if(sc, sc + n_edges_,
@@ -255,15 +260,16 @@ void Delaunay::select_midpoints(double min_length, int count, float threshold,
     thrust::device_ptr<uint64_t> kp(d_score_keys_);
     thrust::sort(kp, kp + n_edges_);
 
-    cudaMemset(d_mid_count_, 0, sizeof(int32_t));
+    CUDA_CHECK(cudaMemset(d_mid_count_, 0, sizeof(int32_t)));
     midpoints_from_sorted_kernel<<<(take + 255) / 256, 256>>>(
         d_score_keys_, take, static_cast<const int64_t*>(d_edge_keys_),
         (int64_t)N_, d_sx_, d_sy_, W_det_, H_det_, P_, d_grid_,
         d_mid_keys_, d_mid_count_);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     int32_t n = 0;
-    cudaMemcpy(&n, d_mid_count_, sizeof(int32_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(&n, d_mid_count_, sizeof(int32_t), cudaMemcpyDeviceToHost));
     if (n == 0) return;
 
     // Sorting by (pixel, rank) puts colliding midpoints together with the
@@ -275,8 +281,8 @@ void Delaunay::select_midpoints(double min_length, int count, float threshold,
     const int m = (int)(end_it - p);
 
     std::vector<int64_t> h_keys(m);
-    cudaMemcpy(h_keys.data(), d_mid_keys_, (size_t)m * sizeof(int64_t),
-               cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_keys.data(), d_mid_keys_, (size_t)m * sizeof(int64_t),
+               cudaMemcpyDeviceToHost));
 
     out.resize((size_t)m * 2);
     for (int i = 0; i < m; ++i) {
@@ -297,9 +303,10 @@ void Delaunay::get_edges(std::vector<int32_t>& out) const
     unpack_edge_keys_kernel<<<(n_edges_ + 255) / 256, 256>>>(
         static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
         d_edge_out_);
-    cudaDeviceSynchronize();
+    CUDA_CHECK_LAST_ERROR();
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     out.resize((size_t)n_edges_ * 2);
-    cudaMemcpy(out.data(), d_edge_out_, (size_t)n_edges_ * 2 * sizeof(int32_t),
-               cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(out.data(), d_edge_out_, (size_t)n_edges_ * 2 * sizeof(int32_t),
+               cudaMemcpyDeviceToHost));
 }

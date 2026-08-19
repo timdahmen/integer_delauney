@@ -17,6 +17,7 @@
 #include <pybind11/numpy.h>
 
 #include "../delaunay.cuh"
+#include "../cuda_check.cuh"
 
 #include <cuda_runtime.h>
 
@@ -51,14 +52,14 @@ public:
         _check_fresh();
         if (typestr_ == "<i4") {
             py::array_t<int32_t> out(count_);
-            cudaMemcpy(out.mutable_data(), ptr_,
-                       (size_t)count_ * sizeof(int32_t), cudaMemcpyDeviceToHost);
+            CUDA_CHECK(cudaMemcpy(out.mutable_data(), ptr_,
+                       (size_t)count_ * sizeof(int32_t), cudaMemcpyDeviceToHost));
             return out;
         }
         if (typestr_ == "|u1") {
             py::array_t<uint8_t> out(count_);
-            cudaMemcpy(out.mutable_data(), ptr_,
-                       (size_t)count_ * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+            CUDA_CHECK(cudaMemcpy(out.mutable_data(), ptr_,
+                       (size_t)count_ * sizeof(uint8_t), cudaMemcpyDeviceToHost));
             return out;
         }
         throw std::runtime_error("to_host(): unsupported typestr '" + typestr_ + "'");

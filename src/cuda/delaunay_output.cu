@@ -2,6 +2,7 @@
 // finalise_device() return, get_voronoi_grid(), and the plain getters that
 // read straight off the host registry.
 #include "delaunay.cuh"
+#include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
 
@@ -51,8 +52,8 @@ void Delaunay::rebuild_sorted_rank_() const
     // Mirrored for crop_pixel_arrays_kernel, which remaps seed ids on the
     // device instead of walking the padded canvas back through the host.
     if (N_ > 0)
-        cudaMemcpy(d_sorted_rank_, h_sorted_rank_.data(),
-                   (size_t)N_ * sizeof(int32_t), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_sorted_rank_, h_sorted_rank_.data(),
+                   (size_t)N_ * sizeof(int32_t), cudaMemcpyHostToDevice));
 }
 
 int32_t Delaunay::translate_to_sorted_rank_(int32_t internal) const
@@ -92,8 +93,8 @@ void Delaunay::build_outputs_(std::vector<TriangleEntry>& tri_map_out,
     const int N_det = W_det_ * H_det_;
 
     std::vector<int32_t> h_t(N_det), h_grid(N_det * 2);
-    cudaMemcpy(h_t.data(),    d_t_grid_, N_det     * sizeof(int32_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_grid.data(), d_grid_,   N_det * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_t.data(),    d_t_grid_, N_det     * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_grid.data(), d_grid_,   N_det * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
     // Crop the padded canvas back to the image.
     tgrid_out.resize(N * 3);
@@ -153,6 +154,12 @@ void Delaunay::build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) co
         d_grid_, d_t_grid_, d_sorted_rank_, (int)h_sorted_rank_.size(),
         W_, H_, P_, W_det_,
         d_pixel_tids_, d_pixel_seed_ids_, d_outside_mask_);
+    // No sync here by design -- see the device-handoff plan's "stream
+    // discipline" note: both extensions share the implicit default stream, so
+    // a later kernel reading these buffers is guaranteed to see this one's
+    // output without one. cudaGetLastError still catches a launch-config
+    // failure immediately, without forcing a wait for the copy to finish.
+    CUDA_CHECK_LAST_ERROR();
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +173,7 @@ void Delaunay::get_voronoi_grid(std::vector<int32_t>& out) const
     const int N_det = W_det_ * H_det_;
     out.resize(N * 2);
     std::vector<int32_t> h_grid(N_det * 2);
-    cudaMemcpy(h_grid.data(), d_grid_, N_det * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost);
+    CUDA_CHECK(cudaMemcpy(h_grid.data(), d_grid_, N_det * 2 * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
     // Same insertion->sorted id translation as build_outputs_, cropping the
     // padded canvas back to the image.
