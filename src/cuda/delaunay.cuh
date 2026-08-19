@@ -13,6 +13,13 @@ struct InsertTimings {
     float assign_ms = 0.f;
 };
 
+//: Tile edge for the dirty prefilter in delaunay_assign.cu's reassign mask.
+//: Small enough that a tile rarely covers unchanged ground, large enough that
+//: a WINDOW_CAP-sized window (delaunay_locate.cuh) spans only a handful of
+//: tiles. Shared with the constructor's tiles_x_/tiles_y_ sizing below, so it
+//: lives here rather than in the .cu file that uses it most.
+static constexpr int MASK_TILE = 8;
+
 class Delaunay {
 public:
     // border_padding < 0 uses DEFAULT_BORDER_PADDING.
@@ -314,6 +321,10 @@ private:
     // separate so it can be deferred across several inserts and run once.
     void full_topology_(float* detect_ms, float* dedup_ms);
     void partial_topology_(float* detect_ms, float* dedup_ms);
+    // Detect into d_detect_buf_ and deduplicate on the device, scoped to mask
+    // (nullptr for the whole grid); returns the surviving count. The one part
+    // full_topology_ and partial_topology_ do identically, aside from that scope.
+    int  detect_and_dedup_(const int32_t* mask, float* detect_ms, float* dedup_ms);
     // Registration + seed write + BFS, shared by insert() and insert_deferred().
     void apply_batch_(const std::vector<int32_t>& new_xs,
                       const std::vector<int32_t>& new_ys,
@@ -342,6 +353,12 @@ private:
     // As build_outputs_(), but launches the crop kernel into the persistent
     // device_pixel_*() buffers instead of downloading and cropping on the host.
     void build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) const;
+    // insertion-order seed/vertex id -> batch pipeline's sorted (x asc, y asc)
+    // id, or the id unchanged if out of range. Shared by build_tri_map_,
+    // build_outputs_ and get_voronoi_grid, which all translate through
+    // h_sorted_rank_ the same way; each still calls ensure_sorted_rank_()
+    // itself first, since this is a pure lookup.
+    int32_t translate_to_sorted_rank_(int32_t internal) const;
 
     static uint64_t pack_triplet_(int32_t a, int32_t b, int32_t c) {
         return (uint64_t(a) << 42) | (uint64_t(b) << 21) | uint64_t(c);

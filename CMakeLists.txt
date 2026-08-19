@@ -20,6 +20,12 @@ if(WITH_CUDA)
         src/cuda/voronoi.cu
         src/cuda/triangulation.cu
         src/cuda/delaunay.cu
+        src/cuda/delaunay_voronoi.cu
+        src/cuda/delaunay_topology.cu
+        src/cuda/delaunay_assign.cu
+        src/cuda/delaunay_query.cu
+        src/cuda/delaunay_scalar_field.cu
+        src/cuda/delaunay_output.cu
     )
 
     target_include_directories(_delauney_cuda PRIVATE src/cuda)

@@ -5,678 +5,18 @@
 // API_REFERENCE.md documents the Python-facing contract.
 //
 // `seeds` / `seed_positions` must be a sequence of (x, y) pairs.
-// Seed ordering (ascending x, tiebreak ascending y) is applied here so that
-// the CUDA API matches the Python reference exactly.
-
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
-#include <pybind11/stl.h>
-
-#include "voronoi.cuh"
-#include "triangulation.cuh"
-#include "delaunay.cuh"
-
-#include <cuda_runtime.h>
-
-#include <algorithm>
-#include <cmath>
-#include <stdexcept>
-#include <string>
-#include <vector>
-
-namespace py = pybind11;
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-// Sort seeds by (x asc, y asc) and return the sorted list.
-static std::vector<Seed> sort_seeds(const py::object& seeds_obj, int W, int H)
-{
-    std::vector<Seed> seeds;
-    for (auto item : seeds_obj) {
-        auto pair = item.cast<py::sequence>();
-        int x = pair[0].cast<int>();
-        int y = pair[1].cast<int>();
-        if (x < 0 || x >= W || y < 0 || y >= H)
-            throw std::invalid_argument("seed coordinate out of bounds");
-        seeds.push_back({x, y});
-    }
-    if (seeds.empty())
-        throw std::invalid_argument("seeds must not be empty");
-
-    std::sort(seeds.begin(), seeds.end(), [](const Seed& a, const Seed& b) {
-        return (a.x != b.x) ? (a.x < b.x) : (a.y < b.y);
-    });
-
-    for (size_t i = 1; i < seeds.size(); ++i) {
-        if (seeds[i].x == seeds[i-1].x && seeds[i].y == seeds[i-1].y)
-            throw std::invalid_argument("duplicate seed positions are not allowed");
-    }
-    return seeds;
-}
-
-// ---------------------------------------------------------------------------
-// Voronoi wrapper
-// ---------------------------------------------------------------------------
-
-class PyVoronoi {
-public:
-    py::array_t<int32_t> compute(int width, int height, const py::object& seeds_obj)
-    {
-        auto seeds = sort_seeds(seeds_obj, width, height);
-
-        std::vector<int32_t> flat;
-        cuda_compute_voronoi(width, height, seeds, flat);
-
-        // flat layout: (y * W + x) * 2 → [seed_id, distance]
-        // NumPy layout: (H, W, 2)
-        py::array_t<int32_t> result({height, width, 2});
-        std::memcpy(result.mutable_data(), flat.data(),
-                    flat.size() * sizeof(int32_t));
-        return result;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// GridTriangulation wrapper
-// ---------------------------------------------------------------------------
-
-// A negative border_padding means "use the library default" -- the int-typed
-// spelling of the reference's border_padding=None.
-//
-// DEFAULT_BORDER_PADDING is a fixed constant rather than a per-call density
-// estimate such as sqrt(area / n_seeds): circumradius depends on triangle
-// shape, not seed count, and grows without limit as three points approach
-// collinearity, at any seed count. The padding a seed set needs is bounded
-// only when the caller controls how densely the hull boundary is sampled.
-// See BORDER_PADDING_BOUND.md.
-static int resolve_border_padding(int border_padding, int, int, int)
-{
-    if (border_padding >= 0) return border_padding;
-    return DEFAULT_BORDER_PADDING;
-}
-
-//: Pack a triangulation into the (triangle_map, grid) pair Python sees.
-//:
-//: Triangles are held C++-side as a contiguous vector whose index IS the
-//: triangle id. The dict form rebuilds that as one Python int plus one 5-tuple
-//: per triangle; as_arrays hands back the (N_tri, 3) indices instead, skipping
-//: the per-triangle Python objects.
-//:
-//: One definition shared by all three entry points, avoiding the same kind of
-//: drift the detection kernel guards against by sharing its rule (see
-//: triangle_detect.cuh).
-static py::tuple _build_output(const std::vector<TriangleEntry>& tri_map,
-                               const std::vector<int32_t>& flat_out,
-                               int H, int W, bool as_arrays = false)
-{
-    py::array_t<int32_t> out_arr({H, W, 3});
-    std::memcpy(out_arr.mutable_data(), flat_out.data(),
-                flat_out.size() * sizeof(int32_t));
-
-    const int32_t n_tri = (int32_t)tri_map.size();
-    if (as_arrays) {
-        py::array_t<int32_t> verts({(int)n_tri, 3});
-        auto* p = verts.mutable_data();
-        for (int32_t tid = 0; tid < n_tri; ++tid) {
-            p[tid * 3]     = tri_map[tid].id_a;
-            p[tid * 3 + 1] = tri_map[tid].id_b;
-            p[tid * 3 + 2] = tri_map[tid].id_c;
-        }
-        return py::make_tuple(verts, out_arr);
-    }
-
-    py::dict py_map;
-    for (int32_t tid = 0; tid < n_tri; ++tid) {
-        const auto& e = tri_map[tid];
-        py_map[py::int_(tid)] = py::make_tuple(e.x, e.y, e.id_a, e.id_b, e.id_c);
-    }
-    return py::make_tuple(py_map, out_arr);
-}
-
-class PyGridTriangulation {
-public:
-    py::tuple compute(
-        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
-        const py::object& seeds_obj,
-        int border_padding = -1,
-        bool as_arrays = false)
-    {
-        auto info = vgrid.request();
-        if (info.ndim != 3 || info.shape[2] != 2)
-            throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
-
-        int H = static_cast<int>(info.shape[0]);
-        int W = static_cast<int>(info.shape[1]);
-
-        auto seeds = sort_seeds(seeds_obj, W, H);
-        int N_seeds = static_cast<int>(seeds.size());
-        border_padding = resolve_border_padding(border_padding, W, H, N_seeds);
-
-        std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
-        for (int i = 0; i < N_seeds; ++i) {
-            seed_xs[i] = seeds[i].x;
-            seed_ys[i] = seeds[i].y;
-        }
-
-        std::vector<TriangleEntry> tri_map;
-        std::vector<int32_t> flat_out;
-
-        cuda_compute_triangulation(W, H,
-            static_cast<const int32_t*>(info.ptr),
-            seed_xs, seed_ys, tri_map, flat_out, nullptr, border_padding);
-
-        return _build_output(tri_map, flat_out, H, W, as_arrays);
-    }
-
-    py::tuple compute_timed(
-        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
-        const py::object& seeds_obj,
-        int border_padding = -1)
-    {
-        auto info = vgrid.request();
-        if (info.ndim != 3 || info.shape[2] != 2)
-            throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
-
-        int H = static_cast<int>(info.shape[0]);
-        int W = static_cast<int>(info.shape[1]);
-
-        auto seeds = sort_seeds(seeds_obj, W, H);
-        int N_seeds = static_cast<int>(seeds.size());
-        border_padding = resolve_border_padding(border_padding, W, H, N_seeds);
-        std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
-        for (int i = 0; i < N_seeds; ++i) {
-            seed_xs[i] = seeds[i].x;
-            seed_ys[i] = seeds[i].y;
-        }
-
-        std::vector<TriangleEntry> tri_map;
-        std::vector<int32_t> flat_out;
-        TriTimings timings;
-
-        cuda_compute_triangulation(W, H,
-            static_cast<const int32_t*>(info.ptr),
-            seed_xs, seed_ys, tri_map, flat_out, &timings, border_padding);
-
-        py::dict py_timings;
-        py_timings["detect_ms"] = timings.detect_ms;
-        py_timings["dedup_ms"]  = timings.dedup_ms;
-        py_timings["assign_ms"] = timings.assign_ms;
-
-        // Timing/debug variants keep the dict form; not a hot path.
-        auto result = _build_output(tri_map, flat_out, H, W, /*as_arrays=*/false);
-        return py::make_tuple(result[0], result[1], py_timings);
-    }
-
-    py::tuple compute_debug(
-        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& vgrid,
-        const py::object& seeds_obj,
-        int border_padding = -1)
-    {
-        auto info = vgrid.request();
-        if (info.ndim != 3 || info.shape[2] != 2)
-            throw std::invalid_argument("voronoi_grid must have shape (H, W, 2)");
-
-        int H = static_cast<int>(info.shape[0]);
-        int W = static_cast<int>(info.shape[1]);
-
-        auto seeds = sort_seeds(seeds_obj, W, H);
-        int N_seeds = static_cast<int>(seeds.size());
-        border_padding = resolve_border_padding(border_padding, W, H, N_seeds);
-        std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
-        for (int i = 0; i < N_seeds; ++i) {
-            seed_xs[i] = seeds[i].x;
-            seed_ys[i] = seeds[i].y;
-        }
-
-        std::vector<TriangleEntry> tri_map;
-        std::vector<int32_t> flat_out;
-        std::vector<int32_t> padded_flat;
-
-        cuda_compute_triangulation(W, H,
-            static_cast<const int32_t*>(info.ptr),
-            seed_xs, seed_ys, tri_map, flat_out,
-            nullptr, border_padding, &padded_flat);
-
-        int H_det = H + 2 * border_padding;
-        int W_det = W + 2 * border_padding;
-        py::array_t<int32_t> padded_arr({H_det, W_det, 2});
-        if (!padded_flat.empty())
-            std::memcpy(padded_arr.mutable_data(), padded_flat.data(),
-                        padded_flat.size() * sizeof(int32_t));
-
-        // Timing/debug variants keep the dict form; not a hot path.
-        auto result = _build_output(tri_map, flat_out, H, W, /*as_arrays=*/false);
-        return py::make_tuple(result[0], result[1], padded_arr);
-    }
-
-};
-
-// ---------------------------------------------------------------------------
-// Device-resident view, returned by PyDelaunay::finalise_device()
-// ---------------------------------------------------------------------------
-
-//: A read-only window onto one of a Delaunay object's device buffers,
-//: exposed to Python as __cuda_array_interface__ only -- no other way to
-//: reach the pointer. Deliberately not a registry: one view, one owner, one
-//: buffer, found only via finalise_device()'s return value.
-//:
-//: Two independent things keep this safe to hand to another CUDA extension:
-//: `owner_` is a reference to the parent Delaunay's Python object, so
-//: ordinary refcounting keeps the device memory allocated for as long as any
-//: view over it is reachable, even if the caller's own reference to the mesh
-//: has already been reassigned. `mesh_` lets __cuda_array_interface__ compare
-//: the mesh's *current* generation() against the value snapshotted when this
-//: view was made, so a view read after the mesh was mutated again raises
-//: instead of silently exposing memory that has moved on.
-class PyDeviceArrayView {
-public:
-    PyDeviceArrayView(py::object owner, const Delaunay* mesh,
-                      const void* ptr, py::ssize_t count,
-                      std::string typestr, uint64_t generation)
-        : owner_(std::move(owner)), mesh_(mesh), ptr_(ptr), count_(count),
-          typestr_(std::move(typestr)), generation_(generation) {}
-
-    py::dict cuda_array_interface() const
-    {
-        if (mesh_->generation() != generation_)
-            throw std::runtime_error(
-                "device view is stale: the mesh was mutated after "
-                "finalise_device() produced this view");
-        py::dict d;
-        d["shape"]   = py::make_tuple(count_);
-        d["typestr"] = typestr_;
-        d["data"]    = py::make_tuple((uintptr_t)ptr_, /*read_only=*/true);
-        d["strides"] = py::none();
-        d["version"] = 3;
-        return d;
-    }
-
-    // A plain host numpy array with this view's contents -- for a debug/
-    // inspection consumer that cannot take a __cuda_array_interface__ (no
-    // cupy/torch dependency), not the interpolation hot path, which reads
-    // the device pointer directly instead. Same staleness check as above.
-    py::array to_host() const
-    {
-        if (mesh_->generation() != generation_)
-            throw std::runtime_error(
-                "device view is stale: the mesh was mutated after "
-                "finalise_device() produced this view");
-        if (typestr_ == "<i4") {
-            py::array_t<int32_t> out(count_);
-            cudaMemcpy(out.mutable_data(), ptr_,
-                       (size_t)count_ * sizeof(int32_t), cudaMemcpyDeviceToHost);
-            return out;
-        }
-        if (typestr_ == "|u1") {
-            py::array_t<uint8_t> out(count_);
-            cudaMemcpy(out.mutable_data(), ptr_,
-                       (size_t)count_ * sizeof(uint8_t), cudaMemcpyDeviceToHost);
-            return out;
-        }
-        throw std::runtime_error("to_host(): unsupported typestr '" + typestr_ + "'");
-    }
-
-private:
-    py::object owner_;        // keeps the parent Delaunay (and its buffers) alive
-    const Delaunay* mesh_;    // valid as long as owner_ is -- see above
-    const void* ptr_;
-    py::ssize_t count_;
-    std::string typestr_;
-    uint64_t generation_;     // snapshot at construction time
-};
-
-// ---------------------------------------------------------------------------
-// Delaunay wrapper
-// ---------------------------------------------------------------------------
-
-class PyDelaunay {
-public:
-    PyDelaunay(int width, int height, int max_seeds,
-                          int border_padding)
-        : impl_(width, height, max_seeds, border_padding) {}
-
-    py::tuple insert(const py::object& seeds_obj, bool as_arrays)
-    {
-        std::vector<int32_t> xs, ys;
-        _parse_seeds(seeds_obj, xs, ys);
-        std::vector<TriangleEntry> tri_map;
-        std::vector<int32_t> tgrid;
-        impl_.insert(xs, ys, tri_map, tgrid);
-        return _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
-                             as_arrays);
-    }
-
-    py::tuple insert_timed(const py::object& seeds_obj, bool as_arrays)
-    {
-        std::vector<int32_t> xs, ys;
-        _parse_seeds(seeds_obj, xs, ys);
-        std::vector<TriangleEntry> tri_map;
-        std::vector<int32_t> tgrid;
-        InsertTimings t;
-        impl_.insert(xs, ys, tri_map, tgrid, &t);
-        auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
-                                 as_arrays);
-        return py::make_tuple(out[0], out[1], _timings_dict(t));
-    }
-
-    void insert_deferred(const py::object& seeds_obj,
-                         const py::object& values_obj)
-    {
-        std::vector<int32_t> xs, ys;
-        _parse_seeds(seeds_obj, xs, ys);
-        if (values_obj.is_none()) { impl_.insert_deferred(xs, ys); return; }
-        auto v = values_obj.cast<py::array_t<float,
-                     py::array::c_style | py::array::forcecast>>();
-        std::vector<float> vals(v.data(), v.data() + v.size());
-        impl_.insert_deferred(xs, ys, nullptr, &vals);
-    }
-
-    py::array_t<int32_t> get_seeds() const
-    {
-        std::vector<int32_t> flat;
-        impl_.get_seeds(flat);
-        const int n = (int)(flat.size() / 2);
-        py::array_t<int32_t> arr({n, 2});
-        if (n > 0)
-            std::memcpy(arr.mutable_data(), flat.data(),
-                        flat.size() * sizeof(int32_t));
-        return arr;
-    }
-
-    py::array_t<int32_t> locate(
-        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& pts)
-    {
-        auto info = pts.request();
-        if (info.ndim != 2 || info.shape[1] != 2)
-            throw std::invalid_argument("points must have shape (N, 2)");
-        const int n = (int)info.shape[0];
-        const auto* p = static_cast<const int32_t*>(info.ptr);
-        std::vector<int32_t> xs(n), ys(n);
-        for (int i = 0; i < n; ++i) { xs[i] = p[i * 2]; ys[i] = p[i * 2 + 1]; }
-
-        std::vector<int32_t> out;
-        impl_.locate(xs, ys, out);
-        py::array_t<int32_t> arr((py::ssize_t)out.size());
-        if (!out.empty())
-            std::memcpy(arr.mutable_data(), out.data(),
-                        out.size() * sizeof(int32_t));
-        return arr;
-    }
-
-    py::tuple in_circumsphere(
-        const py::array_t<int32_t, py::array::c_style | py::array::forcecast>& pts,
-        const py::array_t<double, py::array::c_style | py::array::forcecast>& t)
-    {
-        auto info = pts.request();
-        if (info.ndim != 2 || info.shape[1] != 2)
-            throw std::invalid_argument("points must have shape (N, 2)");
-        const int n = (int)info.shape[0];
-        if ((int)t.size() != n)
-            throw std::invalid_argument("t must have one entry per point");
-
-        const auto* p = static_cast<const int32_t*>(info.ptr);
-        std::vector<int32_t> xs(n), ys(n);
-        for (int i = 0; i < n; ++i) { xs[i] = p[i*2]; ys[i] = p[i*2+1]; }
-        std::vector<double> ts(t.data(), t.data() + n);
-
-        std::vector<uint8_t> mask;
-        std::vector<int32_t> tids;
-        impl_.in_circumsphere(xs, ys, ts, mask, tids);
-
-        py::array_t<bool> m((py::ssize_t)mask.size());
-        py::array_t<int32_t> ti((py::ssize_t)tids.size());
-        auto* mp = m.mutable_data();
-        for (size_t i = 0; i < mask.size(); ++i) mp[i] = mask[i] != 0;
-        if (!tids.empty())
-            std::memcpy(ti.mutable_data(), tids.data(),
-                        tids.size() * sizeof(int32_t));
-        return py::make_tuple(m, ti);
-    }
-
-    py::array_t<float> get_values() const
-    {
-        std::vector<float> v;
-        impl_.get_values(v);
-        py::array_t<float> arr((py::ssize_t)v.size());
-        if (!v.empty())
-            std::memcpy(arr.mutable_data(), v.data(), v.size() * sizeof(float));
-        return arr;
-    }
-
-    py::array_t<float> edge_scores(double min_length) const
-    {
-        std::vector<float> sc;
-        impl_.edge_scores(min_length, sc);
-        py::array_t<float> arr((py::ssize_t)sc.size());
-        if (!sc.empty())
-            std::memcpy(arr.mutable_data(), sc.data(), sc.size() * sizeof(float));
-        return arr;
-    }
-
-    py::array_t<int32_t> select_midpoints(double min_length, int count,
-                                          float threshold) const
-    {
-        std::vector<int32_t> flat;
-        impl_.select_midpoints(min_length, count, threshold, flat);
-        const int n = (int)(flat.size() / 2);
-        py::array_t<int32_t> arr({n, 2});
-        if (n > 0)
-            std::memcpy(arr.mutable_data(), flat.data(),
-                        flat.size() * sizeof(int32_t));
-        return arr;
-    }
-
-    py::dict insert_deferred_timed(const py::object& seeds_obj)
-    {
-        std::vector<int32_t> xs, ys;
-        _parse_seeds(seeds_obj, xs, ys);
-        InsertTimings t;
-        impl_.insert_deferred(xs, ys, &t);
-        return _timings_dict(t);
-    }
-
-    py::tuple finalise(bool as_arrays)
-    {
-        std::vector<TriangleEntry> tri_map;
-        std::vector<int32_t> tgrid;
-        impl_.finalise(tri_map, tgrid);
-        return _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
-                             as_arrays);
-    }
-
-    py::tuple finalise_timed(bool as_arrays)
-    {
-        std::vector<TriangleEntry> tri_map;
-        std::vector<int32_t> tgrid;
-        InsertTimings t;
-        impl_.finalise(tri_map, tgrid, &t);
-        auto out = _build_output(tri_map, tgrid, impl_.height(), impl_.width(),
-                                 as_arrays);
-        return py::make_tuple(out[0], out[1], _timings_dict(t));
-    }
-
-    // As finalise(as_arrays=True), except the (H,W,3) raster never comes back
-    // to the host: pixel_tids, pixel_seed_ids and outside_hull_mask are
-    // returned as __cuda_array_interface__ views straight onto the Delaunay
-    // object's own device memory instead. Returns
-    // (triangle_verts, pixel_tids, pixel_seed_ids, outside_hull_mask).
-    py::tuple finalise_device()
-    {
-        std::vector<TriangleEntry> tri_map;
-        impl_.finalise_device(tri_map);
-
-        py::array_t<int32_t> verts({(int)tri_map.size(), 3});
-        auto* p = verts.mutable_data();
-        for (size_t tid = 0; tid < tri_map.size(); ++tid) {
-            p[tid * 3]     = tri_map[tid].id_a;
-            p[tid * 3 + 1] = tri_map[tid].id_b;
-            p[tid * 3 + 2] = tri_map[tid].id_c;
-        }
-
-        // The existing Python wrapper for `this` -- reference, not a new
-        // object, since pybind11 already owns one. This is what each view
-        // keeps alive; see PyDeviceArrayView.
-        py::object self = py::cast(this, py::return_value_policy::reference);
-        const py::ssize_t n = (py::ssize_t)impl_.width() * impl_.height();
-        const uint64_t gen = impl_.generation();
-
-        py::object pixel_tids = py::cast(PyDeviceArrayView(
-            self, &impl_, impl_.device_pixel_tids(), n, "<i4", gen));
-        py::object pixel_seed_ids = py::cast(PyDeviceArrayView(
-            self, &impl_, impl_.device_pixel_seed_ids(), n, "<i4", gen));
-        py::object outside_mask = py::cast(PyDeviceArrayView(
-            self, &impl_, impl_.device_outside_mask(), n, "|u1", gen));
-
-        return py::make_tuple(verts, pixel_tids, pixel_seed_ids, outside_mask);
-    }
-
-    // (N_tri, 3) vertex ids only -- no raster, no canonical pixels.
-    py::array_t<int32_t> get_triangles() const
-    {
-        std::vector<TriangleEntry> tris;
-        impl_.get_triangles(tris);
-        const int n = (int)tris.size();
-        py::array_t<int32_t> arr({n, 3});
-        auto* p = arr.mutable_data();
-        for (int i = 0; i < n; ++i) {
-            p[i*3]   = tris[i].id_a;
-            p[i*3+1] = tris[i].id_b;
-            p[i*3+2] = tris[i].id_c;
-        }
-        return arr;
-    }
-
-    py::array_t<int32_t> get_edges() const
-    {
-        std::vector<int32_t> flat;
-        impl_.get_edges(flat);
-        const int n = (int)(flat.size() / 2);
-        py::array_t<int32_t> arr({n, 2});
-        if (n > 0)
-            std::memcpy(arr.mutable_data(), flat.data(),
-                        flat.size() * sizeof(int32_t));
-        return arr;
-    }
-
-    py::array_t<int32_t> sorted_rank() const
-    {
-        const auto& r = impl_.sorted_rank();
-        py::array_t<int32_t> arr((py::ssize_t)r.size());
-        if (!r.empty())
-            std::memcpy(arr.mutable_data(), r.data(), r.size() * sizeof(int32_t));
-        return arr;
-    }
-
-    py::array_t<int32_t> get_voronoi_grid() const
-    {
-        std::vector<int32_t> flat;
-        impl_.get_voronoi_grid(flat);
-        int H = impl_.height(), W = impl_.width();
-        py::array_t<int32_t> arr({H, W, 2});
-        std::memcpy(arr.mutable_data(), flat.data(), flat.size() * sizeof(int32_t));
-        return arr;
-    }
-
-    int  seed_count()     const { return impl_.seed_count(); }
-    int  width()          const { return impl_.width(); }
-    int  height()         const { return impl_.height(); }
-    int  border_padding() const { return impl_.border_padding(); }
-    bool has_pending()    const { return impl_.has_pending(); }
-
-private:
-    Delaunay impl_;
-
-    static py::dict _timings_dict(const InsertTimings& t)
-    {
-        py::dict d;
-        d["bfs_ms"]    = t.bfs_ms;
-        d["bfs_iters"] = t.bfs_iters;
-        d["detect_ms"] = t.detect_ms;
-        d["dedup_ms"]  = t.dedup_ms;
-        d["assign_ms"] = t.assign_ms;
-        return d;
-    }
-
-    static void _parse_seeds(const py::object& seeds_obj,
-                             std::vector<int32_t>& xs, std::vector<int32_t>& ys)
-    {
-        // Fast path for the (N, 2) integer arrays callers actually pass. The
-        // generic path below casts two Python objects per seed, which is fine
-        // for a handful and not for the thousands a refinement round inserts.
-        if (py::isinstance<py::array>(seeds_obj)) {
-            auto arr = py::array_t<int32_t, py::array::c_style |
-                                            py::array::forcecast>::ensure(seeds_obj);
-            if (arr && arr.ndim() == 2 && arr.shape(1) == 2) {
-                const py::ssize_t n = arr.shape(0);
-                const int32_t* p = arr.data();
-                xs.resize(n); ys.resize(n);
-                for (py::ssize_t i = 0; i < n; ++i) {
-                    xs[i] = p[i*2];
-                    ys[i] = p[i*2 + 1];
-                }
-                return;
-            }
-        }
-        for (auto item : seeds_obj) {
-            auto pair = item.cast<py::sequence>();
-            xs.push_back(pair[0].cast<int32_t>());
-            ys.push_back(pair[1].cast<int32_t>());
-        }
-    }
-
-};
-
-// ---------------------------------------------------------------------------
-// triangulate: seeds in, triangulation out
-// ---------------------------------------------------------------------------
-
-//: The whole pipeline in one call, and the one callers should reach for.
-//:
-//: Voronoi().compute() followed by GridTriangulation().compute() was the usual
-//: pairing, and at any padding above 0 it built the diagram twice: once in the
-//: caller, and once inside the triangulator on the padded canvas, because
-//: detection needs the padded one. The caller's copy then served only to fill
-//: two output channels that the padded diagram already contains in its interior
-//: window. Going through here computes it once.
-static py::tuple triangulate(
-    int width, int height,
-    const py::object& seeds_obj,
-    int border_padding = -1,
-    bool as_arrays = false)
-{
-    if (width <= 0 || height <= 0)
-        throw std::invalid_argument("width and height must be positive");
-
-    auto seeds = sort_seeds(seeds_obj, width, height);
-    int N_seeds = static_cast<int>(seeds.size());
-    border_padding = resolve_border_padding(border_padding, width, height, N_seeds);
-
-    std::vector<int32_t> seed_xs(N_seeds), seed_ys(N_seeds);
-    for (int i = 0; i < N_seeds; ++i) {
-        seed_xs[i] = seeds[i].x;
-        seed_ys[i] = seeds[i].y;
-    }
-
-    std::vector<TriangleEntry> tri_map;
-    std::vector<int32_t> flat_out;
-
-    // nullptr is the point of this function: the triangulator builds whichever
-    // diagram it actually needs and nothing else.
-    cuda_compute_triangulation(width, height, nullptr,
-        seed_xs, seed_ys, tri_map, flat_out, nullptr, border_padding);
-
-    return _build_output(tri_map, flat_out, height, width, as_arrays);
-}
-
-// ---------------------------------------------------------------------------
-// Module definition
-// ---------------------------------------------------------------------------
+// Seed ordering is (ascending x, tiebreak ascending y).
+
+#include "bindings/binding_helpers.hpp"
+#include "bindings/py_voronoi.hpp"
+#include "bindings/py_grid_triangulation.hpp"
+#include "bindings/py_device_array_view.hpp"
+#include "bindings/py_delaunay.hpp"
+#include "bindings/triangulate.hpp"
 
 PYBIND11_MODULE(_delauney_cuda, m)
 {
-    m.doc() = "CUDA-accelerated Voronoi + Delaunay triangulation";
+    m.doc() = "CUDA-accelerated Voronoi + Delaunay triangulation on bounded integer coordinates";
 
     py::class_<PyVoronoi>(m, "Voronoi")
         .def(py::init<>())
@@ -688,15 +28,11 @@ PYBIND11_MODULE(_delauney_cuda, m)
 
     m.def("triangulate", &triangulate,
           py::arg("width"), py::arg("height"), py::arg("seeds"),
-          py::arg("border_padding") = -1,
+          py::arg("border_padding") = AUTO_BORDER_PADDING,
           py::arg("as_arrays") = false,
           "Triangulate a seed set. The normal entry point.\n\n"
           "Equivalent to Voronoi().compute() followed by\n"
-          "GridTriangulation().compute(), but builds the Voronoi diagram once\n"
-          "instead of twice: at border_padding > 0 the triangulator needs a\n"
-          "padded diagram for detection, and the interior window of that one is\n"
-          "bit-identical to the unpadded diagram a caller would compute, so the\n"
-          "caller's copy was pure duplicate work.\n\n"
+          "GridTriangulation().compute(), but builds the Voronoi diagram only once.\n"
           "border_padding: pixels of Voronoi canvas added on each side before\n"
           "detection, exposing border triangles whose circumcentre lies outside\n"
           "the image. Negative (the default) uses DEFAULT_BORDER_PADDING; 0\n"
@@ -708,7 +44,7 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def(py::init<>())
         .def("compute", &PyGridTriangulation::compute,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
-             py::arg("border_padding") = -1,
+             py::arg("border_padding") = AUTO_BORDER_PADDING,
              py::arg("as_arrays") = false,
              "Extract a Delaunay triangulation from a Voronoi grid.\n\n"
              "border_padding: pixels of Voronoi canvas to add on each side\n"
@@ -726,13 +62,13 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "contains carry -1 in channel 2 of the grid.")
         .def("compute_timed", &PyGridTriangulation::compute_timed,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
-             py::arg("border_padding") = -1,
+             py::arg("border_padding") = AUTO_BORDER_PADDING,
              "Same as compute() but also returns a timings dict.\n\n"
              "Returns (triangle_map, triangulation_grid, timings) where "
              "timings has keys detect_ms, dedup_ms, assign_ms (float, ms).")
         .def("compute_debug", &PyGridTriangulation::compute_debug,
              py::arg("voronoi_grid"), py::arg("seed_positions"),
-             py::arg("border_padding") = -1,
+             py::arg("border_padding") = AUTO_BORDER_PADDING,
              "Same as compute() but also returns the padded Voronoi grid.\n\n"
              "Returns (triangle_map, triangulation_grid, padded_voronoi_grid) where "
              "padded_voronoi_grid has shape (H+2*P, W+2*P, 2).");
@@ -750,7 +86,7 @@ PYBIND11_MODULE(_delauney_cuda, m)
     py::class_<PyDelaunay>(m, "Delaunay")
         .def(py::init<int, int, int, int>(),
              py::arg("width"), py::arg("height"), py::arg("max_seeds"),
-             py::arg("border_padding") = -1,
+             py::arg("border_padding") = AUTO_BORDER_PADDING,
              "Create an incremental Delaunay triangulator with device-resident state.\n\n"
              "max_seeds: upper bound on total seeds ever inserted.\n"
              "border_padding: width of the padded detection canvas; < 0 uses\n"
@@ -770,7 +106,10 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "Returns (triangle_map, triangulation_grid) where triangle_map is\n"
              "{int: (x,y,id_a,id_b,id_c)}, or an (N_tri, 3) vertex-id array when\n"
              "as_arrays=True, and triangulation_grid has shape (H,W,3).\n\n"
-             "Equivalent to insert_deferred() followed by finalise().")
+             "Equivalent to insert_deferred() followed by finalise(). Use this\n"
+             "when you need the triangulation grid back after every batch; use\n"
+             "insert_deferred() instead when you are about to insert several\n"
+             "batches in a row and only need the grid after the last one.")
         .def("insert_timed", &PyDelaunay::insert_timed,
              py::arg("seeds"), py::arg("as_arrays") = false,
              "Same as insert() but also returns a timings dict with keys\n"
@@ -797,7 +136,8 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "return (triangle_map, triangulation_grid).\n\n"
              "Picks a masked or a full assignment by whichever covers less work,\n"
              "so a small accumulated change stays cheap.  Calling this with\n"
-             "nothing pending just rebuilds the outputs.")
+             "nothing pending just rebuilds the outputs. Call this once after a\n"
+             "run of insert_deferred() calls.")
         .def("finalise_timed", &PyDelaunay::finalise_timed,
              py::arg("as_arrays") = false,
              "Same as finalise() but also returns the timings dict.")
