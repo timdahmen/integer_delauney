@@ -136,7 +136,7 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "it and call finalise() once.  get_triangles() stays valid in\n"
              "between; the triangulation grid does not.")
         .def("insert_deferred_timed", &PyDelaunay::insert_deferred_timed,
-             py::arg("seeds"),
+             py::arg("seeds"), py::arg("values") = py::none(),
              "Same as insert_deferred() but returns the timings dict.\n"
              "assign_ms is always 0 here; it is reported by finalise().")
         .def("finalise", &PyDelaunay::finalise,

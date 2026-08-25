@@ -39,12 +39,20 @@ public:
         impl_.insert_deferred(xs, ys, nullptr, &vals);
     }
 
-    py::dict insert_deferred_timed(const py::object& seeds_obj)
+    py::dict insert_deferred_timed(const py::object& seeds_obj,
+                                   const py::object& values_obj)
     {
         std::vector<int32_t> xs, ys;
         _parse_seeds(seeds_obj, xs, ys);
         InsertTimings t;
-        impl_.insert_deferred(xs, ys, &t);
+        if (values_obj.is_none()) {
+            impl_.insert_deferred(xs, ys, &t);
+            return _timings_dict(t);
+        }
+        auto v = values_obj.cast<py::array_t<float,
+                     py::array::c_style | py::array::forcecast>>();
+        std::vector<float> vals(v.data(), v.data() + v.size());
+        impl_.insert_deferred(xs, ys, &t, &vals);
         return _timings_dict(t);
     }
 

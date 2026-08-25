@@ -267,6 +267,16 @@ class TestDeferredApi:
         _, _, t_fin = inc.finalise_timed()
         assert t_fin["assign_ms"] > 0.0
 
+    def test_timed_variant_keeps_values_in_sync(self):
+        """insert_deferred_timed must accept values exactly like
+        insert_deferred -- it once silently dropped them."""
+        rng = np.random.default_rng(12)
+        seeds = scattered_seeds(40, rng)
+        vals = np.arange(len(seeds), dtype=np.float32)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        inc.insert_deferred_timed(seeds, vals)
+        np.testing.assert_array_equal(inc.get_values(), vals)
+
 
 # ---------------------------------------------------------------------------
 # Retired slots
