@@ -69,7 +69,16 @@ class TestCudaMatchesReference:
             f"ref  seed_ids:\n{ref_grid[:,:,0]}"
         )
 
-    def test_large_grid(self, cuda_vd, ref_vd):
+    @pytest.mark.parametrize("n_seeds,W,H,seed", [
+        (20, 128, 128, 42),
+        # Denser: the jump-flood descent's large early jumps have more
+        # opportunity to resolve a tie differently than the cardinal,
+        # one-cell-per-pass sweep this used to be, before finishing with the
+        # same unit-step cleanup either way -- this is the regime most likely
+        # to expose a genuine correctness gap rather than a tie-break choice.
+        (300, 256, 256, 7),
+    ])
+    def test_large_grid(self, cuda_vd, ref_vd, n_seeds, W, H, seed):
         """Both paths must agree, except at cells equidistant from two seeds.
 
         The two update schedules can settle on different but equally correct
@@ -78,9 +87,8 @@ class TestCudaMatchesReference:
         wherever the nearest seed is unique, and at a tie the chosen seed must
         still be a nearest one.
         """
-        rng = np.random.default_rng(42)
-        W, H = 128, 128
-        coords = rng.integers(0, [W, H], size=(20, 2))
+        rng = np.random.default_rng(seed)
+        coords = rng.integers(0, [W, H], size=(n_seeds, 2))
         seeds = list(map(tuple, coords.tolist()))
         # deduplicate
         seeds = list(dict.fromkeys(seeds))

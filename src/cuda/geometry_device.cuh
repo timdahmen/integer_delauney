@@ -27,10 +27,20 @@ bool beats(int32_t a_id, int32_t a_d, int32_t b_id, int32_t b_d)
     return false;
 }
 
-//: One BFS propagation step for pixel (x, y): scan its 4 cardinal neighbours
-//: in `src` and return the best (seed_id, distance) among the pixel's current
-//: owner and each neighbour's owner. Returns whether that differs from the
-//: pixel's current value, so the caller knows to set its own convergence flag.
+//: One jump-flood propagation step for pixel (x, y) at jump distance `step`:
+//: scan its 8 neighbours offset by (+-step, +-step) (including the 4 purely
+//: cardinal ones, step in one axis and 0 in the other) in `src`, and return
+//: the best (seed_id, distance) among the pixel's current owner and each
+//: neighbour's owner. Returns whether that differs from the pixel's current
+//: value, so the caller knows to set its own convergence flag.
+//:
+//: step=1 is what used to be the only propagation rule here (plain BFS, one
+//: cell per pass); run_bfs_() (delaunay_voronoi.cu) and cuda_compute_voronoi()
+//: (voronoi.cu) now open with several passes at halving step sizes (jump
+//: flooding: https://en.wikipedia.org/wiki/Jump_flooding_algorithm) so a
+//: seed's influence can cross the canvas in O(log n) passes instead of one
+//: pixel at a time, then finish with step=1 passes until nothing changes --
+//: same convergence criterion as before, just reached in far fewer passes.
 //:
 //: Distance is recomputed directly from the seed position, never accumulated
 //: through neighbours -- that would give a Manhattan metric, not L2. Shared by
@@ -38,31 +48,46 @@ bool beats(int32_t a_id, int32_t a_d, int32_t b_id, int32_t b_d)
 //: what they do with the changed/unchanged result (an incremental dirty mask
 //: vs. nothing).
 __device__ __forceinline__
-bool voronoi_bfs_step(int x, int y, int W, int H,
+bool voronoi_jfa_step(int x, int y, int W, int H,
                       const int32_t* __restrict__ src,
                       const int32_t* __restrict__ seed_xs,
                       const int32_t* __restrict__ seed_ys,
+                      int step,
                       int32_t& best_id, int32_t& best_d)
 {
     const int base = (y * W + x) * 2;
     const int32_t cur_id = src[base], cur_d = src[base + 1];
     best_id = cur_id; best_d = cur_d;
 
-    const int dx[4] = {-1, 1,  0, 0};
-    const int dy[4] = { 0, 0, -1, 1};
-    for (int k = 0; k < 4; ++k) {
-        int nx = x + dx[k], ny = y + dy[k];
-        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
-        int32_t n_id = src[(ny * W + nx) * 2];
-        if (n_id == UNDEF_SEED) continue;
-        int32_t ndx = x - seed_xs[n_id];
-        int32_t ndy = y - seed_ys[n_id];
-        int32_t n_d = ndx * ndx + ndy * ndy;
-        if (best_id == UNDEF_SEED || beats(best_id, best_d, n_id, n_d)) {
-            best_id = n_id; best_d = n_d;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = x + dx * step, ny = y + dy * step;
+            if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+            int32_t n_id = src[(ny * W + nx) * 2];
+            if (n_id == UNDEF_SEED) continue;
+            int32_t ndx = x - seed_xs[n_id];
+            int32_t ndy = y - seed_ys[n_id];
+            int32_t n_d = ndx * ndx + ndy * ndy;
+            if (best_id == UNDEF_SEED || beats(best_id, best_d, n_id, n_d)) {
+                best_id = n_id; best_d = n_d;
+            }
         }
     }
     return best_id != cur_id || best_d != cur_d;
+}
+
+//: Starting jump distance for the descent above: the largest power of two
+//: that does not exceed the canvas's longer side. Halving this down to 1
+//: covers the whole canvas in ceil(log2(max(W,H)))+1 passes. Host-side
+//: scheduling helper, not a kernel -- shared so voronoi.cu's and
+//: delaunay_voronoi.cu's independent host loops use the same schedule.
+inline int jfa_start_step(int W, int H)
+{
+    int n = W > H ? W : H;
+    int step = 1;
+    while (step * 2 <= n) step *= 2;
+    return step;
 }
 
 __device__ __forceinline__

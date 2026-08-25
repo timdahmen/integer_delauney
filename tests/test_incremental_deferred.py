@@ -267,6 +267,22 @@ class TestDeferredApi:
         _, _, t_fin = inc.finalise_timed()
         assert t_fin["assign_ms"] > 0.0
 
+    def test_bfs_iters_scale_with_log_canvas_not_canvas_size(self):
+        """Regression guard for the jump-flood descent in run_bfs_()
+        (delaunay_voronoi.cu): a fresh insert on a 64x64 canvas should
+        converge in on the order of log2(64)=6 descent passes plus a small
+        cleanup, not the O(canvas size) passes plain unit-step BFS needed
+        before it -- historically as high as the full 64-pixel span."""
+        rng = np.random.default_rng(13)
+        seeds = scattered_seeds(40, rng)
+        inc = _cu.Delaunay(W, H, MAX_SEEDS, PADDING)
+        t = inc.insert_deferred_timed(seeds)
+        # Observed: 7 descent passes (log2(64)=6, so steps 64..1) plus a
+        # couple of BFS_CHECK_EVERY=8 cleanup batches -- comfortably under
+        # W, which plain unit-step BFS could need on its own for a single
+        # long-range propagation.
+        assert t["bfs_iters"] < W
+
     def test_timed_variant_keeps_values_in_sync(self):
         """insert_deferred_timed must accept values exactly like
         insert_deferred -- it once silently dropped them."""

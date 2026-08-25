@@ -1,18 +1,19 @@
-// CUDA kernel for Voronoi: parallel L2-distance Voronoi BFS.
+// CUDA kernel for Voronoi: parallel L2-distance Voronoi via jump flooding.
 //
 // Grid representation: flat int32 array of (seed_id, squared_l2_distance) pairs.
 // Index layout: cell (x, y) → base index (y * W + x) * 2.
 //   [base+0] = seed_id              (-1 = undefined)
 //   [base+1] = squared L2 distance  (0 at seed pixel)
 //
-// Each BFS step propagates seed identity one pixel in a cardinal direction.
-// Distance is NOT accumulated along the path — it is recomputed as the
-// direct squared Euclidean distance from the owning seed to the current pixel.
-// This makes the distance metric exact regardless of propagation direction.
+// Each step propagates seed identity by `step` pixels (jfa_start_step(),
+// halving to 1 -- see geometry_device.cuh). Distance is NOT accumulated
+// along the path — it is recomputed as the direct squared Euclidean distance
+// from the owning seed to the current pixel. This makes the distance metric
+// exact regardless of propagation direction.
 //
 // Double-buffer approach: kernel reads from `src`, writes to `dst`, then
 // the host swaps pointers. An `updated` device flag is OR-ed by any thread
-// that changes a cell; the loop stops when no thread sets it.
+// that changes a cell; the step=1 cleanup loop stops when no thread sets it.
 
 #include "voronoi.cuh"
 #include "geometry_device.cuh"
@@ -25,10 +26,12 @@
 #include <stdexcept>
 #include <vector>
 
-//: One synchronous BFS pass over the whole canvas: every pixel takes the best
-//: (seed_id, distance) among itself and its 4 neighbours (voronoi_bfs_step,
-//: geometry_device.cuh), and any pixel that changed sets `updated_flag` so
-//: the host knows to loop again.
+//: One synchronous jump-flood pass over the whole canvas at jump distance
+//: `step`: every pixel takes the best (seed_id, distance) among itself and
+//: its 8 neighbours at that distance (voronoi_jfa_step, geometry_device.cuh),
+//: and any pixel that changed sets `updated_flag` so the host knows to loop
+//: again (only consulted for the step=1 cleanup passes -- see
+//: cuda_compute_voronoi below).
 __global__
 void voronoi_step_kernel(
     const int32_t* __restrict__ src,
@@ -36,6 +39,7 @@ void voronoi_step_kernel(
     int W, int H,
     const int32_t* __restrict__ seed_xs,
     const int32_t* __restrict__ seed_ys,
+    int step,
     int32_t* __restrict__ updated_flag)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -43,7 +47,7 @@ void voronoi_step_kernel(
     if (x >= W || y >= H) return;
 
     int32_t best_id, best_d;
-    bool changed = voronoi_bfs_step(x, y, W, H, src, seed_xs, seed_ys, best_id, best_d);
+    bool changed = voronoi_jfa_step(x, y, W, H, src, seed_xs, seed_ys, step, best_id, best_d);
 
     int base = (y * W + x) * 2;
     dst[base]     = best_id;
@@ -97,11 +101,25 @@ void cuda_compute_voronoi(
     dim3 block(16, 16);
     dim3 grid((W + 15) / 16, (H + 15) / 16);
 
+    // Jump-flood descent: one pass per halving step size, unconditionally --
+    // see geometry_device.cuh's voronoi_jfa_step doc comment. d_flag is
+    // still passed (the kernel ORs into it unconditionally on any change)
+    // but never read back here; the cleanup loop below is what checks it,
+    // after resetting it to zero first.
+    for (int step = jfa_start_step(W, H); step >= 1; step /= 2) {
+        voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, d_sx, d_sy, step, d_flag);
+        CUDA_CHECK_LAST_ERROR();
+        CUDA_CHECK(cudaDeviceSynchronize());
+        int32_t* tmp = d_a; d_a = d_b; d_b = tmp;
+    }
+
+    // Cleanup: step=1 passes until nothing changes -- same fixed point the
+    // pre-JFA loop converged to, just reached in far fewer total passes.
     for (;;) {
         int32_t zero = 0;
         CUDA_CHECK(cudaMemcpy(d_flag, &zero, sizeof(int32_t), cudaMemcpyHostToDevice));
 
-        voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, d_sx, d_sy, d_flag);
+        voronoi_step_kernel<<<grid, block>>>(d_a, d_b, W, H, d_sx, d_sy, 1, d_flag);
         CUDA_CHECK_LAST_ERROR();
         CUDA_CHECK(cudaDeviceSynchronize());
 

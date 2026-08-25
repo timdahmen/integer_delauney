@@ -2,7 +2,7 @@
 // distance) grid and propagates the Voronoi diagram until it settles.
 #include "delaunay.cuh"
 #include "voronoi.cuh"           // UNDEF_SEED
-#include "geometry_device.cuh"   // beats
+#include "geometry_device.cuh"   // voronoi_jfa_step, jfa_start_step
 #include "phase_timer.cuh"
 #include "cuda_check.cuh"
 
@@ -24,14 +24,15 @@ void write_seeds_kernel(int32_t* grid, int32_t* changed_mask, int W,
     atomicOr(&changed_mask[ys[i] * W + xs[i]], 1);
 }
 
-//: voronoi.cu's step, plus marking each changed pixel in `changed_mask` so the
-//: topology stage (delaunay_topology.cu) knows which detection tiles to
-//: rescope to instead of rescanning the whole canvas.
+//: voronoi.cu's step at jump distance `step`, plus marking each changed pixel
+//: in `changed_mask` so the topology stage (delaunay_topology.cu) knows which
+//: detection tiles to rescope to instead of rescanning the whole canvas.
 __global__
 void voronoi_step_kernel(
     const int32_t* __restrict__ src,
     int32_t* __restrict__       dst,
     int W, int H,
+    int step,
     int32_t* __restrict__ updated_flag,
     int32_t* __restrict__ changed_mask,
     const int32_t* __restrict__ seed_xs,
@@ -42,7 +43,7 @@ void voronoi_step_kernel(
     if (x >= W || y >= H) return;
 
     int32_t best_id, best_d;
-    bool changed = voronoi_bfs_step(x, y, W, H, src, seed_xs, seed_ys, best_id, best_d);
+    bool changed = voronoi_jfa_step(x, y, W, H, src, seed_xs, seed_ys, step, best_id, best_d);
 
     int base = (y * W + x) * 2;
     dst[base]     = best_id;
@@ -54,13 +55,14 @@ void voronoi_step_kernel(
     }
 }
 
-//: BFS passes to run between convergence checks.
+//: Cleanup passes to run between convergence checks, after the jump-flood
+//: descent below.
 //:
 //: A pass costs about 23us of kernel; asking whether it changed anything costs
 //: a device synchronisation and two 4-byte transfers, which together run
 //: longer. Batching trades up to BFS_CHECK_EVERY - 1 passes that find nothing
-//: for one check instead of that many. Runs are 6 to 51 passes, so 8 keeps the
-//: waste under a fifth while removing seven eighths of the checks.
+//: for one check instead of that many. The descent leaves little for this loop
+//: to do -- usually 0-2 batches -- so waste here is capped low regardless.
 static constexpr int BFS_CHECK_EVERY = 8;
 
 void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
@@ -71,8 +73,28 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
     PhaseTimer<2> timer(bfs_ms_out != nullptr);
     timer.mark(0);
 
-    int32_t zero = 0;
     int iters = 0;
+
+    // Jump-flood descent: a seed's influence crosses the canvas in O(log n)
+    // passes instead of one pixel at a time. Unconditional, no convergence
+    // check per pass -- see geometry_device.cuh's voronoi_jfa_step doc
+    // comment. d_updated_flag_ is still passed (the kernel ORs into it
+    // unconditionally) but not read back until the cleanup loop below.
+    for (int step = jfa_start_step(W_det_, H_det_); step >= 1; step /= 2) {
+        ++iters;
+        voronoi_step_kernel<<<grid_dim, block>>>(
+            d_grid_, d_tmp_, W_det_, H_det_, step, d_updated_flag_, d_changed_,
+            d_sx_, d_sy_);
+        CUDA_CHECK_LAST_ERROR();
+        std::swap(d_grid_, d_tmp_);
+    }
+
+    // Cleanup: step=1 passes until nothing changes -- same fixed point the
+    // pre-JFA loop converged to (mod the pre-existing, documented tie-break
+    // nondeterminism -- see beats()'s doc comment), just reached in far
+    // fewer total passes since the descent above already did the long-range
+    // propagation.
+    int32_t zero = 0;
     for (;;) {
         CUDA_CHECK(cudaMemcpy(d_updated_flag_, &zero, sizeof(int32_t), cudaMemcpyHostToDevice));
 
@@ -88,7 +110,7 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
         for (int i = 0; i < BFS_CHECK_EVERY; ++i) {
             ++iters;
             voronoi_step_kernel<<<grid_dim, block>>>(
-                d_grid_, d_tmp_, W_det_, H_det_, d_updated_flag_, d_changed_,
+                d_grid_, d_tmp_, W_det_, H_det_, 1, d_updated_flag_, d_changed_,
                 d_sx_, d_sy_);
             CUDA_CHECK_LAST_ERROR();
             std::swap(d_grid_, d_tmp_);
@@ -100,7 +122,7 @@ void Delaunay::run_bfs_(float* bfs_ms_out, int* iters_out)
     }
     // Passes performed, not passes needed: convergence is noticed at the end of
     // a batch, so up to BFS_CHECK_EVERY - 1 of them found nothing to do. That
-    // is the cost being reported.
+    // is the cost being reported, on top of the descent's fixed pass count.
     if (iters_out) *iters_out = iters;
 
     timer.mark(1);
