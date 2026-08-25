@@ -143,6 +143,38 @@ Delaunay::~Delaunay()
     free_device_buffers_();
 }
 
+void Delaunay::reset()
+{
+    const int N = W_det_ * H_det_;
+
+    // Same memsets the constructor applies, over the same buffers -- no
+    // cudaMalloc, so this is the allocation-free half of construction.
+    CUDA_CHECK(cudaMemset(d_grid_,   SENTINEL_BYTE, (size_t)N * 2 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N     * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(d_changed_,  0, (size_t)N     * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(d_dirty_accum_, 0, (size_t)N  * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(d_dead_, 0, (size_t)max_seeds_ * 4 * sizeof(uint8_t)));
+
+    N_ = 0;
+    pending_ = false;
+    n_live_ = 0;
+    csr_dirty_ = true;
+    sorted_rank_dirty_ = true;
+    edges_dirty_ = true;
+    n_edges_ = 0;
+    have_values_ = false;
+    ++generation_;
+
+    h_triangles_.clear();
+    h_dead_.clear();
+    h_triplet_to_tid_.clear();
+    h_sx_.clear();
+    h_sy_.clear();
+    h_values_.clear();
+    h_seed_set_.clear();
+    h_sorted_rank_.clear();
+}
+
 void Delaunay::free_device_buffers_() noexcept
 {
     CUDA_CHECK_NOTHROW(cudaFree(d_grid_));    CUDA_CHECK_NOTHROW(cudaFree(d_tmp_));      CUDA_CHECK_NOTHROW(cudaFree(d_changed_));

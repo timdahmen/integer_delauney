@@ -13,6 +13,8 @@ public:
     PyDelaunay(int width, int height, int max_seeds, int border_padding)
         : impl_(width, height, max_seeds, border_padding) {}
 
+    void reset() { impl_.reset(); }
+
     py::tuple insert(const py::object& seeds_obj, bool as_arrays)
     {
         return _insert_impl(seeds_obj, as_arrays, nullptr);
@@ -237,6 +239,7 @@ public:
     int  width()          const { return impl_.width(); }
     int  height()         const { return impl_.height(); }
     int  border_padding() const { return impl_.border_padding(); }
+    int  max_seeds()      const { return impl_.max_seeds(); }
     bool has_pending()    const { return impl_.has_pending(); }
 
 private:

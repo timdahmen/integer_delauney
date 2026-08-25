@@ -100,6 +100,15 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "  under-padded relative to what the batch path would pick for it.\n"
              "  Pass a value explicitly when the eventual seed count is not close\n"
              "  to max_seeds. Padding costs ((W+2P)(H+2P))/(WH) in grid work.")
+        .def("reset", &PyDelaunay::reset,
+             "Discard every seed and triangle, restoring just-constructed\n"
+             "state, without freeing or reallocating any device buffer.\n\n"
+             "width()/height()/max_seeds()/border_padding() are unchanged, so\n"
+             "a caller about to insert a same-canvas, same-or-smaller seed\n"
+             "set can reuse this object instead of constructing a new one --\n"
+             "skipping its cudaMalloc calls. Bumps generation(), so any\n"
+             "outstanding finalise_device() view is invalidated exactly as it\n"
+             "would be by another insert/finalise call.")
         .def("insert", &PyDelaunay::insert,
              py::arg("seeds"), py::arg("as_arrays") = false,
              "Insert a batch of (x, y) seeds and update the triangulation.\n\n"
@@ -223,6 +232,8 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def_property_readonly("border_padding",
              &PyDelaunay::border_padding,
              "Resolved width of the padded detection canvas.")
+        .def_property_readonly("max_seeds", &PyDelaunay::max_seeds,
+             "Upper bound on total seeds this object can ever hold.")
         .def_property_readonly("has_pending", &PyDelaunay::has_pending,
              "True when deferred inserts are awaiting a finalise().");
 }

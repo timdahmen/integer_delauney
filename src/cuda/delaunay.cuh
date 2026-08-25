@@ -35,6 +35,14 @@ public:
                         int border_padding = -1);
     ~Delaunay();
 
+    // Restores the object to its just-constructed state -- every seed and
+    // triangle discarded, generation() bumped -- without freeing or
+    // reallocating any device buffer. width()/height()/max_seeds()/
+    // border_padding() are unchanged, so a caller inserting a same-canvas,
+    // same-or-smaller seed set next can reuse this object instead of paying
+    // for a fresh Delaunay's cudaMalloc calls.
+    void reset();
+
     // Appends a batch of seeds (insertion-order IDs).
     // Returns current full triangle_map and triangulation grid (H,W,3).
     // Exactly equivalent to insert_deferred() followed by finalise().
@@ -82,9 +90,9 @@ public:
     //
     // Those three views are valid from the moment this call returns until
     // generation() next changes, i.e. until the next call to insert(),
-    // insert_deferred(), finalise() or finalise_device() on this object, or
-    // until the object is destroyed. A caller holding a view across such a
-    // call is reading memory that has moved on.
+    // insert_deferred(), finalise(), finalise_device() or reset() on this
+    // object, or until the object is destroyed. A caller holding a view
+    // across such a call is reading memory that has moved on.
     void finalise_device(std::vector<TriangleEntry>& tri_map_out);
 
     const int32_t* device_pixel_tids()     const { return d_pixel_tids_; }
@@ -201,6 +209,7 @@ public:
     int  width()         const { return W_; }
     int  height()        const { return H_; }
     int  border_padding() const { return P_; }
+    int  max_seeds()     const { return max_seeds_; }
     bool has_pending()   const { return pending_; }
 
 private:
