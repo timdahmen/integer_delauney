@@ -51,7 +51,7 @@
 // apply_batch_ below is their only caller in this file.
 __global__ void write_seeds_kernel(int32_t* grid, int32_t* changed_mask, int W,
                                    const int32_t* xs, const int32_t* ys,
-                                   const int32_t* ids, int k);
+                                   int32_t base_id, int k);
 __global__ void or_mask_kernel(const int32_t* __restrict__ src,
                                int32_t* __restrict__ dst, int N);
 
@@ -246,10 +246,10 @@ void Delaunay::apply_batch_(
         }
     }
 
-    // Register seeds
-    std::vector<int32_t> new_ids(k);
+    // Register seeds. New ids are always the contiguous range starting at
+    // the old N_ -- write_seeds_kernel computes them from its own thread
+    // index rather than needing them uploaded.
     for (int i = 0; i < k; ++i) {
-        new_ids[i] = N_ + i;
         h_sx_.push_back(new_xs[i]);
         h_sy_.push_back(new_ys[i]);
         h_seed_set_.insert(pack_xy_(new_xs[i], new_ys[i]));
@@ -280,14 +280,13 @@ void Delaunay::apply_batch_(
     // the union since the last finalise and scopes assignment.
     CUDA_CHECK(cudaMemset(d_changed_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t)));
 
-    // Write seeds into grid (also marks seed cells in d_changed_)
-    int32_t* d_kxs  = d_seed_stage_;
-    int32_t* d_kys  = d_seed_stage_ + max_seeds_;
-    int32_t* d_kids = d_seed_stage_ + 2 * max_seeds_;
-    CUDA_CHECK(cudaMemcpy(d_kxs,  padded_xs.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_kys,  padded_ys.data(),  k * sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_kids, new_ids.data(),    k * sizeof(int32_t), cudaMemcpyHostToDevice));
-    write_seeds_kernel<<<(k+255)/256, 256>>>(d_grid_, d_changed_, W_det_, d_kxs, d_kys, d_kids, k);
+    // Write seeds into grid (also marks seed cells in d_changed_). Reads
+    // straight from d_sx_/d_sy_'s tail (just uploaded above) instead of a
+    // separate d_seed_stage_ copy of the same values -- there is no layout
+    // reason write_seeds_kernel needs its own staged copy, it only ever
+    // reads xs[i]/ys[i] independently per thread.
+    write_seeds_kernel<<<(k+255)/256, 256>>>(
+        d_grid_, d_changed_, W_det_, d_sx_ + N_ - k, d_sy_ + N_ - k, N_ - k, k);
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
 
