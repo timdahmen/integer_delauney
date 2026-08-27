@@ -96,6 +96,7 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
         CUDA_CHECK(cudaMalloc(&d_raw_buf_, (size_t)max_seeds * 4 * sizeof(RawTriangle)));
         CUDA_CHECK(cudaMalloc(&d_detect_buf_,
                    max_raw_triangles(W_det_, H_det_) * sizeof(RawTriangle)));
+        CUDA_CHECK(cudaMalloc(&d_stale_tids_,   (size_t)max_seeds * 4  * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_t_grid_,       (size_t)N              * sizeof(int32_t)));
         // Sized on the unpadded image, unlike the buffers above: these are the
         // finalise_device() outputs, addressed in image space by the crop kernel.
@@ -182,6 +183,7 @@ void Delaunay::free_device_buffers_() noexcept
     CUDA_CHECK_NOTHROW(cudaFree(d_grid_));    CUDA_CHECK_NOTHROW(cudaFree(d_tmp_));      CUDA_CHECK_NOTHROW(cudaFree(d_changed_));
     CUDA_CHECK_NOTHROW(cudaFree(d_sx_));      CUDA_CHECK_NOTHROW(cudaFree(d_sy_));        CUDA_CHECK_NOTHROW(cudaFree(d_raw_buf_));
     CUDA_CHECK_NOTHROW(cudaFree(d_detect_buf_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_stale_tids_));
     CUDA_CHECK_NOTHROW(cudaFree(d_t_grid_));  CUDA_CHECK_NOTHROW(cudaFree(d_csr_ptr_));  CUDA_CHECK_NOTHROW(cudaFree(d_csr_idx_));
     CUDA_CHECK_NOTHROW(cudaFree(d_sorted_rank_));    CUDA_CHECK_NOTHROW(cudaFree(d_pixel_tids_));
     CUDA_CHECK_NOTHROW(cudaFree(d_pixel_seed_ids_)); CUDA_CHECK_NOTHROW(cudaFree(d_outside_mask_));
@@ -197,6 +199,7 @@ void Delaunay::free_device_buffers_() noexcept
 
     d_grid_ = d_tmp_ = d_changed_ = d_sx_ = d_sy_ = nullptr;
     d_raw_buf_ = d_detect_buf_ = d_edge_keys_ = nullptr;
+    d_stale_tids_ = nullptr;
     d_t_grid_ = d_csr_ptr_ = d_csr_idx_ = nullptr;
     d_sorted_rank_ = d_pixel_tids_ = d_pixel_seed_ids_ = nullptr;
     d_outside_mask_ = nullptr;

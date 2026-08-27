@@ -240,6 +240,11 @@ private:
     // only survivable if the whole list is re-uploaded afterwards -- exactly
     // the O(total triangles) work per insert this design removes.
     void*    d_detect_buf_ = nullptr;  // see max_raw_triangles()
+    // Scratch for partial_topology_'s retire step: the stale tids compacted
+    // out of d_stale_ on the device, so the host loop that flags them dead
+    // (and erases them from h_triplet_to_tid_) touches only the ones that
+    // changed, not every slot in the registry.
+    int32_t* d_stale_tids_ = nullptr;       // (max_seeds * 4)
     // (3 * max triangles) packed undirected edge keys for get_edges(). Sized
     // like d_stale_, off the planarity bound of under 2n triangles for n seeds.
     void*    d_edge_keys_ = nullptr;
@@ -361,6 +366,11 @@ private:
     // tri_map is indexed by triangle id and must be dense for callers.
     void compact_registry_();
     bool should_compact_() const;
+    // Streams the tids in [0, old_count) that mark_stale_kernel flagged and
+    // upload_dead_flags_ has not already retired into d_stale_tids_, on the
+    // device. Returns the count. partial_topology_'s retire step downloads
+    // only that many, instead of every slot in the registry.
+    int  compact_stale_tids_(int old_count);
     void ensure_edges_() const;
     // Shared by build_outputs_() and build_outputs_device_(): the per-triangle
     // vertex ids, translated through sorted_rank(). Small (per-triangle), so

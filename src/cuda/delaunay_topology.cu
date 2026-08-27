@@ -18,6 +18,9 @@
 #include <thrust/device_ptr.h>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
+#include <thrust/copy.h>
+#include <thrust/execution_policy.h>
+#include <thrust/iterator/counting_iterator.h>
 
 #include <cstdint>
 #include <vector>
@@ -109,6 +112,18 @@ void mark_stale_kernel(const RawTriangle* __restrict__ tris, int n_tri,
              ? 1 : 0;
 }
 
+// Predicate for compact_stale_tids_: a tid belongs in the compacted list if
+// mark_stale_kernel flagged it AND it was not already retired by an earlier
+// round. d_dead_ reflects state as of the end of the previous round, which is
+// exactly what "already retired" should mean here.
+struct IsStaleAndLive {
+    const uint8_t* __restrict__ stale;
+    const uint8_t* __restrict__ dead;
+    __device__ bool operator()(int32_t tid) const {
+        return stale[tid] != 0 && dead[tid] == 0;
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Kernel: remap triangle IDs in t_grid (after compaction)
 // ---------------------------------------------------------------------------
@@ -177,6 +192,16 @@ void Delaunay::upload_dead_flags_()
     if (h_dead_.empty()) return;
     CUDA_CHECK(cudaMemcpy(d_dead_, h_dead_.data(), h_dead_.size() * sizeof(uint8_t),
                cudaMemcpyHostToDevice));
+}
+
+int Delaunay::compact_stale_tids_(int old_count)
+{
+    if (old_count == 0) return 0;
+    thrust::counting_iterator<int32_t> begin(0), end(old_count);
+    thrust::device_ptr<int32_t> out(d_stale_tids_);
+    IsStaleAndLive pred{d_stale_, d_dead_};
+    auto out_end = thrust::copy_if(thrust::device, begin, end, out, pred);
+    return (int)(out_end - out);
 }
 
 //: Compact once the retired slots outnumber the live ones, or the slot count
@@ -346,17 +371,25 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     // registry order -- but only until detection overwrites it below, so this
     // has to happen first.
     int old_count = (int)h_triangles_.size();
-    std::vector<uint8_t> h_stale(old_count, 0);
+    int n_stale = 0;
+    std::vector<int32_t> h_stale_tids;
     if (old_count > 0) {
         mark_stale_kernel<<<(old_count + 255) / 256, 256>>>(
             static_cast<RawTriangle*>(d_raw_buf_), old_count,
             d_mask_, W_det_, H_det_, d_stale_);
         CUDA_CHECK_LAST_ERROR();
         CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaMemcpy(h_stale.data(), d_stale_, old_count * sizeof(uint8_t),
-                   cudaMemcpyDeviceToHost));
+
+        // Compacted on the device: old_count can be the whole registry, but a
+        // change typically retires a handful, so the host only ever downloads
+        // and scans that handful, not every slot.
+        n_stale = compact_stale_tids_(old_count);
+        if (n_stale > 0) {
+            h_stale_tids.resize(n_stale);
+            CUDA_CHECK(cudaMemcpy(h_stale_tids.data(), d_stale_tids_,
+                       n_stale * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        }
     }
-    auto is_stale = [&h_stale](int tid) { return h_stale[tid] != 0; };
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_detect_buf_);
     int n_new = detect_and_dedup_(d_mask_, det_ms, dedup_ms);
@@ -370,8 +403,7 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     // which is the whole point. Renumbering instead cost a full map rebuild, a
     // full device upload and a grid remap on every insert, all proportional to
     // the total triangle count rather than to the size of the change.
-    for (int tid = 0; tid < old_count; ++tid) {
-        if (h_dead_[tid] || !is_stale(tid)) continue;
+    for (int32_t tid : h_stale_tids) {
         const auto& t = h_triangles_[tid];
         h_triplet_to_tid_.erase(pack_triplet_(t.a, t.b, t.c));
         h_dead_[tid] = 1;
