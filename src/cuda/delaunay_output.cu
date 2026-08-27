@@ -204,8 +204,7 @@ void Delaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 void Delaunay::get_triangles(std::vector<TriangleEntry>& out) const
 {
     // Downloaded on demand: the registry lives on the device (see
-    // download_registry_'s doc comment), and this call is not the hot path
-    // per-insert work this design targets.
+    // download_registry_'s doc comment).
     std::vector<RawTriangle> tris;
     std::vector<uint8_t> dead;
     download_registry_(tris, dead);

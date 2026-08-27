@@ -267,18 +267,14 @@ private:
     // divided by 3 and rounded: rounding after the divide can merge two
     // close-but-distinct centroids (two triangles sharing an edge, for
     // instance), which the exact sum cannot. NO_TRIANGLE where no live
-    // triangle claims that position. This is the sole identity check the
-    // append kernel needs -- no host-side map, no per-round upload.
+    // triangle claims that position.
     int32_t* d_centroid_index_ = nullptr;   // (centroid_index_w_ * _h_)
     // Scratch for the append kernel: 1/0 "is this candidate new" flags,
     // exclusive-scanned in place into each new candidate's rank among the
-    // new ones -- new_tid = next_tid_host_ + rank. Ranking by array order
-    // (which detect_and_dedup_'s thrust::unique already sorted by vertex
-    // triplet) reproduces the same tid assignment order the original
-    // sequential host loop gave, deterministically and independent of how
-    // an insert was batched -- unlike a raw atomicAdd claim, whose winner
-    // among concurrent threads has no relation to array order. See
-    // append_triangles_kernel's doc comment.
+    // new ones -- new_tid = next_tid_host_ + rank, deterministic in the
+    // array order detect_and_dedup_'s thrust::unique already sorted
+    // candidates into (by vertex triplet). See append_triangles_kernel's
+    // doc comment for why this order has to be deterministic.
     int32_t* d_new_rank_ = nullptr;         // (max_raw_triangles bound)
     // (3 * max triangles) packed undirected edge keys for get_edges(). Sized
     // like d_stale_, off the planarity bound of under 2n triangles for n seeds.
@@ -291,7 +287,14 @@ private:
     uint8_t* d_outside_mask_ = nullptr;   // (H*W) 1 where the pixel has no containing triangle
     uint64_t generation_;       // see generation() above
     int32_t* d_csr_ptr_ = nullptr;     // (max_seeds+1) CSR row starts
-    int32_t* d_csr_idx_ = nullptr;     // (max_seeds*8) CSR triangle IDs
+    // Sized for one (seed, tid) pair per corner of every registry slot
+    // (max_seeds*4 slots x 3), including dead ones: rebuild_csr_and_upload_
+    // sentinel-tags a dead slot's pairs so they sort past every live seed's
+    // range, see that function.
+    int32_t* d_csr_idx_ = nullptr;     // (max_seeds*12) CSR triangle IDs
+    // Scratch sort keys for rebuild_csr_and_upload_, paired 1:1 with
+    // d_csr_idx_'s values during the sort; not meaningful afterwards.
+    int32_t* d_csr_pair_seed_ = nullptr; // (max_seeds*12)
     int32_t* d_updated_flag_ = nullptr;// (1)     BFS convergence flag
     int32_t* d_mask_ = nullptr;        // (H*W)   reused for border / reassign masks
     // Changes since the last finalise, as opposed to d_changed_, which holds
@@ -418,12 +421,10 @@ private:
     // has nothing else to seed it from) and compact_registry_ (renumbering
     // invalidates every tid the index was holding).
     void rebuild_centroid_index_(int count);
-    // Temporary host snapshot of d_raw_buf_/d_dead_[0, next_tid_host_), for
-    // the output builders not yet reading the device registry directly
-    // (build_tri_map_, get_triangles, rebuild_csr_and_upload_). Downloads on
-    // every call by design -- these run once per finalise()/get_triangles(),
-    // not once per insert, so this is not the per-insert cost the rest of
-    // this design removes.
+    // Host snapshot of d_raw_buf_/d_dead_[0, next_tid_host_), downloaded
+    // fresh on every call, for the output builders not yet reading the
+    // device registry directly (build_tri_map_, get_triangles). These run
+    // once per finalise()/get_triangles() call.
     void download_registry_(std::vector<RawTriangle>& tris,
                             std::vector<uint8_t>& dead) const;
     void ensure_edges_() const;

@@ -24,6 +24,7 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/scan.h>
 #include <thrust/reduce.h>
+#include <thrust/binary_search.h>
 
 #include <cstdint>
 #include <utility>
@@ -165,9 +166,8 @@ void write_centroid_index_kernel(
 // Retires each of this round's stale tids directly: marks it dead and clears
 // its centroid-index slot, reading the triangle's own (not yet overwritten)
 // data straight out of d_raw_buf_ -- the same buffer and tids
-// mark_stale_kernel already tested. No host round trip for any of it; the
-// caller only needs n_stale (already known without a download) to update
-// n_live_.
+// mark_stale_kernel already tested. The caller updates n_live_ from n_stale
+// alone.
 __global__
 void retire_triangles_kernel(
     uint8_t* __restrict__ dead,
@@ -204,17 +204,16 @@ void mark_new_candidates_kernel(
 // mark_new_candidates_kernel's output, holds candidate i's count of new
 // candidates before it in array order -- the same order detect_and_dedup_'s
 // thrust::unique already sorted candidates into (by vertex triplet), so a
-// genuinely new candidate's tid is tid_base + rank[i]. This reproduces
-// exactly the assignment order the original sequential host loop gave:
-// deterministic and independent of how an insert was batched, unlike a raw
-// atomicAdd claim, whose winner among concurrent threads has no relation to
-// array order -- needed so insert_deferred()+finalise() assigns the same
-// tids insert() would for the same seeds. Re-tests the identity check
-// rather than trusting a flag carried over from mark_new_candidates_kernel:
-// nothing touches centroid_index between that kernel and this one, so the
-// two reads agree, and this avoids a second buffer just to remember the
-// flag the in-place scan overwrote. Must run after retire_triangles_kernel
-// has completed for this round (stream-ordered, no explicit sync needed) --
+// genuinely new candidate's tid is tid_base + rank[i]. Tid assignment must
+// stay deterministic in this array order: insert_deferred()+finalise() has
+// to assign the same tids insert() would for the same seeds, regardless of
+// how the insert was batched -- test_five_rounds_matches_immediate and
+// test_matches_batch_after_several_deferred_inserts check this directly.
+// Re-tests the identity check directly: the scan below overwrites rank[]'s
+// original 0/1 flags with prefix counts, and nothing else touches
+// centroid_index between mark_new_candidates_kernel and here, so the two
+// reads still agree. Must run after retire_triangles_kernel has completed
+// for this round (stream-ordered, no explicit sync needed) --
 // a triangle re-detected at a stale position needs its old slot cleared
 // before this check runs, or it is retired without being re-registered and
 // silently disappears.
@@ -408,27 +407,61 @@ void Delaunay::compact_registry_()
 // rebuild_csr_and_upload_
 // ---------------------------------------------------------------------------
 
+// One (seed, tid) pair per corner of every registry slot, live or dead --
+// a dead slot's three pairs are tagged with the sentinel seed id n_seeds
+// (one past the valid range), so the sort below pushes them past every
+// real seed's range.
+__global__
+void emit_csr_pairs_kernel(
+    const RawTriangle* __restrict__ registry, const uint8_t* __restrict__ dead,
+    int n_tri, int32_t n_seeds,
+    int32_t* __restrict__ pair_seed, int32_t* __restrict__ pair_tid)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tri) return;
+    int32_t s0 = n_seeds, s1 = n_seeds, s2 = n_seeds;
+    if (!dead[tid]) {
+        const RawTriangle& r = registry[tid];
+        s0 = r.orig_a; s1 = r.orig_b; s2 = r.orig_c;
+    }
+    pair_seed[tid * 3]     = s0; pair_tid[tid * 3]     = tid;
+    pair_seed[tid * 3 + 1] = s1; pair_tid[tid * 3 + 1] = tid;
+    pair_seed[tid * 3 + 2] = s2; pair_tid[tid * 3 + 2] = tid;
+}
+
 void Delaunay::rebuild_csr_and_upload_()
 {
+    const int n_tri = next_tid_host_;
+    if (n_tri == 0) {
+        CUDA_CHECK(cudaMemset(d_csr_ptr_, 0, (size_t)(N_ + 1) * sizeof(int32_t)));
+        return;
+    }
+
     // Retired slots are skipped: assign_triangles_kernel reaches a triangle
-    // only through this index, so leaving them out is what keeps a dead slot
-    // from ever being tested against a pixel.
-    //
-    // Downloads the registry fresh every call rather than reading a
-    // standing host copy -- this runs once per finalise(), not once per
-    // insert, so it is not the per-insert cost the rest of this file
-    // removes. See download_registry_'s own doc comment.
-    std::vector<RawTriangle> tris;
-    std::vector<uint8_t> dead;
-    download_registry_(tris, dead);
+    // only through this index, so keeping them past d_csr_ptr_[N_] (via the
+    // sentinel tag below) is what keeps a dead slot from ever being tested
+    // against a pixel.
+    emit_csr_pairs_kernel<<<(n_tri + 255) / 256, 256>>>(
+        static_cast<RawTriangle*>(d_raw_buf_), d_dead_, n_tri, N_,
+        d_csr_pair_seed_, d_csr_idx_);
+    CUDA_CHECK_LAST_ERROR();
 
-    std::vector<int32_t> h_csr_ptr, h_csr_idx;
-    build_seed_triangle_csr(tris, N_,
-        [&dead](int tid) { return dead[tid] != 0; },
-        h_csr_ptr, h_csr_idx);
+    // Sorting d_csr_idx_'s tids by d_csr_pair_seed_'s keys groups every
+    // seed's triangles together, in place: d_csr_idx_ becomes the CSR's
+    // index array directly.
+    thrust::device_ptr<int32_t> seed_keys(d_csr_pair_seed_);
+    thrust::device_ptr<int32_t> tid_vals(d_csr_idx_);
+    thrust::sort_by_key(thrust::device, seed_keys, seed_keys + (size_t)n_tri * 3, tid_vals);
 
-    CUDA_CHECK(cudaMemcpy(d_csr_ptr_, h_csr_ptr.data(), (N_+1)*sizeof(int32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_csr_idx_, h_csr_idx.data(), h_csr_idx.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+    // d_csr_ptr_[s] = the sorted array's first position with seed id >= s,
+    // for s in [0, N_] -- exactly the CSR row-start array, since the sort
+    // above already grouped equal seed ids contiguously. Dead slots'
+    // sentinel-tagged pairs sort past every s < N_, so d_csr_ptr_[N_] is the
+    // boundary past which nothing valid is ever read.
+    thrust::counting_iterator<int32_t> search_begin(0);
+    thrust::device_ptr<int32_t> csr_ptr_out(d_csr_ptr_);
+    thrust::lower_bound(thrust::device, seed_keys, seed_keys + (size_t)n_tri * 3,
+                        search_begin, search_begin + (N_ + 1), csr_ptr_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,8 +510,8 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     int N_tri = detect_and_dedup_(nullptr, det_ms, dedup_ms);
 
     // Detection wrote to the scratch buffer, so the registry gets its own
-    // copy -- device to device, no host round trip at all. The order out of
-    // detect_and_dedup_ is already dense, so tid == own index.
+    // copy, device to device. The order out of detect_and_dedup_ is already
+    // dense, so tid == own index.
     if (N_tri > 0)
         CUDA_CHECK(cudaMemcpy(d_raw_buf_, d_raw, (size_t)N_tri * sizeof(RawTriangle),
                    cudaMemcpyDeviceToDevice));
@@ -535,12 +568,10 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
         // that handful, not every slot.
         n_stale = compact_stale_tids_(old_count);
         if (n_stale > 0) {
-            // Retire directly on the device: no tid list ever needs to reach
-            // the host for this. Must complete before the append kernel's
-            // "already registered" check below runs (stream-ordered, no
-            // explicit sync needed) -- see retire_triangles_kernel's own
-            // comment for why a re-detected-but-still-valid triangle would
-            // otherwise be lost.
+            // Must complete before the append kernel's "already registered"
+            // check below runs (stream-ordered, no explicit sync needed) --
+            // see retire_triangles_kernel's own comment for why a
+            // re-detected-but-still-valid triangle would otherwise be lost.
             retire_triangles_kernel<<<(n_stale + 255) / 256, 256>>>(
                 d_dead_, d_centroid_index_, static_cast<RawTriangle*>(d_raw_buf_),
                 d_stale_tids_, n_stale, d_sx_, d_sy_, centroid_index_w_);
@@ -553,12 +584,10 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     int n_new = detect_and_dedup_(d_mask_, det_ms, dedup_ms);
 
     // Append whatever the re-detection found that d_centroid_index_ does not
-    // already carry. A retired triangle that is still valid geometry comes
-    // back through here and takes a fresh slot, same as before. Entirely
-    // device-side: the identity check, the tid ranking and the registry
-    // write all happen in the two kernels below, with no candidate ever
-    // visible to the host. n_appended is a single small device-to-host
-    // value from thrust::reduce, not a per-candidate transfer.
+    // already carry -- a retired triangle that is still valid geometry takes
+    // a fresh slot here. The identity check, tid ranking and registry write
+    // all happen in the two kernels below; n_appended is the one value that
+    // comes back to the host, from thrust::reduce.
     if (n_new > 0) {
         mark_new_candidates_kernel<<<(n_new + 255) / 256, 256>>>(
             d_centroid_index_, d_raw, n_new, d_sx_, d_sy_, centroid_index_w_,

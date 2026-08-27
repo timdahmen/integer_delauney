@@ -113,7 +113,8 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
         CUDA_CHECK(cudaMalloc(&d_pixel_seed_ids_,  (size_t)W_ * H_         * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_outside_mask_,    (size_t)W_ * H_         * sizeof(uint8_t)));
         CUDA_CHECK(cudaMalloc(&d_csr_ptr_,      (size_t)(max_seeds + 1)* sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 8  * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 12 * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_csr_pair_seed_,(size_t)max_seeds * 12 * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_updated_flag_, 1                      * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_mask_,         (size_t)N              * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_dirty_accum_,  (size_t)N              * sizeof(int32_t)));
@@ -199,6 +200,7 @@ void Delaunay::free_device_buffers_() noexcept
     CUDA_CHECK_NOTHROW(cudaFree(d_stale_tids_));
     CUDA_CHECK_NOTHROW(cudaFree(d_centroid_index_)); CUDA_CHECK_NOTHROW(cudaFree(d_new_rank_));
     CUDA_CHECK_NOTHROW(cudaFree(d_t_grid_));  CUDA_CHECK_NOTHROW(cudaFree(d_csr_ptr_));  CUDA_CHECK_NOTHROW(cudaFree(d_csr_idx_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_csr_pair_seed_));
     CUDA_CHECK_NOTHROW(cudaFree(d_sorted_rank_));    CUDA_CHECK_NOTHROW(cudaFree(d_pixel_tids_));
     CUDA_CHECK_NOTHROW(cudaFree(d_pixel_seed_ids_)); CUDA_CHECK_NOTHROW(cudaFree(d_outside_mask_));
     CUDA_CHECK_NOTHROW(cudaFree(d_edge_keys_));
@@ -214,7 +216,7 @@ void Delaunay::free_device_buffers_() noexcept
     d_grid_ = d_tmp_ = d_changed_ = d_sx_ = d_sy_ = nullptr;
     d_raw_buf_ = d_raw_buf_compact_ = d_detect_buf_ = d_edge_keys_ = nullptr;
     d_stale_tids_ = d_centroid_index_ = d_new_rank_ = nullptr;
-    d_t_grid_ = d_csr_ptr_ = d_csr_idx_ = nullptr;
+    d_t_grid_ = d_csr_ptr_ = d_csr_idx_ = d_csr_pair_seed_ = nullptr;
     d_sorted_rank_ = d_pixel_tids_ = d_pixel_seed_ids_ = nullptr;
     d_outside_mask_ = nullptr;
     d_dead_ = nullptr;
