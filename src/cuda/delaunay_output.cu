@@ -1,7 +1,8 @@
 // Materialising results: the triangle map and (H,W,3) grid finalise() and
 // finalise_device() return, get_voronoi_grid(), and the plain getters that
-// read straight off the host registry.
+// download the registry on demand (see download_registry_'s doc comment).
 #include "delaunay.cuh"
+#include "triangle_detect.cuh"  // RawTriangle
 #include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
@@ -69,11 +70,19 @@ int32_t Delaunay::translate_to_sorted_rank_(int32_t internal) const
 void Delaunay::build_tri_map_(std::vector<TriangleEntry>& tri_map_out) const
 {
     ensure_sorted_rank_();
-    int N_tri = (int)h_triangles_.size();
+
+    // Every caller of build_tri_map_ (build_outputs_, build_outputs_device_)
+    // runs it right after compact_registry_(), so the registry is already
+    // dense here -- no dead slots to skip. download_registry_ still returns
+    // the dead flags alongside; unused below, since there is nothing to filter.
+    std::vector<RawTriangle> tris;
+    std::vector<uint8_t> dead;
+    download_registry_(tris, dead);
+    const int N_tri = (int)tris.size();
 
     tri_map_out.resize(N_tri);
     for (int tid = 0; tid < N_tri; ++tid) {
-        const auto& t = h_triangles_[tid];
+        const auto& t = tris[tid];
         // Canonical positions come back in image coordinates. A border triangle
         // lands outside [0,W)x[0,H) once shifted, which is correct and matches
         // the batch path: its circumcentre genuinely lies outside the image.
@@ -194,12 +203,19 @@ void Delaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 
 void Delaunay::get_triangles(std::vector<TriangleEntry>& out) const
 {
-    const int slots = (int)h_triangles_.size();
+    // Downloaded on demand: the registry lives on the device (see
+    // download_registry_'s doc comment), and this call is not the hot path
+    // per-insert work this design targets.
+    std::vector<RawTriangle> tris;
+    std::vector<uint8_t> dead;
+    download_registry_(tris, dead);
+    const int slots = (int)tris.size();
+
     out.clear();
     out.reserve(n_live_);
     for (int tid = 0; tid < slots; ++tid) {
-        if (h_dead_[tid]) continue;
-        const auto& t = h_triangles_[tid];
+        if (dead[tid]) continue;
+        const auto& t = tris[tid];
         // Insertion-order ids, deliberately untranslated -- see the header.
         // Canonical position in image coordinates, as build_outputs_ reports it.
         out.push_back({t.x - P_, t.y - P_, t.orig_a, t.orig_b, t.orig_c});

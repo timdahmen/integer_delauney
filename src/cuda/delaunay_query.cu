@@ -153,7 +153,7 @@ void Delaunay::in_circumsphere(const std::vector<int32_t>& qx,
 
     compact_registry_();
     ensure_csr_();
-    if (h_triangles_.empty()) return;
+    if (next_tid_host_ == 0) return;
 
     int32_t* d_qx = d_seed_stage_;
     int32_t* d_qy = d_seed_stage_ + max_seeds_;
@@ -199,7 +199,7 @@ void Delaunay::locate(const std::vector<int32_t>& qx,
     // alike; and the CSR, which is how a candidate triangle is reached.
     compact_registry_();
     ensure_csr_();
-    if (h_triangles_.empty()) return;
+    if (next_tid_host_ == 0) return;
 
     // The queries reuse the seed staging buffer: an insert is the only other
     // user and cannot be in flight here.

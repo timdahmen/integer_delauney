@@ -21,8 +21,12 @@
 #include <thrust/copy.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/scan.h>
+#include <thrust/reduce.h>
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 //: An entry in the old->new remap for a triangle that did not survive
@@ -125,6 +129,149 @@ struct IsStaleAndLive {
 };
 
 // ---------------------------------------------------------------------------
+// Kernels: d_centroid_index_ maintenance and the registry itself.
+//
+// A triangle's key is the exact (unrounded) sum of its three vertices' seed
+// coordinates -- see d_centroid_index_'s doc comment in delaunay.cuh for why
+// this position is provably unique per live triangle. d_raw_buf_/d_dead_ are
+// the registry's source of truth; nothing here mirrors a host copy.
+// ---------------------------------------------------------------------------
+
+__device__ static __forceinline__ int32_t centroid_key(
+    int32_t a, int32_t b, int32_t c,
+    const int32_t* __restrict__ seed_xs, const int32_t* __restrict__ seed_ys, int CW)
+{
+    int32_t sx = seed_xs[a] + seed_xs[b] + seed_xs[c];
+    int32_t sy = seed_ys[a] + seed_ys[b] + seed_ys[c];
+    return sy * CW + sx;
+}
+
+// index[key(triangles[i])] = tid_base + i, for i in [0, count). Seeds the
+// index from a contiguous, freshly-tid'd run of triangles: full_topology_
+// (tid_base = 0, the whole grid) and compact_registry_ (tid_base = 0, the
+// renumbered survivors), both after rebuild_centroid_index_ clears it first.
+__global__
+void write_centroid_index_kernel(
+    int32_t* __restrict__ index,
+    const RawTriangle* __restrict__ triangles, int32_t tid_base, int count,
+    const int32_t* __restrict__ seed_xs, const int32_t* __restrict__ seed_ys, int CW)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const RawTriangle& r = triangles[i];
+    index[centroid_key(r.a, r.b, r.c, seed_xs, seed_ys, CW)] = tid_base + i;
+}
+
+// Retires each of this round's stale tids directly: marks it dead and clears
+// its centroid-index slot, reading the triangle's own (not yet overwritten)
+// data straight out of d_raw_buf_ -- the same buffer and tids
+// mark_stale_kernel already tested. No host round trip for any of it; the
+// caller only needs n_stale (already known without a download) to update
+// n_live_.
+__global__
+void retire_triangles_kernel(
+    uint8_t* __restrict__ dead,
+    int32_t* __restrict__ centroid_index,
+    const RawTriangle* __restrict__ registry,
+    const int32_t* __restrict__ stale_tids, int n_stale,
+    const int32_t* __restrict__ seed_xs, const int32_t* __restrict__ seed_ys, int CW)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_stale) return;
+    int32_t tid = stale_tids[i];
+    dead[tid] = 1;
+    const RawTriangle& r = registry[tid];
+    centroid_index[centroid_key(r.a, r.b, r.c, seed_xs, seed_ys, CW)] = NO_TRIANGLE;
+}
+
+// Which of this round's deduped detection candidates are genuinely new (not
+// already registered), flagged 1/0 for the caller's exclusive scan to rank.
+__global__
+void mark_new_candidates_kernel(
+    const int32_t* __restrict__ centroid_index,
+    const RawTriangle* __restrict__ candidates, int n_new,
+    const int32_t* __restrict__ seed_xs, const int32_t* __restrict__ seed_ys, int CW,
+    int32_t* __restrict__ is_new)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_new) return;
+    const RawTriangle& r = candidates[i];
+    int32_t key = centroid_key(r.a, r.b, r.c, seed_xs, seed_ys, CW);
+    is_new[i] = (centroid_index[key] == NO_TRIANGLE) ? 1 : 0;
+}
+
+// rank[i], after the caller's in-place exclusive scan over
+// mark_new_candidates_kernel's output, holds candidate i's count of new
+// candidates before it in array order -- the same order detect_and_dedup_'s
+// thrust::unique already sorted candidates into (by vertex triplet), so a
+// genuinely new candidate's tid is tid_base + rank[i]. This reproduces
+// exactly the assignment order the original sequential host loop gave:
+// deterministic and independent of how an insert was batched, unlike a raw
+// atomicAdd claim, whose winner among concurrent threads has no relation to
+// array order -- needed so insert_deferred()+finalise() assigns the same
+// tids insert() would for the same seeds. Re-tests the identity check
+// rather than trusting a flag carried over from mark_new_candidates_kernel:
+// nothing touches centroid_index between that kernel and this one, so the
+// two reads agree, and this avoids a second buffer just to remember the
+// flag the in-place scan overwrote. Must run after retire_triangles_kernel
+// has completed for this round (stream-ordered, no explicit sync needed) --
+// a triangle re-detected at a stale position needs its old slot cleared
+// before this check runs, or it is retired without being re-registered and
+// silently disappears.
+__global__
+void append_triangles_kernel(
+    RawTriangle* __restrict__ registry,
+    uint8_t* __restrict__ dead,
+    int32_t* __restrict__ centroid_index,
+    const int32_t* __restrict__ rank, int32_t tid_base,
+    const RawTriangle* __restrict__ candidates, int n_new,
+    const int32_t* __restrict__ seed_xs, const int32_t* __restrict__ seed_ys, int CW)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_new) return;
+    const RawTriangle& r = candidates[i];
+    int32_t key = centroid_key(r.a, r.b, r.c, seed_xs, seed_ys, CW);
+    if (centroid_index[key] != NO_TRIANGLE) return;   // already registered
+    int32_t new_tid = tid_base + rank[i];
+    registry[new_tid] = r;
+    dead[new_tid] = 0;
+    centroid_index[key] = new_tid;
+}
+
+// compact_registry_'s per-tid live flag, used both to scan (new dense tid =
+// count of live slots before this one) and, combined with the scan result in
+// finalize_remap_kernel below, to build the remap array in one pass.
+struct IsLive {
+    const uint8_t* __restrict__ dead;
+    __device__ int32_t operator()(int32_t tid) const { return dead[tid] ? 0 : 1; }
+};
+
+// remap[] already holds each live tid's new dense position (the exclusive
+// scan's output); this just overwrites the dead slots with TID_DELETED,
+// in place -- each thread only ever touches its own index.
+__global__
+void finalize_remap_kernel(int32_t* __restrict__ remap,
+                           const uint8_t* __restrict__ dead, int old_count)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= old_count) return;
+    if (dead[tid]) remap[tid] = TID_DELETED;
+}
+
+// Scatters each surviving triangle from src[tid] to dst[remap[tid]].
+__global__
+void scatter_compact_kernel(const RawTriangle* __restrict__ src,
+                            RawTriangle* __restrict__ dst,
+                            const int32_t* __restrict__ remap, int old_count)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= old_count) return;
+    int32_t new_tid = remap[tid];
+    if (new_tid == TID_DELETED) return;
+    dst[new_tid] = src[tid];
+}
+
+// ---------------------------------------------------------------------------
 // Kernel: remap triangle IDs in t_grid (after compaction)
 // ---------------------------------------------------------------------------
 
@@ -167,31 +314,33 @@ void invalidate_dead_tgrid_kernel(int32_t* __restrict__ t_grid, int N,
 }
 
 // ---------------------------------------------------------------------------
-// upload_triangles_: sync h_triangles_ -> d_raw_buf_
+// rebuild_centroid_index_ / download_registry_
 // ---------------------------------------------------------------------------
 
-void Delaunay::upload_triangles_()
+void Delaunay::rebuild_centroid_index_(int count)
 {
-    upload_triangles_range_(0, (int)h_triangles_.size());
-}
-
-void Delaunay::upload_triangles_range_(int first, int count)
-{
-    if (count <= 0) return;
-    std::vector<RawTriangle> h_raw(count);
-    for (int i = 0; i < count; ++i) {
-        const auto& h = h_triangles_[first + i];
-        h_raw[i] = {h.x, h.y, h.a, h.b, h.c, h.orig_a, h.orig_b, h.orig_c};
+    CUDA_CHECK(cudaMemset(d_centroid_index_, SENTINEL_BYTE,
+               (size_t)centroid_index_w_ * centroid_index_h_ * sizeof(int32_t)));
+    if (count > 0) {
+        write_centroid_index_kernel<<<(count + 255) / 256, 256>>>(
+            d_centroid_index_, static_cast<RawTriangle*>(d_raw_buf_), 0, count,
+            d_sx_, d_sy_, centroid_index_w_);
+        CUDA_CHECK_LAST_ERROR();
     }
-    CUDA_CHECK(cudaMemcpy(static_cast<RawTriangle*>(d_raw_buf_) + first, h_raw.data(),
-               (size_t)count * sizeof(RawTriangle), cudaMemcpyHostToDevice));
 }
 
-void Delaunay::upload_dead_flags_()
+void Delaunay::download_registry_(std::vector<RawTriangle>& tris,
+                                  std::vector<uint8_t>& dead) const
 {
-    if (h_dead_.empty()) return;
-    CUDA_CHECK(cudaMemcpy(d_dead_, h_dead_.data(), h_dead_.size() * sizeof(uint8_t),
-               cudaMemcpyHostToDevice));
+    const int slots = next_tid_host_;
+    tris.resize(slots);
+    dead.resize(slots);
+    if (slots > 0) {
+        CUDA_CHECK(cudaMemcpy(tris.data(), d_raw_buf_, (size_t)slots * sizeof(RawTriangle),
+                   cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(dead.data(), d_dead_, (size_t)slots * sizeof(uint8_t),
+                   cudaMemcpyDeviceToHost));
+    }
 }
 
 int Delaunay::compact_stale_tids_(int old_count)
@@ -209,7 +358,7 @@ int Delaunay::compact_stale_tids_(int old_count)
 //: O(triangles) but at least halves the slot count.
 bool Delaunay::should_compact_() const
 {
-    const int slots = (int)h_triangles_.size();
+    const int slots = next_tid_host_;
     if (slots == 0) return false;
     if (slots > 2 * n_live_ + 1024) return true;
     return slots > max_seeds_ * 4 - 4096;
@@ -217,37 +366,38 @@ bool Delaunay::should_compact_() const
 
 void Delaunay::compact_registry_()
 {
-    const int old_count = (int)h_triangles_.size();
+    const int old_count = next_tid_host_;
     if (old_count == n_live_) return;          // already dense
 
-    std::vector<int32_t> remap(old_count, TID_DELETED);
-    std::vector<HTriangle> live;
-    live.reserve(n_live_);
-    for (int tid = 0; tid < old_count; ++tid) {
-        if (h_dead_[tid]) continue;
-        remap[tid] = (int32_t)live.size();
-        live.push_back(h_triangles_[tid]);
-    }
+    // Exclusive scan of "is this slot live" gives each survivor's new dense
+    // tid directly -- that already *is* the remap array's content for live
+    // slots; finalize_remap_kernel fills in TID_DELETED for the rest.
+    thrust::counting_iterator<int32_t> cbegin(0), cend(old_count);
+    IsLive is_live{d_dead_};
+    thrust::device_ptr<int32_t> scan_out(d_remap_);
+    thrust::exclusive_scan(thrust::device,
+        thrust::make_transform_iterator(cbegin, is_live),
+        thrust::make_transform_iterator(cend, is_live),
+        scan_out);
+    finalize_remap_kernel<<<(old_count + 255) / 256, 256>>>(d_remap_, d_dead_, old_count);
+    CUDA_CHECK_LAST_ERROR();
 
-    h_triangles_ = std::move(live);
-    h_dead_.assign(h_triangles_.size(), 0);
-    n_live_ = (int)h_triangles_.size();
+    // Scatter survivors into the ping-pong buffer, then swap -- same pattern
+    // d_grid_/d_tmp_ already use for BFS.
+    scatter_compact_kernel<<<(old_count + 255) / 256, 256>>>(
+        static_cast<RawTriangle*>(d_raw_buf_), static_cast<RawTriangle*>(d_raw_buf_compact_),
+        d_remap_, old_count);
+    CUDA_CHECK_LAST_ERROR();
+    std::swap(d_raw_buf_, d_raw_buf_compact_);
 
-    h_triplet_to_tid_.clear();
-    h_triplet_to_tid_.reserve(h_triangles_.size() * 2);
-    for (int tid = 0; tid < (int)h_triangles_.size(); ++tid) {
-        const auto& t = h_triangles_[tid];
-        h_triplet_to_tid_[pack_triplet_(t.a, t.b, t.c)] = tid;
-    }
+    CUDA_CHECK(cudaMemset(d_dead_, 0, (size_t)n_live_ * sizeof(uint8_t)));
+    next_tid_host_ = n_live_;
+    rebuild_centroid_index_(n_live_);
 
-    upload_triangles_();
-    upload_dead_flags_();
     csr_dirty_ = true;
     edges_dirty_ = true;
 
     const int N = W_det_ * H_det_;
-    CUDA_CHECK(cudaMemcpy(d_remap_, remap.data(), (size_t)old_count * sizeof(int32_t),
-               cudaMemcpyHostToDevice));
     remap_tgrid_kernel<<<(N+255)/256, 256>>>(d_t_grid_, N, d_remap_, old_count,
                                              NO_TRIANGLE);
     CUDA_CHECK_LAST_ERROR();
@@ -263,9 +413,18 @@ void Delaunay::rebuild_csr_and_upload_()
     // Retired slots are skipped: assign_triangles_kernel reaches a triangle
     // only through this index, so leaving them out is what keeps a dead slot
     // from ever being tested against a pixel.
+    //
+    // Downloads the registry fresh every call rather than reading a
+    // standing host copy -- this runs once per finalise(), not once per
+    // insert, so it is not the per-insert cost the rest of this file
+    // removes. See download_registry_'s own doc comment.
+    std::vector<RawTriangle> tris;
+    std::vector<uint8_t> dead;
+    download_registry_(tris, dead);
+
     std::vector<int32_t> h_csr_ptr, h_csr_idx;
-    build_seed_triangle_csr(h_triangles_, N_,
-        [this](int tid) { return h_dead_[tid] != 0; },
+    build_seed_triangle_csr(tris, N_,
+        [&dead](int tid) { return dead[tid] != 0; },
         h_csr_ptr, h_csr_idx);
 
     CUDA_CHECK(cudaMemcpy(d_csr_ptr_, h_csr_ptr.data(), (N_+1)*sizeof(int32_t), cudaMemcpyHostToDevice));
@@ -317,25 +476,17 @@ void Delaunay::full_topology_(float* det_ms, float* dedup_ms)
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_detect_buf_);
     int N_tri = detect_and_dedup_(nullptr, det_ms, dedup_ms);
 
-    std::vector<RawTriangle> h_dedup(N_tri);
-    CUDA_CHECK(cudaMemcpy(h_dedup.data(), d_raw, N_tri * sizeof(RawTriangle), cudaMemcpyDeviceToHost));
-
-    h_triangles_.clear(); h_triplet_to_tid_.clear();
-    h_triangles_.reserve(N_tri);
-    for (int32_t tid = 0; tid < N_tri; ++tid) {
-        const auto& r = h_dedup[tid];
-        h_triangles_.push_back({r.x, r.y, r.a, r.b, r.c, r.orig_a, r.orig_b, r.orig_c});
-        h_triplet_to_tid_[pack_triplet_(r.a, r.b, r.c)] = tid;
-    }
-    // A full build leaves no holes.
-    h_dead_.assign(N_tri, 0);
-    n_live_ = N_tri;
-    upload_dead_flags_();
-    // Detection wrote to the scratch buffer, so the list gets its own copy.
-    // Device to device, and the order already matches h_triangles_.
+    // Detection wrote to the scratch buffer, so the registry gets its own
+    // copy -- device to device, no host round trip at all. The order out of
+    // detect_and_dedup_ is already dense, so tid == own index.
     if (N_tri > 0)
         CUDA_CHECK(cudaMemcpy(d_raw_buf_, d_raw, (size_t)N_tri * sizeof(RawTriangle),
                    cudaMemcpyDeviceToDevice));
+    // A full build leaves no holes.
+    CUDA_CHECK(cudaMemset(d_dead_, 0, (size_t)N_tri * sizeof(uint8_t)));
+    n_live_ = N_tri;
+    next_tid_host_ = N_tri;
+    rebuild_centroid_index_(N_tri);
 
     // The CSR is not built here. Its only reader is assign_triangles_kernel,
     // which runs in assign_pending_, so building it per insert was O(N_tri +
@@ -370,9 +521,8 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
     // W*H mask, and d_raw_buf_ already holds those positions on the device in
     // registry order -- but only until detection overwrites it below, so this
     // has to happen first.
-    int old_count = (int)h_triangles_.size();
+    int old_count = next_tid_host_;
     int n_stale = 0;
-    std::vector<int32_t> h_stale_tids;
     if (old_count > 0) {
         mark_stale_kernel<<<(old_count + 255) / 256, 256>>>(
             static_cast<RawTriangle*>(d_raw_buf_), old_count,
@@ -381,62 +531,64 @@ void Delaunay::partial_topology_(float* det_ms, float* dedup_ms)
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Compacted on the device: old_count can be the whole registry, but a
-        // change typically retires a handful, so the host only ever downloads
-        // and scans that handful, not every slot.
+        // change typically retires a handful, so this stays proportional to
+        // that handful, not every slot.
         n_stale = compact_stale_tids_(old_count);
         if (n_stale > 0) {
-            h_stale_tids.resize(n_stale);
-            CUDA_CHECK(cudaMemcpy(h_stale_tids.data(), d_stale_tids_,
-                       n_stale * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            // Retire directly on the device: no tid list ever needs to reach
+            // the host for this. Must complete before the append kernel's
+            // "already registered" check below runs (stream-ordered, no
+            // explicit sync needed) -- see retire_triangles_kernel's own
+            // comment for why a re-detected-but-still-valid triangle would
+            // otherwise be lost.
+            retire_triangles_kernel<<<(n_stale + 255) / 256, 256>>>(
+                d_dead_, d_centroid_index_, static_cast<RawTriangle*>(d_raw_buf_),
+                d_stale_tids_, n_stale, d_sx_, d_sy_, centroid_index_w_);
+            CUDA_CHECK_LAST_ERROR();
+            n_live_ -= n_stale;
         }
     }
 
     RawTriangle* d_raw = static_cast<RawTriangle*>(d_detect_buf_);
     int n_new = detect_and_dedup_(d_mask_, det_ms, dedup_ms);
 
-    std::vector<RawTriangle> h_new(n_new);
-    if (n_new > 0)
-        CUDA_CHECK(cudaMemcpy(h_new.data(), d_raw, n_new * sizeof(RawTriangle), cudaMemcpyDeviceToHost));
+    // Append whatever the re-detection found that d_centroid_index_ does not
+    // already carry. A retired triangle that is still valid geometry comes
+    // back through here and takes a fresh slot, same as before. Entirely
+    // device-side: the identity check, the tid ranking and the registry
+    // write all happen in the two kernels below, with no candidate ever
+    // visible to the host. n_appended is a single small device-to-host
+    // value from thrust::reduce, not a per-candidate transfer.
+    if (n_new > 0) {
+        mark_new_candidates_kernel<<<(n_new + 255) / 256, 256>>>(
+            d_centroid_index_, d_raw, n_new, d_sx_, d_sy_, centroid_index_w_,
+            d_new_rank_);
+        CUDA_CHECK_LAST_ERROR();
 
-    // Retire the invalidated triangles. Their ids are not reused and nothing
-    // else is renumbered, so this touches only the entries that changed --
-    // which is the whole point. Renumbering instead cost a full map rebuild, a
-    // full device upload and a grid remap on every insert, all proportional to
-    // the total triangle count rather than to the size of the change.
-    for (int32_t tid : h_stale_tids) {
-        const auto& t = h_triangles_[tid];
-        h_triplet_to_tid_.erase(pack_triplet_(t.a, t.b, t.c));
-        h_dead_[tid] = 1;
-        --n_live_;
+        thrust::device_ptr<int32_t> rank(d_new_rank_);
+        const int32_t n_appended = thrust::reduce(thrust::device, rank, rank + n_new, 0);
+        // In-place: rank[i] becomes "how many new candidates before i", the
+        // same order append_triangles_kernel re-derives from centroid_index,
+        // so a stale 1/0 flag is never read after this point.
+        thrust::exclusive_scan(thrust::device, rank, rank + n_new, rank);
+
+        if (n_appended > 0) {
+            append_triangles_kernel<<<(n_new + 255) / 256, 256>>>(
+                static_cast<RawTriangle*>(d_raw_buf_), d_dead_, d_centroid_index_,
+                d_new_rank_, next_tid_host_, d_raw, n_new, d_sx_, d_sy_, centroid_index_w_);
+            CUDA_CHECK_LAST_ERROR();
+        }
+        n_live_ += n_appended;
+        next_tid_host_ += n_appended;
     }
 
-    // Append whatever the re-detection found that the registry no longer holds.
-    // A retired triangle that is still valid geometry comes back through here
-    // and takes a fresh slot, which is what the renumbering path did too.
-    const int append_first = (int)h_triangles_.size();
-    for (const auto& r : h_new) {
-        auto key = pack_triplet_(r.a, r.b, r.c);
-        if (h_triplet_to_tid_.count(key)) continue;
-        h_triplet_to_tid_[key] = (int32_t)h_triangles_.size();
-        h_triangles_.push_back({r.x, r.y, r.a, r.b, r.c,
-                                r.orig_a, r.orig_b, r.orig_c});
-        h_dead_.push_back(0);
-        ++n_live_;
-    }
-    const int append_count = (int)h_triangles_.size() - append_first;
-
-    // Only the tail goes up; the earlier slots are untouched on the device.
-    // mark_stale_kernel and get_edges read d_raw_buf_, so it has to stay in
-    // step. The CSR does not -- see full_topology_.
-    upload_triangles_range_(append_first, append_count);
-    upload_dead_flags_();
     csr_dirty_ = true;
 
     // Pixels naming a retired triangle are cleared. Ids did not move, so the
     // old remap table is unnecessary: the flags say which ids are gone.
     const int N = W_det_ * H_det_;
     invalidate_dead_tgrid_kernel<<<(N+255)/256, 256>>>(
-        d_t_grid_, N, d_dead_, (int)h_triangles_.size());
+        d_t_grid_, N, d_dead_, next_tid_host_);
     CUDA_CHECK_LAST_ERROR();
     CUDA_CHECK(cudaDeviceSynchronize());
 

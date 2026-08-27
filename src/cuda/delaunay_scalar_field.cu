@@ -181,7 +181,7 @@ void Delaunay::ensure_edges_() const
     n_edges_ = 0;
     edges_dirty_ = false;
 
-    const int n_tri = (int)h_triangles_.size();
+    const int n_tri = next_tid_host_;
     if (n_tri == 0 || N_ == 0 || n_live_ == 0) return;
 
     const RawTriangle* d_tris = static_cast<const RawTriangle*>(d_raw_buf_);
