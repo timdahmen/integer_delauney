@@ -195,8 +195,10 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "space and recent enough in time; a triangle of circumradius R "
              "admits nothing beyond t = R.\n\n"
              "Returns (mask, triangle_ids). The triangle is reported because a "
-             "caller asking this usually wants it and it is found on the way; "
-             "-1 where no triangle contains the point, where the mask is False.")
+             "caller asking this usually wants it and it is found on the way. "
+             "A point outside every triangle falls back to the triangle "
+             "nearest its Voronoi seed; triangle_ids is -1, and the mask is "
+             "False, only where that also finds nothing.")
         .def("locate", &PyDelaunay::locate, py::arg("points"),
              "Triangle containing each point of an (N, 2) int32 array, in "
              "image coordinates, as an (N,) int32 array. -1 where no triangle "

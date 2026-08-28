@@ -296,6 +296,20 @@ class TestLocate:
         assert len(mesh.locate(np.zeros((0, 2), dtype=np.int32))) == 0
 
 
+def _circumcenter_and_radius(a, b, c):
+    """Host circumcenter/radius for one 2-D triangle -- a self-contained
+    oracle so tests using it don't need stads on the path."""
+    a, b, c = (np.asarray(p, dtype=np.float64) for p in (a, b, c))
+    ab, ac = b - a, c - a
+    d = 2.0 * (ab[0] * ac[1] - ab[1] * ac[0])
+    ab2, ac2 = ab @ ab, ac @ ac
+    center = a + np.array([ac[1] * ab2 - ab[1] * ac2,
+                           ab[0] * ac2 - ac[0] * ab2]) / d
+    radius = max(np.linalg.norm(a - center), np.linalg.norm(b - center),
+                np.linalg.norm(c - center))
+    return center, radius
+
+
 class TestInCircumsphere:
     """The in-circle predicate, lifted out of the plane by t.
 
@@ -379,8 +393,36 @@ class TestInCircumsphere:
         rng = np.random.default_rng(36)
         q = np.stack([rng.integers(0, W, 2000),
                       rng.integers(0, H, 2000)], axis=1).astype(np.int32)
+        direct = mesh.locate(q)
         _, tids = mesh.in_circumsphere(q, np.zeros(len(q)))
-        np.testing.assert_array_equal(tids, mesh.locate(q))
+        # Inside the hull, in_circumsphere's search is locate()'s own search;
+        # outside it, in_circumsphere additionally falls back to a nearby
+        # triangle (see test_outside_hull_falls_back_to_a_nearby_triangle),
+        # so the two only have to agree where locate() itself succeeds.
+        within = direct >= 0
+        np.testing.assert_array_equal(tids[within], direct[within])
+
+    def test_outside_hull_falls_back_to_a_nearby_triangle(self):
+        """A point beyond the hull, when a nearby triangle exists, is tested
+        against that triangle's circumsphere instead of being reported as
+        unconditionally outside."""
+        mesh, seeds, verts = self._mesh(400, seed=41)
+        rng = np.random.default_rng(42)
+        q = np.stack([rng.integers(0, W, 3000),
+                      rng.integers(0, H, 3000)], axis=1).astype(np.int32)
+        t = np.zeros(len(q))
+
+        outside_direct = mesh.locate(q) < 0
+        got, tids = mesh.in_circumsphere(q, t)
+        resolved = outside_direct & (tids >= 0)
+        assert resolved.any(), "query set does not exercise the fallback"
+
+        for i in np.flatnonzero(resolved):
+            a, b, c = seeds[verts[tids[i]]]
+            center, radius = _circumcenter_and_radius(a, b, c)
+            want = np.linalg.norm(q[i].astype(np.float64) - center) < radius
+            assert bool(got[i]) == want, \
+                f"mismatch at query {q[i]}, triangle {tids[i]}"
 
     def test_no_triangle_means_not_inside(self):
         mesh, seeds, _ = self._mesh(60, seed=37)
