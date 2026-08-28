@@ -330,7 +330,7 @@ class TestInCircumsphere:
 
     @staticmethod
     def _host(seeds, verts, tids, pts, t):
-        from stads.utility_functions import compute_triangle_circumcircles
+        from stads.edge_refinement import compute_triangle_circumcircles
         ok = tids >= 0
         out = np.zeros(len(pts), dtype=bool)
         if not ok.any():
@@ -347,7 +347,7 @@ class TestInCircumsphere:
 
     @pytest.mark.parametrize("t_val", [0.0, 1.0, 4.0, 12.0, 40.0])
     def test_matches_the_host_predicate(self, t_val):
-        pytest.importorskip("stads.utility_functions")
+        pytest.importorskip("stads.edge_refinement")
         mesh, seeds, verts = self._mesh(400, seed=int(t_val) + 3)
         rng = np.random.default_rng(int(t_val) + 5)
         q = np.stack([rng.integers(0, W, 3000),
