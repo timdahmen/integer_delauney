@@ -1,7 +1,7 @@
 """Tests for Delaunay.finalise_device(): the device-resident counterpart of
-finalise(as_arrays=True) that hands pixel_tids/pixel_seed_ids/outside_hull_mask
-to the caller as __cuda_array_interface__ views instead of downloading and
-cropping them on the host.
+finalise(as_arrays=True) that hands triangle_verts/pixel_tids/
+pixel_seed_ids/outside_hull_mask to the caller as __cuda_array_interface__
+views instead of downloading and cropping them on the host.
 
 Correctness strategy
 ---------------------
@@ -103,8 +103,9 @@ def test_finalise_device_matches_finalise(n_seeds):
     mask_dev = _read_device(outside_mask.__cuda_array_interface__, np.uint8)
 
     verts_ref, sids_ref, mask_ref, tids_ref = _host_reference(seeds)
+    verts_dev = _read_device(verts.__cuda_array_interface__, np.int32).reshape(-1, 3)
 
-    np.testing.assert_array_equal(np.asarray(verts), verts_ref)
+    np.testing.assert_array_equal(verts_dev, verts_ref)
     np.testing.assert_array_equal(sids_dev, sids_ref)
     np.testing.assert_array_equal(mask_dev, mask_ref)
     np.testing.assert_array_equal(tids_dev, tids_ref)
@@ -115,7 +116,7 @@ def test_finalise_device_cuda_array_interface_shape():
     seeds = _random_seeds(rng, 30)
     d = Delaunay(W, H, MAX_SEEDS, -1)
     d.insert_deferred(seeds, None)
-    _, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
+    verts, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
 
     for view, typestr in ((pixel_tids, "<i4"), (pixel_seed_ids, "<i4"),
                           (outside_mask, "|u1")):
@@ -124,6 +125,12 @@ def test_finalise_device_cuda_array_interface_shape():
         assert cai["typestr"] == typestr
         assert cai["data"][1] is True  # read-only
         assert cai["version"] == 3
+
+    # Flat (triangle_count()*3,), not (triangle_count(), 3) -- the caller
+    # reshapes, see finalise_device()'s doc comment.
+    verts_cai = verts.__cuda_array_interface__
+    assert verts_cai["shape"] == (d.triangle_count * 3,)
+    assert verts_cai["typestr"] == "<i4"
 
 
 def test_fresh_view_reads_without_error():
@@ -147,7 +154,7 @@ def test_stale_view_raises_after_mutation():
     seeds = _random_seeds(rng, 20)
     d = Delaunay(W, H, MAX_SEEDS, -1)
     d.insert_deferred(seeds, None)
-    _, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
+    verts, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
 
     more = _random_seeds(rng, 5)
     more = [s for s in more if s not in set(seeds)]
@@ -155,7 +162,7 @@ def test_stale_view_raises_after_mutation():
         pytest.skip("random seeds collided with the original set")
     d.insert_deferred(more, None)  # mutates -> must invalidate the views above
 
-    for view in (pixel_tids, pixel_seed_ids, outside_mask):
+    for view in (verts, pixel_tids, pixel_seed_ids, outside_mask):
         with pytest.raises(RuntimeError):
             view.__cuda_array_interface__
 
@@ -173,15 +180,18 @@ def test_to_host_matches_finalise(n_seeds):
     d.insert_deferred(seeds, None)
     verts, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
 
+    verts_host = verts.to_host().reshape(-1, 3)
     tids_host = pixel_tids.to_host()
     sids_host = pixel_seed_ids.to_host()
     mask_host = outside_mask.to_host()
 
     verts_ref, sids_ref, mask_ref, tids_ref = _host_reference(seeds)
 
+    assert verts_host.dtype == np.int32
     assert tids_host.dtype == np.int32
     assert sids_host.dtype == np.int32
     assert mask_host.dtype == np.uint8
+    np.testing.assert_array_equal(verts_host, verts_ref)
     np.testing.assert_array_equal(tids_host, tids_ref)
     np.testing.assert_array_equal(sids_host, sids_ref)
     np.testing.assert_array_equal(mask_host, mask_ref)
@@ -195,7 +205,7 @@ def test_stale_view_to_host_raises_after_mutation():
     seeds = _random_seeds(rng, 20)
     d = Delaunay(W, H, MAX_SEEDS, -1)
     d.insert_deferred(seeds, None)
-    _, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
+    verts, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
 
     more = _random_seeds(rng, 5)
     more = [s for s in more if s not in set(seeds)]
@@ -203,7 +213,7 @@ def test_stale_view_to_host_raises_after_mutation():
         pytest.skip("random seeds collided with the original set")
     d.insert_deferred(more, None)  # mutates -> must invalidate the views above
 
-    for view in (pixel_tids, pixel_seed_ids, outside_mask):
+    for view in (verts, pixel_tids, pixel_seed_ids, outside_mask):
         with pytest.raises(RuntimeError):
             view.to_host()
 

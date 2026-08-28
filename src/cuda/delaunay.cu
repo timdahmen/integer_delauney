@@ -112,6 +112,7 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
         CUDA_CHECK(cudaMalloc(&d_pixel_tids_,      (size_t)W_ * H_         * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_pixel_seed_ids_,  (size_t)W_ * H_         * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_outside_mask_,    (size_t)W_ * H_         * sizeof(uint8_t)));
+        CUDA_CHECK(cudaMalloc(&d_triangle_verts_,  (size_t)max_seeds * 4 * 3 * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_csr_ptr_,      (size_t)(max_seeds + 1)* sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_csr_idx_,      (size_t)max_seeds * 12 * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&d_csr_pair_seed_,(size_t)max_seeds * 12 * sizeof(int32_t)));
@@ -203,6 +204,7 @@ void Delaunay::free_device_buffers_() noexcept
     CUDA_CHECK_NOTHROW(cudaFree(d_csr_pair_seed_));
     CUDA_CHECK_NOTHROW(cudaFree(d_sorted_rank_));    CUDA_CHECK_NOTHROW(cudaFree(d_pixel_tids_));
     CUDA_CHECK_NOTHROW(cudaFree(d_pixel_seed_ids_)); CUDA_CHECK_NOTHROW(cudaFree(d_outside_mask_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_triangle_verts_));
     CUDA_CHECK_NOTHROW(cudaFree(d_edge_keys_));
     CUDA_CHECK_NOTHROW(cudaFree(d_dead_));
     CUDA_CHECK_NOTHROW(cudaFree(d_values_));   CUDA_CHECK_NOTHROW(cudaFree(d_scores_));  CUDA_CHECK_NOTHROW(cudaFree(d_score_keys_));
@@ -219,6 +221,7 @@ void Delaunay::free_device_buffers_() noexcept
     d_t_grid_ = d_csr_ptr_ = d_csr_idx_ = d_csr_pair_seed_ = nullptr;
     d_sorted_rank_ = d_pixel_tids_ = d_pixel_seed_ids_ = nullptr;
     d_outside_mask_ = nullptr;
+    d_triangle_verts_ = nullptr;
     d_dead_ = nullptr;
     d_values_ = nullptr;
     d_scores_ = nullptr;
@@ -396,7 +399,7 @@ void Delaunay::finalise(
     build_outputs_(tri_map_out, tgrid_out);
 }
 
-void Delaunay::finalise_device(std::vector<TriangleEntry>& tri_map_out)
+void Delaunay::finalise_device()
 {
     // One generation per call: even a call with nothing pending re-launches
     // the crop kernel and produces a view a caller should treat as new.
@@ -408,7 +411,7 @@ void Delaunay::finalise_device(std::vector<TriangleEntry>& tri_map_out)
         CUDA_CHECK(cudaMemset(d_dirty_accum_, 0, (size_t)W_det_ * H_det_ * sizeof(int32_t)));
         pending_ = false;
     }
-    build_outputs_device_(tri_map_out);
+    build_outputs_device_();
 }
 
 void Delaunay::insert(

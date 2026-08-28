@@ -87,23 +87,31 @@ public:
         std::vector<int32_t>&       tgrid_out,
         InsertTimings*         timings = nullptr);
 
-    // Same as finalise(), except the per-pixel outputs stay on the device
-    // instead of being downloaded and cropped on the host: tri_map_out is
-    // still built host-side, since it is per-triangle and small, but the
-    // (H*W) triangle-id, seed-id and outside-hull arrays are written directly
-    // into device_pixel_tids()/device_pixel_seed_ids()/device_outside_mask()
-    // by a crop kernel and never copied to host memory here.
+    // Same as finalise(), except every output stays on the device: the
+    // (H*W) triangle-id, seed-id and outside-hull arrays are written
+    // directly into device_pixel_tids()/device_pixel_seed_ids()/
+    // device_outside_mask(), and the (triangle_count(), 3) vertex-id array
+    // into device_triangle_verts(), all by kernels, never copied to host
+    // memory here.
     //
-    // Those three views are valid from the moment this call returns until
+    // Those four views are valid from the moment this call returns until
     // generation() next changes, i.e. until the next call to insert(),
     // insert_deferred(), finalise(), finalise_device() or reset() on this
     // object, or until the object is destroyed. A caller holding a view
     // across such a call is reading memory that has moved on.
-    void finalise_device(std::vector<TriangleEntry>& tri_map_out);
+    void finalise_device();
 
     const int32_t* device_pixel_tids()     const { return d_pixel_tids_; }
     const int32_t* device_pixel_seed_ids() const { return d_pixel_seed_ids_; }
     const uint8_t* device_outside_mask()   const { return d_outside_mask_; }
+    // (triangle_count(), 3) vertex ids, sorted-rank numbered like
+    // device_pixel_seed_ids(). Valid under the same rule as the three
+    // buffers above; see finalise_device()'s doc comment.
+    const int32_t* device_triangle_verts() const { return d_triangle_verts_; }
+    // Rows in device_triangle_verts() as of the last finalise_device()
+    // call -- n_live_ at that point, since finalise_device() compacts the
+    // registry first.
+    int triangle_count() const { return n_live_; }
 
     // Bumped by every call that can change what the three device_* buffers
     // above contain (see finalise_device()). A snapshot taken at one
@@ -285,6 +293,10 @@ private:
     int32_t* d_pixel_tids_ = nullptr;     // (H*W) triangle id per pixel, NO_TRIANGLE -> 0
     int32_t* d_pixel_seed_ids_ = nullptr; // (H*W) nearest seed id per pixel, sorted numbering
     uint8_t* d_outside_mask_ = nullptr;   // (H*W) 1 where the pixel has no containing triangle
+    // (max_seeds*4 slots * 3) vertex ids, sorted-rank numbered; only
+    // [0, triangle_count()*3) is meaningful, written fresh by
+    // finalise_device() each call.
+    int32_t* d_triangle_verts_ = nullptr;
     uint64_t generation_;       // see generation() above
     int32_t* d_csr_ptr_ = nullptr;     // (max_seeds+1) CSR row starts
     // Sized for one (seed, tid) pair per corner of every registry slot
@@ -428,15 +440,16 @@ private:
     void download_registry_(std::vector<RawTriangle>& tris,
                             std::vector<uint8_t>& dead) const;
     void ensure_edges_() const;
-    // Shared by build_outputs_() and build_outputs_device_(): the per-triangle
-    // vertex ids, translated through sorted_rank(). Small (per-triangle), so
-    // both paths build it on the host the same way.
+    // build_outputs_()'s per-triangle vertex ids, translated through
+    // sorted_rank(), downloading the registry (download_registry_) to do
+    // it host-side.
     void build_tri_map_(std::vector<TriangleEntry>& tri_map_out) const;
     void build_outputs_(std::vector<TriangleEntry>& tri_map_out,
                         std::vector<int32_t>& tgrid_out) const;
-    // As build_outputs_(), but launches the crop kernel into the persistent
-    // device_pixel_*() buffers instead of downloading and cropping on the host.
-    void build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) const;
+    // As build_outputs_(), but launches kernels into the persistent
+    // device_pixel_*()/device_triangle_verts() buffers instead of
+    // downloading and cropping on the host.
+    void build_outputs_device_() const;
     // insertion-order seed/vertex id -> batch pipeline's sorted (x asc, y asc)
     // id, or the id unchanged if out of range. Shared by build_tri_map_,
     // build_outputs_ and get_voronoi_grid, which all translate through

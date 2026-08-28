@@ -235,5 +235,7 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def_property_readonly("max_seeds", &PyDelaunay::max_seeds,
              "Upper bound on total seeds this object can ever hold.")
         .def_property_readonly("has_pending", &PyDelaunay::has_pending,
-             "True when deferred inserts are awaiting a finalise().");
+             "True when deferred inserts are awaiting a finalise().")
+        .def_property_readonly("triangle_count", &PyDelaunay::triangle_count,
+             "Rows in the last finalise_device() call's triangle_verts view.");
 }

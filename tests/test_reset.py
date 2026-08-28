@@ -113,11 +113,11 @@ def test_stale_view_raises_after_reset():
     seeds = _random_seeds(rng, 20)
     d = Delaunay(W, H, MAX_SEEDS, -1)
     d.insert_deferred(seeds, None)
-    _, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
+    verts, pixel_tids, pixel_seed_ids, outside_mask = d.finalise_device()
 
     d.reset()
 
-    for view in (pixel_tids, pixel_seed_ids, outside_mask):
+    for view in (verts, pixel_tids, pixel_seed_ids, outside_mask):
         with pytest.raises(RuntimeError):
             view.__cuda_array_interface__
 
