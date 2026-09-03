@@ -24,6 +24,9 @@
   a plain and a `_timed`/`_debug` variant), the doc comment must say when to
   reach for one over the other.
 
+## API design
+- Argument order should be consistent for similiar functions or signatures
+
 ## Duplication
 - Important rule Avoid code duplication on all levels. Examples are:
   - functions with similiar names (compute and compute_timed or such)
@@ -43,3 +46,4 @@
 ## GOLDEN RULE
 - If nothing else applies, loosely use the ideas expressed 
   in Clean Code by R. C. Martin as guidelines.
+  
