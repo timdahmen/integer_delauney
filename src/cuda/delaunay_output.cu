@@ -1,7 +1,8 @@
 // Materialising results: the triangle map and (H,W,3) grid finalise() and
 // finalise_device() return, get_voronoi_grid(), and the plain getters that
-// read straight off the host registry.
+// download the registry on demand (see download_registry_'s doc comment).
 #include "delaunay.cuh"
+#include "triangle_detect.cuh"  // RawTriangle
 #include "cuda_check.cuh"
 
 #include <cuda_runtime.h>
@@ -69,11 +70,19 @@ int32_t Delaunay::translate_to_sorted_rank_(int32_t internal) const
 void Delaunay::build_tri_map_(std::vector<TriangleEntry>& tri_map_out) const
 {
     ensure_sorted_rank_();
-    int N_tri = (int)h_triangles_.size();
+
+    // Every caller of build_tri_map_ (build_outputs_, build_outputs_device_)
+    // runs it right after compact_registry_(), so the registry is already
+    // dense here -- no dead slots to skip. download_registry_ still returns
+    // the dead flags alongside; unused below, since there is nothing to filter.
+    std::vector<RawTriangle> tris;
+    std::vector<uint8_t> dead;
+    download_registry_(tris, dead);
+    const int N_tri = (int)tris.size();
 
     tri_map_out.resize(N_tri);
     for (int tid = 0; tid < N_tri; ++tid) {
-        const auto& t = h_triangles_[tid];
+        const auto& t = tris[tid];
         // Canonical positions come back in image coordinates. A border triangle
         // lands outside [0,W)x[0,H) once shifted, which is correct and matches
         // the batch path: its circumcentre genuinely lies outside the image.
@@ -143,9 +152,29 @@ void crop_pixel_arrays_kernel(const int32_t* __restrict__ grid,
     pixel_tids_out[d]   = outside ? 0 : tid;
 }
 
-void Delaunay::build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) const
+//: One thread per live triangle, translating its vertex ids through
+//: sorted_rank exactly as crop_pixel_arrays_kernel does for seed ids --
+//: build_tri_map_'s per-triangle loop, on the device. Only called after
+//: compact_registry_(), so tid in [0, n_tri) is already dense.
+__global__
+void build_triangle_verts_kernel(const RawTriangle* __restrict__ registry, int n_tri,
+                                 const int32_t* __restrict__ sorted_rank,
+                                 int sorted_rank_size,
+                                 int32_t* __restrict__ verts_out)
 {
-    build_tri_map_(tri_map_out);
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_tri) return;
+    const RawTriangle& r = registry[tid];
+    auto translate = [&](int32_t id) -> int32_t {
+        return (id >= 0 && id < sorted_rank_size) ? sorted_rank[id] : id;
+    };
+    verts_out[tid * 3]     = translate(r.orig_a);
+    verts_out[tid * 3 + 1] = translate(r.orig_b);
+    verts_out[tid * 3 + 2] = translate(r.orig_c);
+}
+
+void Delaunay::build_outputs_device_() const
+{
     ensure_sorted_rank_();
 
     dim3 block(16, 16);
@@ -154,12 +183,20 @@ void Delaunay::build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) co
         d_grid_, d_t_grid_, d_sorted_rank_, (int)h_sorted_rank_.size(),
         W_, H_, P_, W_det_,
         d_pixel_tids_, d_pixel_seed_ids_, d_outside_mask_);
-    // No sync here by design -- see the device-handoff plan's "stream
-    // discipline" note: both extensions share the implicit default stream, so
-    // a later kernel reading these buffers is guaranteed to see this one's
-    // output without one. cudaGetLastError still catches a launch-config
-    // failure immediately, without forcing a wait for the copy to finish.
     CUDA_CHECK_LAST_ERROR();
+
+    if (n_live_ > 0) {
+        build_triangle_verts_kernel<<<(n_live_ + 255) / 256, 256>>>(
+            static_cast<RawTriangle*>(d_raw_buf_), n_live_,
+            d_sorted_rank_, (int)h_sorted_rank_.size(), d_triangle_verts_);
+        // No sync here by design -- see the device-handoff plan's "stream
+        // discipline" note: both extensions share the implicit default
+        // stream, so a later kernel reading these buffers is guaranteed to
+        // see this one's output without one. cudaGetLastError still catches
+        // a launch-config failure immediately, without forcing a wait for
+        // the copy to finish.
+        CUDA_CHECK_LAST_ERROR();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -194,12 +231,18 @@ void Delaunay::get_voronoi_grid(std::vector<int32_t>& out) const
 
 void Delaunay::get_triangles(std::vector<TriangleEntry>& out) const
 {
-    const int slots = (int)h_triangles_.size();
+    // Downloaded on demand: the registry lives on the device (see
+    // download_registry_'s doc comment).
+    std::vector<RawTriangle> tris;
+    std::vector<uint8_t> dead;
+    download_registry_(tris, dead);
+    const int slots = (int)tris.size();
+
     out.clear();
     out.reserve(n_live_);
     for (int tid = 0; tid < slots; ++tid) {
-        if (h_dead_[tid]) continue;
-        const auto& t = h_triangles_[tid];
+        if (dead[tid]) continue;
+        const auto& t = tris[tid];
         // Insertion-order ids, deliberately untranslated -- see the header.
         // Canonical position in image coordinates, as build_outputs_ reports it.
         out.push_back({t.x - P_, t.y - P_, t.orig_a, t.orig_b, t.orig_c});

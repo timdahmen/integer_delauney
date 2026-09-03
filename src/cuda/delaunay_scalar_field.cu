@@ -181,16 +181,19 @@ void Delaunay::ensure_edges_() const
     n_edges_ = 0;
     edges_dirty_ = false;
 
-    const int n_tri = (int)h_triangles_.size();
+    const int n_tri = next_tid_host_;
     if (n_tri == 0 || N_ == 0 || n_live_ == 0) return;
 
     const RawTriangle* d_tris = static_cast<const RawTriangle*>(d_raw_buf_);
     int64_t* d_keys = static_cast<int64_t*>(d_edge_keys_);
 
+    // No sync here either: thrust::sort/unique below run on the same
+    // default stream as this kernel, and the cudaMemcpy further down is
+    // itself synchronous -- both already guarantee this kernel's output is
+    // visible before it's needed, same reasoning as select_midpoints below.
     build_edge_keys_kernel<<<(n_tri + 255) / 256, 256>>>(
         d_tris, n_tri, (int64_t)N_, d_dead_, d_keys);
     CUDA_CHECK_LAST_ERROR();
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     thrust::device_ptr<int64_t> p(d_keys);
     thrust::sort(p, p + (size_t)n_tri * 3);
@@ -237,11 +240,16 @@ void Delaunay::select_midpoints(double min_length, int count, float threshold,
         throw std::logic_error(
             "select_midpoints needs a value per seed; pass values to insert_deferred");
 
+    // No sync between these launches, or before the thrust calls below --
+    // all of it (kernels and thrust) runs on the same default stream, so
+    // stream ordering already guarantees each step sees the previous
+    // step's output. cudaGetLastError still catches a launch-config
+    // failure immediately without forcing a wait for completion; see
+    // build_outputs_device_'s comment for the same reasoning applied there.
     score_edges_kernel<<<(n_edges_ + 255) / 256, 256>>>(
         static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
         d_sx_, d_sy_, d_values_, min_length * min_length, d_scores_);
     CUDA_CHECK_LAST_ERROR();
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     // The whole of the selection: order the edges best-first and take the
     // front. No threshold crosses to the caller and none comes back, because
@@ -249,7 +257,6 @@ void Delaunay::select_midpoints(double min_length, int count, float threshold,
     pack_score_keys_kernel<<<(n_edges_ + 255) / 256, 256>>>(
         d_scores_, n_edges_, threshold, d_score_keys_);
     CUDA_CHECK_LAST_ERROR();
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     thrust::device_ptr<float> sc(d_scores_);
     const int n_eligible = (int)thrust::count_if(sc, sc + n_edges_,
@@ -266,8 +273,9 @@ void Delaunay::select_midpoints(double min_length, int count, float threshold,
         (int64_t)N_, d_sx_, d_sy_, W_det_, H_det_, P_, d_grid_,
         d_mid_keys_, d_mid_count_);
     CUDA_CHECK_LAST_ERROR();
-    CUDA_CHECK(cudaDeviceSynchronize());
 
+    // No explicit sync here either -- this cudaMemcpy is synchronous, so it
+    // already waits for all prior work on the stream before transferring.
     int32_t n = 0;
     CUDA_CHECK(cudaMemcpy(&n, d_mid_count_, sizeof(int32_t), cudaMemcpyDeviceToHost));
     if (n == 0) return;

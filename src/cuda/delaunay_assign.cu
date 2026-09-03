@@ -137,7 +137,7 @@ void Delaunay::assign_pending_(float* asgn_ms)
     dim3 block(16, 16);
     dim3 grid_dim((W_det_ + 15) / 16, (H_det_ + 15) / 16);
 
-    int N_tri = (int)h_triangles_.size();
+    int N_tri = next_tid_host_;
     if (N_tri == 0) {
         CUDA_CHECK(cudaMemset(d_t_grid_, SENTINEL_BYTE, (size_t)N * sizeof(int32_t)));
         if (asgn_ms) *asgn_ms = 0.f;

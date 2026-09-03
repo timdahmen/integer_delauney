@@ -195,8 +195,10 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "space and recent enough in time; a triangle of circumradius R "
              "admits nothing beyond t = R.\n\n"
              "Returns (mask, triangle_ids). The triangle is reported because a "
-             "caller asking this usually wants it and it is found on the way; "
-             "-1 where no triangle contains the point, where the mask is False.")
+             "caller asking this usually wants it and it is found on the way. "
+             "A point outside every triangle falls back to the triangle "
+             "nearest its Voronoi seed; triangle_ids is -1, and the mask is "
+             "False, only where that also finds nothing.")
         .def("locate", &PyDelaunay::locate, py::arg("points"),
              "Triangle containing each point of an (N, 2) int32 array, in "
              "image coordinates, as an (N,) int32 array. -1 where no triangle "
@@ -235,5 +237,7 @@ PYBIND11_MODULE(_delauney_cuda, m)
         .def_property_readonly("max_seeds", &PyDelaunay::max_seeds,
              "Upper bound on total seeds this object can ever hold.")
         .def_property_readonly("has_pending", &PyDelaunay::has_pending,
-             "True when deferred inserts are awaiting a finalise().");
+             "True when deferred inserts are awaiting a finalise().")
+        .def_property_readonly("triangle_count", &PyDelaunay::triangle_count,
+             "Rows in the last finalise_device() call's triangle_verts view.");
 }

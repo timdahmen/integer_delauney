@@ -12,12 +12,16 @@
 __global__
 void write_seeds_kernel(int32_t* grid, int32_t* changed_mask, int W,
                         const int32_t* xs, const int32_t* ys,
-                        const int32_t* ids, int k)
+                        int32_t base_id, int k)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= k) return;
     int base = (ys[i] * W + xs[i]) * 2;
-    grid[base]     = ids[i];
+    // New seeds' ids are always the contiguous range starting at base_id --
+    // computed here instead of uploaded, since xs/ys already carry the
+    // per-thread index apply_batch_ would otherwise need a separate array
+    // just to hand back.
+    grid[base]     = base_id + i;
     grid[base + 1] = 0;
     // Mark the seed cell as changed so the border expansion
     // covers detection positions that touch the seed cell directly.

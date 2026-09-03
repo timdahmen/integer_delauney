@@ -68,29 +68,26 @@ public:
         return py::make_tuple(out[0], out[1], _timings_dict(t));
     }
 
-    // As finalise(as_arrays=True), except the (H,W,3) raster never comes back
-    // to the host: pixel_tids, pixel_seed_ids and outside_hull_mask are
-    // returned as __cuda_array_interface__ views straight onto the Delaunay
-    // object's own device memory instead. Returns
+    // As finalise(as_arrays=True), except nothing comes back to the host:
+    // triangle_verts, pixel_tids, pixel_seed_ids and outside_hull_mask are
+    // all returned as __cuda_array_interface__ views straight onto the
+    // Delaunay object's own device memory. triangle_verts is flat
+    // (triangle_count()*3,), row tid at [tid*3, tid*3+3) -- the caller
+    // reshapes to (triangle_count(), 3) itself, same as any other
+    // C-contiguous device array. Returns
     // (triangle_verts, pixel_tids, pixel_seed_ids, outside_hull_mask).
     py::tuple finalise_device()
     {
-        std::vector<TriangleEntry> tri_map;
-        impl_.finalise_device(tri_map);
-
-        py::array_t<int32_t> verts({(int)tri_map.size(), 3});
-        auto* p = verts.mutable_data();
-        for (size_t tid = 0; tid < tri_map.size(); ++tid) {
-            p[tid * 3]     = tri_map[tid].id_a;
-            p[tid * 3 + 1] = tri_map[tid].id_b;
-            p[tid * 3 + 2] = tri_map[tid].id_c;
-        }
+        impl_.finalise_device();
 
         // What each returned view keeps alive; see PyDeviceArrayView.
         py::object self = py::cast(this, py::return_value_policy::reference);
         const py::ssize_t n = (py::ssize_t)impl_.width() * impl_.height();
+        const py::ssize_t n_verts = (py::ssize_t)impl_.triangle_count() * 3;
         const uint64_t gen = impl_.generation();
 
+        py::object verts = py::cast(PyDeviceArrayView(
+            self, &impl_, impl_.device_triangle_verts(), n_verts, "<i4", gen));
         py::object pixel_tids = py::cast(PyDeviceArrayView(
             self, &impl_, impl_.device_pixel_tids(), n, "<i4", gen));
         py::object pixel_seed_ids = py::cast(PyDeviceArrayView(
@@ -249,6 +246,8 @@ public:
     int  border_padding() const { return impl_.border_padding(); }
     int  max_seeds()      const { return impl_.max_seeds(); }
     bool has_pending()    const { return impl_.has_pending(); }
+    // Rows in the last finalise_device() call's triangle_verts view.
+    int  triangle_count() const { return impl_.triangle_count(); }
 
 private:
     Delaunay impl_;

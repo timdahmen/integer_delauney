@@ -15,7 +15,46 @@
 #include <stdexcept>
 #include <vector>
 
-//: Is a point inside the circumsphere of the triangle containing it?
+//: Containing triangle for a point that falls outside every triangle's
+//: interior -- direct locate_at() only returns NO_TRIANGLE there.
+//:
+//: The point's nearest seed (the Voronoi grid's own seed-id channel) almost
+//: always sits inside a real triangle, or one grid step away from one when it
+//: sits exactly on a triangle vertex or hull edge. Falling back to that
+//: triangle answers "which triangle is this point closest to" for the
+//: in-circle test below, which is what a caller outside the hull wants.
+__device__ __forceinline__
+int32_t locate_with_hull_fallback(int x, int y, int W, int H,
+                                  const int32_t* __restrict__ grid,
+                                  const RawTriangle* __restrict__ triangles,
+                                  const int32_t* __restrict__ sx,
+                                  const int32_t* __restrict__ sy,
+                                  const int32_t* __restrict__ csr_ptr,
+                                  const int32_t* __restrict__ csr_idx,
+                                  int N_seeds)
+{
+    int32_t tid = locate_at(x, y, W, H, grid, triangles, sx, sy, csr_ptr, csr_idx, N_seeds);
+    if (tid != NO_TRIANGLE) return tid;
+
+    const int32_t seed = grid[(y * W + x) * 2];
+    if (seed < 0 || seed >= N_seeds) return NO_TRIANGLE;
+
+    const int vx = sx[seed], vy = sy[seed];
+    tid = locate_at(vx, vy, W, H, grid, triangles, sx, sy, csr_ptr, csr_idx, N_seeds);
+    if (tid != NO_TRIANGLE) return tid;
+
+    const int offsets[4][2] = {{-1, 0}, {0, -1}, {1, 0}, {0, 1}};
+    for (int k = 0; k < 4; ++k) {
+        const int nx = vx + offsets[k][0], ny = vy + offsets[k][1];
+        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+        tid = locate_at(nx, ny, W, H, grid, triangles, sx, sy, csr_ptr, csr_idx, N_seeds);
+        if (tid != NO_TRIANGLE) return tid;
+    }
+    return NO_TRIANGLE;
+}
+
+//: Is a point inside the circumsphere of the triangle containing it, or, for a
+//: point outside the hull, of the triangle nearest to it?
 //:
 //: The in-circle predicate Delaunay triangulation is defined by, lifted out of
 //: the plane: the triangle's vertices lie at t = 0 and the query point at t,
@@ -54,8 +93,8 @@ void in_circumsphere_kernel(const int32_t* __restrict__ qx,
         if (tid_out) tid_out[i] = NO_TRIANGLE;
         return;
     }
-    const int32_t tid = locate_at(x, y, W, H, grid, triangles,
-                                  sx, sy, csr_ptr, csr_idx, N_seeds);
+    const int32_t tid = locate_with_hull_fallback(x, y, W, H, grid, triangles,
+                                                   sx, sy, csr_ptr, csr_idx, N_seeds);
     if (tid_out) tid_out[i] = tid;
     if (tid == NO_TRIANGLE) return;
 
@@ -153,7 +192,7 @@ void Delaunay::in_circumsphere(const std::vector<int32_t>& qx,
 
     compact_registry_();
     ensure_csr_();
-    if (h_triangles_.empty()) return;
+    if (next_tid_host_ == 0) return;
 
     int32_t* d_qx = d_seed_stage_;
     int32_t* d_qy = d_seed_stage_ + max_seeds_;
@@ -199,7 +238,7 @@ void Delaunay::locate(const std::vector<int32_t>& qx,
     // alike; and the CSR, which is how a candidate triangle is reached.
     compact_registry_();
     ensure_csr_();
-    if (h_triangles_.empty()) return;
+    if (next_tid_host_ == 0) return;
 
     // The queries reuse the seed staging buffer: an insert is the only other
     // user and cannot be in flight here.

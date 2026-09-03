@@ -5,6 +5,12 @@
 #include <vector>
 #include "triangulation.cuh"   // TriangleEntry
 
+// Declared in triangle_detect.cuh, a CUDA-only header (uses atomicAdd etc.)
+// that host-only translation units like bindings.cpp cannot include. This
+// class only ever names RawTriangle in reference parameters below, never
+// needs it complete, so a forward declaration is enough here.
+struct RawTriangle;
+
 struct InsertTimings {
     float bfs_ms    = 0.f;
     int   bfs_iters = 0;     // BFS trip count; each trip is a full-canvas pass
@@ -81,23 +87,31 @@ public:
         std::vector<int32_t>&       tgrid_out,
         InsertTimings*         timings = nullptr);
 
-    // Same as finalise(), except the per-pixel outputs stay on the device
-    // instead of being downloaded and cropped on the host: tri_map_out is
-    // still built host-side, since it is per-triangle and small, but the
-    // (H*W) triangle-id, seed-id and outside-hull arrays are written directly
-    // into device_pixel_tids()/device_pixel_seed_ids()/device_outside_mask()
-    // by a crop kernel and never copied to host memory here.
+    // Same as finalise(), except every output stays on the device: the
+    // (H*W) triangle-id, seed-id and outside-hull arrays are written
+    // directly into device_pixel_tids()/device_pixel_seed_ids()/
+    // device_outside_mask(), and the (triangle_count(), 3) vertex-id array
+    // into device_triangle_verts(), all by kernels, never copied to host
+    // memory here.
     //
-    // Those three views are valid from the moment this call returns until
+    // Those four views are valid from the moment this call returns until
     // generation() next changes, i.e. until the next call to insert(),
     // insert_deferred(), finalise(), finalise_device() or reset() on this
     // object, or until the object is destroyed. A caller holding a view
     // across such a call is reading memory that has moved on.
-    void finalise_device(std::vector<TriangleEntry>& tri_map_out);
+    void finalise_device();
 
     const int32_t* device_pixel_tids()     const { return d_pixel_tids_; }
     const int32_t* device_pixel_seed_ids() const { return d_pixel_seed_ids_; }
     const uint8_t* device_outside_mask()   const { return d_outside_mask_; }
+    // (triangle_count(), 3) vertex ids, sorted-rank numbered like
+    // device_pixel_seed_ids(). Valid under the same rule as the three
+    // buffers above; see finalise_device()'s doc comment.
+    const int32_t* device_triangle_verts() const { return d_triangle_verts_; }
+    // Rows in device_triangle_verts() as of the last finalise_device()
+    // call -- n_live_ at that point, since finalise_device() compacts the
+    // registry first.
+    int triangle_count() const { return n_live_; }
 
     // Bumped by every call that can change what the three device_* buffers
     // above contain (see finalise_device()). A snapshot taken at one
@@ -233,13 +247,43 @@ private:
     int32_t* d_changed_ = nullptr;     // (H*W)   cells updated during BFS (accumulated)
     int32_t* d_sx_ = nullptr;          // (max_seeds) seed x
     int32_t* d_sy_ = nullptr;          // (max_seeds) seed y
-    // The persistent triangle list, kept in step with h_triangles_.
+    // The triangle registry itself -- the source of truth, not a mirror of a
+    // host copy. Written directly by the retire/append kernels
+    // (partial_topology_) and by full_topology_/compact_registry_; read by
+    // everything else that needs triangle data (get_edges, get_triangles,
+    // build_tri_map_, the CSR build). See next_tid_host_ below for the
+    // "how many slots" bookkeeping.
     void*    d_raw_buf_ = nullptr;
+    // Ping-pong target for compact_registry_'s device-side compaction, same
+    // size and layout as d_raw_buf_ -- swapped in, mirroring d_grid_/d_tmp_'s
+    // BFS ping-pong, rather than allocated and freed per compaction.
+    void*    d_raw_buf_compact_ = nullptr;
     // Detection scratch, written from index 0 on every detect. Separate from
-    // the list above because detection would otherwise overwrite it, which is
-    // only survivable if the whole list is re-uploaded afterwards -- exactly
-    // the O(total triangles) work per insert this design removes.
+    // the registry above because detection would otherwise overwrite it.
     void*    d_detect_buf_ = nullptr;  // see max_raw_triangles()
+    // Scratch for partial_topology_'s retire step: the stale tids compacted
+    // out of d_stale_ on the device, so the retire kernel touches only the
+    // ones that changed, not every slot in the registry.
+    int32_t* d_stale_tids_ = nullptr;       // (max_seeds * 4)
+    // Triangle identity, keyed by geometry: a live triangle's three vertices
+    // are immutable once inserted, so the exact (unrounded) sum of their seed
+    // coordinates is a position no other live triangle can also claim --
+    // triangulation gives every triangle a disjoint interior, and a
+    // non-degenerate triangle's centroid always lies strictly inside its own
+    // interior, so two distinct triangles can never share one. Sized at 3x
+    // resolution (centroid_index_w_/_h_ below) because that sum is exact, not
+    // divided by 3 and rounded: rounding after the divide can merge two
+    // close-but-distinct centroids (two triangles sharing an edge, for
+    // instance), which the exact sum cannot. NO_TRIANGLE where no live
+    // triangle claims that position.
+    int32_t* d_centroid_index_ = nullptr;   // (centroid_index_w_ * _h_)
+    // Scratch for the append kernel: 1/0 "is this candidate new" flags,
+    // exclusive-scanned in place into each new candidate's rank among the
+    // new ones -- new_tid = next_tid_host_ + rank, deterministic in the
+    // array order detect_and_dedup_'s thrust::unique already sorted
+    // candidates into (by vertex triplet). See append_triangles_kernel's
+    // doc comment for why this order has to be deterministic.
+    int32_t* d_new_rank_ = nullptr;         // (max_raw_triangles bound)
     // (3 * max triangles) packed undirected edge keys for get_edges(). Sized
     // like d_stale_, off the planarity bound of under 2n triangles for n seeds.
     void*    d_edge_keys_ = nullptr;
@@ -249,9 +293,20 @@ private:
     int32_t* d_pixel_tids_ = nullptr;     // (H*W) triangle id per pixel, NO_TRIANGLE -> 0
     int32_t* d_pixel_seed_ids_ = nullptr; // (H*W) nearest seed id per pixel, sorted numbering
     uint8_t* d_outside_mask_ = nullptr;   // (H*W) 1 where the pixel has no containing triangle
+    // (max_seeds*4 slots * 3) vertex ids, sorted-rank numbered; only
+    // [0, triangle_count()*3) is meaningful, written fresh by
+    // finalise_device() each call.
+    int32_t* d_triangle_verts_ = nullptr;
     uint64_t generation_;       // see generation() above
     int32_t* d_csr_ptr_ = nullptr;     // (max_seeds+1) CSR row starts
-    int32_t* d_csr_idx_ = nullptr;     // (max_seeds*8) CSR triangle IDs
+    // Sized for one (seed, tid) pair per corner of every registry slot
+    // (max_seeds*4 slots x 3), including dead ones: rebuild_csr_and_upload_
+    // sentinel-tags a dead slot's pairs so they sort past every live seed's
+    // range, see that function.
+    int32_t* d_csr_idx_ = nullptr;     // (max_seeds*12) CSR triangle IDs
+    // Scratch sort keys for rebuild_csr_and_upload_, paired 1:1 with
+    // d_csr_idx_'s values during the sort; not meaningful afterwards.
+    int32_t* d_csr_pair_seed_ = nullptr; // (max_seeds*12)
     int32_t* d_updated_flag_ = nullptr;// (1)     BFS convergence flag
     int32_t* d_mask_ = nullptr;        // (H*W)   reused for border / reassign masks
     // Changes since the last finalise, as opposed to d_changed_, which holds
@@ -270,13 +325,22 @@ private:
     int32_t* d_remap_ = nullptr;       // (max triangles) old id -> new, for compaction
     int32_t* d_edge_out_ = nullptr;    // (2 * 3 * max triangles) unpacked edge pairs
     uint8_t* d_stale_ = nullptr;       // (max triangles) per-triangle invalidation flags
-    uint8_t* d_dead_ = nullptr;        // (max triangles) retired-slot flags, mirrors h_dead_
+    uint8_t* d_dead_ = nullptr;        // (max triangles) retired-slot flags, authoritative
     float*   d_values_ = nullptr;      // (max_seeds) scalar field, one per seed
     uint64_t* d_score_keys_ = nullptr; // (3 * max triangles) packed (score, edge index)
     float*   d_scores_ = nullptr;      // (3 * max triangles) one per edge
     int64_t* d_mid_keys_ = nullptr;    // (max_seeds) packed midpoint pixel + edge index
     int32_t* d_mid_count_ = nullptr;   // (1)
     int      tiles_x_, tiles_y_;
+    // d_centroid_index_'s dimensions: 3x the padded canvas per axis, since it
+    // is indexed by an unrounded x3-scaled coordinate sum. See d_centroid_index_.
+    int      centroid_index_w_, centroid_index_h_;
+    // "How many slots the registry has handed out", live or dead -- what
+    // h_triangles_.size() used to mean, the next tid append_triangles_kernel
+    // will hand out. Only ever adjusted by cheap arithmetic (+= n_appended,
+    // -= n_stale, or set directly by full_topology_/compact_registry_),
+    // never by inspecting individual triangles.
+    int      next_tid_host_;
     bool     pending_;       // deferred inserts awaiting a finalise
     // Derived structures whose only consumers run at assignment or output
     // time. Rebuilding them per insert cost O(N_tri + N_seeds) of host work
@@ -290,24 +354,21 @@ private:
     mutable int      n_edges_;
     bool             have_values_;
 
-    // ---- host-side triangle registry ----
-    struct HTriangle {
-        int32_t x, y;
-        int32_t a, b, c;            // sorted key (a<=b<=c)
-        int32_t orig_a, orig_b, orig_c;
-    };
-    // Slots, not a dense list. A partial update retires the triangles the
+    // Live slot count. d_raw_buf_/d_dead_ (device) are the registry itself --
+    // see their own comments above -- this is the one piece of triangle-count
+    // bookkeeping still kept host-side, and it is cheap arithmetic only
+    // (+= n_appended, -= n_stale), never a per-triangle read.
+    //
+    // Slots are not a dense list. A partial update retires the triangles the
     // change invalidated and appends their replacements; retiring is a flag,
-    // so the ids of everything else stay put and the lookup map only sees the
-    // entries that actually moved. Compacting instead would renumber every
-    // triangle, which forces a full map rebuild, a full device upload and a
-    // remap of the pixel grid -- all O(total triangles) on a change that
-    // touched a handful of them. Density is restored in compact_registry_(),
-    // which finalise() calls once per frame rather than once per insert.
-    std::vector<HTriangle>                 h_triangles_;
-    std::vector<uint8_t>                   h_dead_;      // parallel to above
-    int                                    n_live_;      // live slot count
-    std::unordered_map<uint64_t,int32_t>   h_triplet_to_tid_;
+    // so the ids of everything else stay put and d_centroid_index_ only sees
+    // the entries that actually moved. Compacting instead would renumber
+    // every triangle, which forces a full index rebuild, a full device
+    // upload and a remap of the pixel grid -- all O(total triangles) on a
+    // change that touched a handful of them. Density is restored in
+    // compact_registry_(), which finalise() calls once per frame rather
+    // than once per insert.
+    int                                    n_live_;
 
     // ---- host-side seed registry ----
     std::vector<int32_t>            h_sx_, h_sy_;
@@ -352,25 +413,43 @@ private:
     void build_reassign_mask_();
     int  count_mask_();
     void rebuild_csr_and_upload_();
-    void upload_triangles_();
-    // Only the appended tail, which is all a partial update changes.
-    void upload_triangles_range_(int first, int count);
-    void upload_dead_flags_();
-    // Squeeze the retired slots out and renumber. O(total triangles), so it
-    // runs when the holes are worth the pass, and before outputs are built --
-    // tri_map is indexed by triangle id and must be dense for callers.
+    // Squeeze the retired slots out and renumber, entirely device-side: an
+    // exclusive scan over live/dead gives each survivor's new dense tid
+    // (which doubles as d_remap_'s content for remap_tgrid_kernel), a scatter
+    // kernel writes survivors into d_raw_buf_compact_, then the two buffers
+    // swap. O(total triangles), so it runs when the holes are worth the
+    // pass, and before outputs are built -- tri_map is indexed by triangle id
+    // and must be dense for callers.
     void compact_registry_();
     bool should_compact_() const;
+    // Streams the tids in [0, old_count) that mark_stale_kernel flagged and
+    // are not already dead into d_stale_tids_, on the device. Returns the
+    // count. partial_topology_'s retire kernel touches only that many,
+    // instead of every slot in the registry.
+    int  compact_stale_tids_(int old_count);
+    // Clears d_centroid_index_ and repopulates it from d_raw_buf_[0, count),
+    // tid == own index. Used wherever a contiguous, freshly-tid'd run of
+    // triangles just replaced the registry: full_topology_ (a first insert
+    // has nothing else to seed it from) and compact_registry_ (renumbering
+    // invalidates every tid the index was holding).
+    void rebuild_centroid_index_(int count);
+    // Host snapshot of d_raw_buf_/d_dead_[0, next_tid_host_), downloaded
+    // fresh on every call, for the output builders not yet reading the
+    // device registry directly (build_tri_map_, get_triangles). These run
+    // once per finalise()/get_triangles() call.
+    void download_registry_(std::vector<RawTriangle>& tris,
+                            std::vector<uint8_t>& dead) const;
     void ensure_edges_() const;
-    // Shared by build_outputs_() and build_outputs_device_(): the per-triangle
-    // vertex ids, translated through sorted_rank(). Small (per-triangle), so
-    // both paths build it on the host the same way.
+    // build_outputs_()'s per-triangle vertex ids, translated through
+    // sorted_rank(), downloading the registry (download_registry_) to do
+    // it host-side.
     void build_tri_map_(std::vector<TriangleEntry>& tri_map_out) const;
     void build_outputs_(std::vector<TriangleEntry>& tri_map_out,
                         std::vector<int32_t>& tgrid_out) const;
-    // As build_outputs_(), but launches the crop kernel into the persistent
-    // device_pixel_*() buffers instead of downloading and cropping on the host.
-    void build_outputs_device_(std::vector<TriangleEntry>& tri_map_out) const;
+    // As build_outputs_(), but launches kernels into the persistent
+    // device_pixel_*()/device_triangle_verts() buffers instead of
+    // downloading and cropping on the host.
+    void build_outputs_device_() const;
     // insertion-order seed/vertex id -> batch pipeline's sorted (x asc, y asc)
     // id, or the id unchanged if out of range. Shared by build_tri_map_,
     // build_outputs_ and get_voronoi_grid, which all translate through
@@ -378,9 +457,6 @@ private:
     // itself first, since this is a pure lookup.
     int32_t translate_to_sorted_rank_(int32_t internal) const;
 
-    static uint64_t pack_triplet_(int32_t a, int32_t b, int32_t c) {
-        return (uint64_t(a) << 42) | (uint64_t(b) << 21) | uint64_t(c);
-    }
     static uint64_t pack_xy_(int32_t x, int32_t y) {
         return (uint64_t(uint32_t(x)) << 32) | uint64_t(uint32_t(y));
     }
