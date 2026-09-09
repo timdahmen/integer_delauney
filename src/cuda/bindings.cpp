@@ -223,6 +223,19 @@ PYBIND11_MODULE(_delauney_cuda, m)
              "across the bus and sort them on the host. Consumers score edges\n"
              "rather than triangles, so this is the shape the data is wanted\n"
              "in, and it moves less of it.")
+        .def("nearest_prior_distance", &PyDelaunay::nearest_prior_distance,
+             py::arg("n_frame_points"),
+             "Device-resident distance from each of this mesh's first\n"
+             "n_frame_points seeds (insertion order) to its nearest prior\n"
+             "neighbour -- a lower-indexed seed also < n_frame_points, or any\n"
+             "seed >= n_frame_points (retained history, chronologically\n"
+             "older despite its higher index in this rebuild). -1 where a\n"
+             "seed has no such neighbour.\n\n"
+             "Returns a __cuda_array_interface__ view, valid under the same\n"
+             "staleness rule as finalise_device()'s views. A directional\n"
+             "scatter-min over get_edges()'s own edge list, computed here\n"
+             "instead of downloading it -- get_edges() is sized by the whole\n"
+             "retained mesh, most of which this query does not need.")
         .def_property_readonly("sorted_rank", &PyDelaunay::sorted_rank,
              "int32 array mapping insertion-order seed id -> sorted (x asc,\n"
              "y asc) id, which is the numbering insert()/finalise() report.")

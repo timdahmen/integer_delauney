@@ -135,6 +135,7 @@ Delaunay::Delaunay(int width, int height, int max_seeds,
         CUDA_CHECK(cudaMalloc(&d_scores_,       (size_t)max_seeds * 12 * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_mid_keys_,     (size_t)max_seeds      * sizeof(int64_t)));
         CUDA_CHECK(cudaMalloc(&d_mid_count_,    1                      * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_prior_dist_,   (size_t)max_seeds      * sizeof(float)));
         CUDA_CHECK(cudaMemset(d_dead_, 0,       (size_t)max_seeds * 4  * sizeof(uint8_t)));
         // Three edge keys per triangle, over the same triangle bound as d_stale_.
         CUDA_CHECK(cudaMalloc(&d_edge_keys_,    (size_t)max_seeds * 4 * 3 * sizeof(int64_t)));
@@ -209,6 +210,7 @@ void Delaunay::free_device_buffers_() noexcept
     CUDA_CHECK_NOTHROW(cudaFree(d_dead_));
     CUDA_CHECK_NOTHROW(cudaFree(d_values_));   CUDA_CHECK_NOTHROW(cudaFree(d_scores_));  CUDA_CHECK_NOTHROW(cudaFree(d_score_keys_));
     CUDA_CHECK_NOTHROW(cudaFree(d_mid_keys_)); CUDA_CHECK_NOTHROW(cudaFree(d_mid_count_));
+    CUDA_CHECK_NOTHROW(cudaFree(d_prior_dist_));
     CUDA_CHECK_NOTHROW(cudaFree(d_updated_flag_)); CUDA_CHECK_NOTHROW(cudaFree(d_mask_));
     CUDA_CHECK_NOTHROW(cudaFree(d_dirty_accum_));  CUDA_CHECK_NOTHROW(cudaFree(d_tile_dirty_)); CUDA_CHECK_NOTHROW(cudaFree(d_count_));
     CUDA_CHECK_NOTHROW(cudaFree(d_stale_));

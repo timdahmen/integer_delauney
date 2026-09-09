@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <thrust/device_ptr.h>
 #include <thrust/count.h>
+#include <thrust/fill.h>
 #include <thrust/sort.h>
 #include <thrust/unique.h>
 
@@ -79,6 +80,52 @@ void unpack_edge(int64_t key, int64_t n_seeds, int32_t& a, int32_t& b)
 {
     a = (int32_t)(key / n_seeds);
     b = (int32_t)(key % n_seeds);
+}
+
+// nearest_prior_distance_kernel: one thread per edge, atomicMin-scatters
+// its length into the "prior" endpoint's output slot. a <= b always (see
+// build_edge_keys_kernel), so a==b never happens and !a_frame implies
+// !b_frame too -- the only two cases worth a write are both endpoints <
+// n_frame_points (only the higher-indexed, later-inserted one, b, may
+// count the other as prior) and exactly a < n_frame_points <= b (b is
+// retained history, chronologically older despite its higher index in
+// this rebuild, so it is always prior for a).
+//
+// atomicMin on a non-negative float's bit pattern is exactly atomicMin on
+// the float: IEEE-754's non-negative encodings and the unsigned integers
+// they bit-cast to are ordered the same way (the same trick
+// pdf_pipeline.cu's residual scatter uses with atomicMax). `out` must be
+// pre-filled with a value no real distance can beat (+inf) -- see
+// finalize_prior_distance_kernel below for turning a slot nothing wrote
+// into the -1 sentinel callers expect.
+__global__
+void nearest_prior_distance_kernel(const int64_t* __restrict__ keys, int n_edges,
+                                   int64_t n_seeds,
+                                   const int32_t* __restrict__ sx,
+                                   const int32_t* __restrict__ sy,
+                                   int n_frame_points,
+                                   float* __restrict__ out)
+{
+    int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_edges) return;
+    int32_t a, b;
+    unpack_edge(keys[e], n_seeds, a, b);
+    if (a >= n_frame_points) return;
+
+    const double dx = (double)sx[a] - sx[b];
+    const double dy = (double)sy[a] - sy[b];
+    const float dist = (float)sqrt(dx * dx + dy * dy);
+
+    const int32_t target = (b < n_frame_points) ? b : a;
+    atomicMin((unsigned int*)&out[target], __float_as_uint(dist));
+}
+
+__global__
+void finalize_prior_distance_kernel(float* __restrict__ out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (!isfinite(out[i])) out[i] = -1.0f;
 }
 
 //: |dv| * |ab|, or zero for an edge too short to subdivide.
@@ -317,4 +364,24 @@ void Delaunay::get_edges(std::vector<int32_t>& out) const
     out.resize((size_t)n_edges_ * 2);
     CUDA_CHECK(cudaMemcpy(out.data(), d_edge_out_, (size_t)n_edges_ * 2 * sizeof(int32_t),
                cudaMemcpyDeviceToHost));
+}
+
+void Delaunay::nearest_prior_distance(int n_frame_points) const
+{
+    ensure_edges_();
+    if (n_frame_points <= 0) return;
+
+    thrust::device_ptr<float> out_ptr(d_prior_dist_);
+    thrust::fill(thrust::device, out_ptr, out_ptr + n_frame_points, HUGE_VALF);
+
+    if (n_edges_ > 0) {
+        nearest_prior_distance_kernel<<<(n_edges_ + 255) / 256, 256>>>(
+            static_cast<const int64_t*>(d_edge_keys_), n_edges_, (int64_t)N_,
+            d_sx_, d_sy_, n_frame_points, d_prior_dist_);
+        CUDA_CHECK_LAST_ERROR();
+    }
+
+    finalize_prior_distance_kernel<<<(n_frame_points + 255) / 256, 256>>>(
+        d_prior_dist_, n_frame_points);
+    CUDA_CHECK_LAST_ERROR();
 }

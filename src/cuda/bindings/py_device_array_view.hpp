@@ -62,6 +62,12 @@ public:
                        (size_t)count_ * sizeof(uint8_t), cudaMemcpyDeviceToHost));
             return out;
         }
+        if (typestr_ == "<f4") {
+            py::array_t<float> out(count_);
+            CUDA_CHECK(cudaMemcpy(out.mutable_data(), ptr_,
+                       (size_t)count_ * sizeof(float), cudaMemcpyDeviceToHost));
+            return out;
+        }
         throw std::runtime_error("to_host(): unsupported typestr '" + typestr_ + "'");
     }
 

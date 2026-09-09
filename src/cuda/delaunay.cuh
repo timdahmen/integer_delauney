@@ -138,6 +138,20 @@ public:
     // data is wanted in.
     void get_edges(std::vector<int32_t>& out) const;
 
+    // Device-resident nearest-prior-neighbour distance for each of this
+    // mesh's first n_frame_points seeds (insertion order): the shortest
+    // edge to another seed that counts as "prior" -- a lower-indexed seed
+    // also < n_frame_points, or any seed >= n_frame_points (retained
+    // history, chronologically older despite its higher index in this
+    // rebuild). -1 where a seed has no such neighbour. Writes
+    // device_prior_dist(), valid under the same staleness rule as
+    // finalise_device()'s views (see generation()). A directional
+    // scatter-min over get_edges()'s own edge list, done here instead of
+    // downloading it: get_edges() is sized by the whole retained mesh, most
+    // of which this query never needs.
+    void nearest_prior_distance(int n_frame_points) const;
+    const float* device_prior_dist() const { return d_prior_dist_; }
+
     // ---- scalar field on the vertices, and the edge metric over it ----
     //
     // A caller that refines a mesh carries one number per vertex -- a measured
@@ -331,6 +345,7 @@ private:
     float*   d_scores_ = nullptr;      // (3 * max triangles) one per edge
     int64_t* d_mid_keys_ = nullptr;    // (max_seeds) packed midpoint pixel + edge index
     int32_t* d_mid_count_ = nullptr;   // (1)
+    float*   d_prior_dist_ = nullptr;  // (max_seeds) nearest_prior_distance() output
     int      tiles_x_, tiles_y_;
     // d_centroid_index_'s dimensions: 3x the padded canvas per axis, since it
     // is indexed by an unrounded x3-scaled coordinate sum. See d_centroid_index_.

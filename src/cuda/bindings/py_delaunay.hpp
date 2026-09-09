@@ -114,6 +114,19 @@ public:
         return arr;
     }
 
+    // Device-resident nearest-prior-neighbour distance for this mesh's
+    // first n_frame_points seeds (insertion order) -- see
+    // Delaunay::nearest_prior_distance. Returned as a __cuda_array_interface__
+    // view, valid under the same staleness rule as finalise_device()'s views.
+    py::object nearest_prior_distance(int n_frame_points)
+    {
+        impl_.nearest_prior_distance(n_frame_points);
+        py::object self = py::cast(this, py::return_value_policy::reference);
+        return py::cast(PyDeviceArrayView(
+            self, &impl_, impl_.device_prior_dist(), n_frame_points, "<f4",
+            impl_.generation()));
+    }
+
     py::array_t<int32_t> get_edges() const
     {
         std::vector<int32_t> flat;
