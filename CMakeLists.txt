@@ -32,7 +32,9 @@ if(WITH_CUDA)
     # bindings.cpp is a CXX source calling cudaMemcpy (to_host()), so it needs
     # the toolkit include dir explicitly -- CMake's CUDA language support only
     # adds it for the .cu sources compiled in the CUDA language.
-    target_link_libraries(_delauney_cuda PRIVATE CUDA::cudart)
+    # The static runtime matches what nvcc links into the .cu sources and
+    # leaves the module without a cudart64_*.dll for the interpreter to find.
+    target_link_libraries(_delauney_cuda PRIVATE CUDA::cudart_static)
     target_compile_options(_delauney_cuda PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
