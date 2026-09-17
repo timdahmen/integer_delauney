@@ -31,7 +31,8 @@ inline void build_seed_triangle_csr(
     for (int tid = 0; tid < n_tri; ++tid) {
         if (is_dead(tid)) continue;
         const auto& t = triangles[tid];
-        for (int32_t s : {t.orig_a, t.orig_b, t.orig_c}) {
+        const int32_t seeds[3] = {t.orig_a, t.orig_b, t.orig_c};
+        for (int32_t s : seeds) {
             csr_idx_out[csr_ptr_out[s] + fill[s]] = tid;
             fill[s]++;
         }
